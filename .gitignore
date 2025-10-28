@@ -1,0 +1,54 @@
+# Ignore build artifacts and temporary files
+
+# object files, compiled binaries
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.lib
+*.lo
+*.la
+*.out
+
+# preprocessed/source-generated files
+*.i
+*.ii
+pre*.i
+
+# assembler, map
+*.s
+*.map
+
+# editor/temp files
+*~
+*.tmp
+*.bak
+*.swp
+*.log
+
+# VS Code and local editor settings
+.vscode/
+*.code-workspace
+
+# backup folder used during cleanups
+lzo_cpu/backup/
+
+# MinGW/MSYS dumps
+*.exe.stackdump
+
+# Ignore other common generated files
+*.pyc
+__pycache__/
+
+# Local user build files
+/.local-build/
+
+# If there are specific build outputs in subdirs, add them explicitly
+# e.g. ignore any lzo_cpu executables or preprocessed outputs
+lzo_cpu/*.exe
+lzo_cpu/*.i
+lzo_cpu/pre*.i
+
+# end
