@@ -6,7 +6,7 @@
 #ifndef LZO_LEVELS_H
 #define LZO_LEVELS_H
 
-#include "minilzo.h"
+#include <lzo/lzo1x.h>
 
 #ifdef __cplusplus
 extern "C" {

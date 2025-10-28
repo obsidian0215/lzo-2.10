@@ -19,7 +19,9 @@
 #define DINDEX(dv,p)        DM((dv) + ((dv) >> (32-D_BITS)))
 #endif
 #include "config1x.h"
+#ifndef LZO_DETERMINISTIC
 #define LZO_DETERMINISTIC !(LZO_DICT_USE_PTR)
+#endif
 
 #ifndef DO_COMPRESS
 #define DO_COMPRESS     lzo1x_1_11_compress

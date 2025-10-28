@@ -9,6 +9,9 @@
 #include "lzo_conf.h"
 #include <lzo/lzo1x.h>
 
+/* choose hashing strategy used by lzo_dict.h */
+#define LZO_HASH            LZO_HASH_LZO_INCREMENTAL_B
+
 #ifndef LZO_EOF_CODE
 #define LZO_EOF_CODE 1
 #endif

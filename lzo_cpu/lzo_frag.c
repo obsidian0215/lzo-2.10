@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <string.h>
-#include <minilzo.h>
+#include <lzo/lzo1x.h>
 #include "lzo_levels.h"
 #include <sys/time.h>
 
