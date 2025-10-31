@@ -6,7 +6,7 @@
 
 PROGRAM = lzo_cpu
 # Fully decoupled build: use local copies under lzo_cpu (include and src)
-SOURCES = lzo_frag.c lzo1x_1k.c lzo1x_1l.c lzo1x_1.c lzo1x_1o.c \
+SOURCES = lzo_frag.c lzo1x_1k.c lzo1x_1l.c lzo1x_1.c lzo1x_1o.c lzo1x_d1.c \
 		  src/lzo_init.c src/lzo_ptr.c src/lzo_str.c src/lzo_util.c src/lzo_crc.c
 
 default:
@@ -21,12 +21,11 @@ default:
 	@echo ""
 
 
-# Make sure that minilzo.h, lzoconf.h and lzodefs.h are in the
-# current dircectory. Otherwise you may want to adjust CPPFLAGS.
-/* Ensure we can find the top-level minilzo headers instead of local copies */
+# Ensure we can find the local self-contained headers
 CPPFLAGS = -I. -I./src -I./include -I./include/lzo
 
-GCC_CFLAGS = -Wall -g -fomit-frame-pointer -pthread
+# Match the successful gcc build: C11, O2, NDEBUG, pthread
+GCC_CFLAGS = -std=c11 -O2 -DNDEBUG -Wall -fomit-frame-pointer -pthread
 
 
 #
@@ -72,7 +71,7 @@ win32-lccwin32:
 	lc -A -unused -O $(CPPFLAGS) $(SOURCES)
 
 win32-mingw32 win32-mingw:
-	gcc -mno-cygwin $(CPPFLAGS) $(GCC_CFLAGS) -o $(PROGRAM).exe $(SOURCES)
+	gcc $(CPPFLAGS) $(GCC_CFLAGS) -o $(PROGRAM).exe $(SOURCES)
 
 win32-visualc win32-vc:
 	cl -nologo -MT -W3 -O2 -GF $(CPPFLAGS) $(SOURCES)
