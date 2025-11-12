@@ -23,6 +23,10 @@
 
 #define DMUL(a,b) ((lzo_xint) ((a) * (b)))
 
+/* Use generic address-space pointers (match other variants) to allow the
+   compiler to choose the best addressing mode. This aligns behavior with
+   lzo1x_1k/1l/1o and avoids forced global-address-space loads which can be
+   slower on some OpenCL implementations. */
 #define lzo_memops_TU0p __generic void *
 #define lzo_memops_TU1p __generic unsigned char *
 
@@ -30,8 +34,9 @@
 #define lzo_memops_move_TU1p    lzo_memops_TU1p
 
 /* 判断指针运行时对齐 */
-static inline bool lzo_ptr_aligned(const void *p, uint align_pow2)
-{   return (((ulong) p) & (align_pow2 - 1)) == 0; }
+/* address-space agnostic pointer-alignment test
+    Use integer cast to avoid passing pointers across address-spaces. */
+#define lzo_ptr_aligned(p, align_pow2) ((((lzo_uintptr_t)(p)) & ((align_pow2) - 1)) == 0)
 
 #define LZO_MEMOPS_SET1(dd,cc) \
     LZO_BLOCK_BEGIN \
@@ -80,16 +85,18 @@ static inline void LZO_MEMOPS_COPYN(void *dd, const void *ss, uint nn)
 
 static inline uint lzo_memops_get_le32(const void *pp)
 {
-    const __generic uchar *p = (__generic const uchar*)pp;
+    const __generic uchar *p = (const __generic uchar*)pp;
 
     if (lzo_ptr_aligned(p,4))
-        return as_uint(*(__generic const uint*)p);      /* 1 × 32-bit load */
+        return as_uint(*((const __generic uint*)p));      /* 1 × 32-bit load */
 
     return  (uint)p[0]        |
            ((uint)p[1] <<  8) |
            ((uint)p[2] << 16) |
            ((uint)p[3] << 24);
 }
+
+
 
 #define LZO_MEMOPS_GET_LE32(ss)    lzo_memops_get_le32(ss)
 
@@ -122,7 +129,13 @@ static inline uint lzo_memops_get_le32(const void *pp)
 #undef  lzo_dict_t
 #define lzo_dict_t lzo_uint16_t
 
-/* 标准版本：使用14位字典 */
+#if 1
+/* 标准版本：使用14位字典 (原始)，但大型 per-work-item dict 导致在某些设备上私有内存溢出/溢写到全局内存。
+    为了对比与其它变体，这里临时将 D_BITS 降低到 11，以减少每个 work-item 的字典内存占用。
+    这是一次小型实验性改动，可在确认效果后恢复或采用更稳健的优化（如使用 __local 或全局字典）。 */
+#endif
+#define D_BITS_REDUCED_EXPERIMENT 11
+#define D_BITS          D_BITS_REDUCED_EXPERIMENT
 #define D_BITS          14
 #define D_INDEX1(d,p)       d = DM(DMUL(0x21,DX3(p,5,5,6)) >> 5)
 #define D_INDEX2(d,p)       d = (d & (D_MASK & 0x7ff)) ^ (D_HIGH | 0x1f)
@@ -210,11 +223,11 @@ lzo1x_1_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
                    LZO_ADDR_GLOBAL lzo_bytep out, lzo_uintp out_len,
                     lzo_uint  ti, lzo_voidp wrkmem)
 {
-    const lzo_bytep ip;
-    lzo_bytep op;
-    const lzo_bytep const in_end = in + in_len;
-    const lzo_bytep const ip_end = in + in_len - 20;
-    const lzo_bytep ii;
+    LZO_ADDR_GLOBAL const lzo_bytep ip;
+    LZO_ADDR_GLOBAL lzo_bytep op;
+    const LZO_ADDR_GLOBAL lzo_bytep in_end = in + in_len;
+    const LZO_ADDR_GLOBAL lzo_bytep ip_end = in + in_len - 20;
+    LZO_ADDR_GLOBAL const lzo_bytep ii;
     lzo_dict_p const dict = (lzo_dict_p) wrkmem;
 
     op = out;
@@ -224,7 +237,7 @@ lzo1x_1_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
     ip += ti < 4 ? 4 - ti : 0;
     for (;;)
     {
-        const lzo_bytep m_pos;
+    LZO_ADDR_GLOBAL const lzo_bytep m_pos;
 
         lzo_uint m_off;
         lzo_uint m_len;
@@ -267,13 +280,16 @@ lzo1x_1_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
                         UA_SET1(op, 0);
                         op++;
                     }
-                    // assert(tt > 0);
+                    /* assert(tt > 0); */
                     *op++ = LZO_BYTE(tt);
                 }
                 { do *op++ = *ii++; while (--t > 0); }
             }
-        }
+            }
         m_len = 4;
+        /* Simple byte-wise / small-unroll extension (used by other kernels).
+           This avoids device-specific ctz/wide-load overhead and gives more
+           consistent performance across devices. */
         if (ip[m_len] == m_pos[m_len]) {
             do {
                 m_len += 1;
@@ -361,7 +377,7 @@ m_len_done:
 }
 
 /* —— memset(dict,0,…) —— */
-static inline void dict_clear(uint* d) {
+static inline void dict_clear(lzo_dict_t* d) {
 #pragma unroll
     for (uint i = 0; i < D_SIZE; ++i) d[i] = 0;
 }
@@ -418,13 +434,175 @@ static inline int do_compress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint  in_l
     return 0;
 }
 
+#ifdef LZO_ENABLE_LOCAL_IMPL
+/* local-address-space variants (for C1 local-cache implementation) */
+static inline void LZO_MEMOPS_COPYN_LOCAL(LZO_ADDR_LOCAL void *dd, LZO_ADDR_LOCAL const void *ss, uint nn)
+{
+    LZO_ADDR_LOCAL uchar *d = (LZO_ADDR_LOCAL uchar*)dd;
+    LZO_ADDR_LOCAL const uchar *s = (LZO_ADDR_LOCAL const uchar*)ss;
+    while (nn >= 8) { /* simple copy loop; alignment assumptions omitted for local */
+        d[0]=s[0]; d[1]=s[1]; d[2]=s[2]; d[3]=s[3]; d[4]=s[4]; d[5]=s[5]; d[6]=s[6]; d[7]=s[7];
+        d += 8; s += 8; nn -= 8;
+    }
+    while (nn >= 4) { d[0]=s[0]; d[1]=s[1]; d[2]=s[2]; d[3]=s[3]; d += 4; s += 4; nn -= 4; }
+    while (nn--) *d++ = *s++;
+}
+
+static inline uint lzo_memops_get_le32_local(LZO_ADDR_LOCAL const void *pp)
+{
+    LZO_ADDR_LOCAL const uchar *p = (LZO_ADDR_LOCAL const uchar*)pp;
+    if (lzo_ptr_aligned(p,4))
+        return *((LZO_ADDR_LOCAL const uint*)p);
+    return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
+}
+
+#define UA_GET_LE32_LOCAL    lzo_memops_get_le32_local
+
+/* local-capable compress core: input in __local, output remains __global */
+static lzo_uint
+lzo1x_1_compress_core_local(LZO_ADDR_LOCAL const lzo_bytep in , lzo_uint  in_len,
+                   LZO_ADDR_GLOBAL lzo_bytep out, lzo_uintp out_len,
+                    lzo_uint  ti, lzo_voidp wrkmem)
+{
+    LZO_ADDR_LOCAL const lzo_bytep ip;
+    LZO_ADDR_GLOBAL lzo_bytep op;
+    const LZO_ADDR_LOCAL lzo_bytep in_end = in + in_len;
+    const LZO_ADDR_LOCAL lzo_bytep ip_end = in + in_len - 20;
+    LZO_ADDR_LOCAL const lzo_bytep ii;
+    lzo_dict_p const dict = (lzo_dict_p) wrkmem;
+
+    op = out;
+    ip = in;
+    ii = ip;
+
+    ip += ti < 4 ? 4 - ti : 0;
+    for (;;)
+    {
+    LZO_ADDR_LOCAL const lzo_bytep m_pos;
+
+        lzo_uint m_off;
+        lzo_uint m_len;
+        {
+        lzo_uint32_t dv;
+        lzo_uint dindex;
+    literal_local:
+        ip += 1 + ((ip - ii) >> 5);
+    next_local:
+        if (ip >= ip_end)
+            break;
+        dv = UA_GET_LE32_LOCAL(ip);
+        dindex = DINDEX(dv,ip);
+        GINDEX(m_off,m_pos,in+dict,dindex,in);
+        UPDATE_I(dict,0,dindex,ip,in);
+        if (dv != UA_GET_LE32_LOCAL(m_pos))
+            goto literal_local;
+        }
+
+        ii -= ti; ti = 0;
+        lzo_uint t = pd(ip,ii);
+        if (t != 0)
+        {
+            if (t <= 3)
+            {
+                op[-2] = LZO_BYTE(op[-2] | t);
+                { do *op++ = *ii++; while (--t > 0); }
+            }
+            else
+            {
+                if (t <= 18)
+                    *op++ = LZO_BYTE(t - 3);
+                else
+                {
+                    lzo_uint tt = t - 18;
+                    *op++ = 0;
+                    while (tt > 255)
+                    {
+                        tt -= 255;
+                        UA_SET1(op, 0);
+                        op++;
+                    }
+                    *op++ = LZO_BYTE(tt);
+                }
+                { do *op++ = *ii++; while (--t > 0); }
+            }
+        }
+        m_len = 4;
+                /* simple local-tail extension: byte-wise (safe) */
+                {
+                    uint rem = (uint)(ip_end - ip);
+                    uint probe_pos = m_len;
+                    while (rem > probe_pos && (ip + probe_pos)[0] == (m_pos + probe_pos)[0]) { probe_pos++; }
+                    m_len = probe_pos;
+                    if (ip + m_len >= ip_end)
+                        goto m_len_done_local;
+                }
+m_len_done_local:
+        m_off = pd(ip,m_pos);
+        ip += m_len;
+        ii = ip;
+        if (m_len <= M2_MAX_LEN && m_off <= M2_MAX_OFFSET)
+        {
+            m_off -= 1;
+
+            *op++ = LZO_BYTE(((m_len - 1) << 5) | ((m_off & 7) << 2));
+            *op++ = LZO_BYTE(m_off >> 3);
+        }
+        else if (m_off <= M3_MAX_OFFSET)
+        {
+            m_off -= 1;
+            if (m_len <= M3_MAX_LEN)
+                *op++ = LZO_BYTE(M3_MARKER | (m_len - 2));
+            else
+            {
+                m_len -= M3_MAX_LEN;
+                *op++ = M3_MARKER | 0;
+                while(m_len > 255)
+                {
+                    m_len -= 255;
+                    UA_SET1(op, 0);
+                    op++;
+                }
+                *op++ = LZO_BYTE(m_len);
+            }
+            *op++ = LZO_BYTE(m_off << 2);
+            *op++ = LZO_BYTE(m_off >> 6);
+        }
+        else
+        {
+            m_off -= 0x4000;
+            if (m_len <= M4_MAX_LEN)
+                *op++ = LZO_BYTE(M4_MARKER | ((m_off >> 11) & 8) | (m_len - 2));
+            else
+            {
+                m_len -= M4_MAX_LEN;
+                *op++ = LZO_BYTE(M4_MARKER | ((m_off >> 11) & 8));
+                while(m_len > 255)
+                {
+                    m_len -= 255;
+                    UA_SET1(op, 0);
+                    op++;
+                }
+                *op++ = LZO_BYTE(m_len);
+            }
+            *op++ = LZO_BYTE(m_off << 2);
+            *op++ = LZO_BYTE(m_off >> 6);
+        }
+        goto next_local;
+    }
+
+    *out_len = pd(op, out);
+    return pd(in_end,ii-ti);
+}
+#endif /* LZO_ENABLE_LOCAL_IMPL */
+
 /* LZO1X-1 标准压缩内核 - 使用标准字典 */
+#ifndef LZO_NO_DEFAULT_KERNEL
 __kernel void lzo1x_block_compress(__global const uchar *in ,
                                    __global       uchar *out,
                                    __global       uint  *out_len,
-	                                   const uint  in_sz,
-                                        const uint  blk_size,
-                                        const uint  worst_blk)
+                                   const uint  in_sz,
+                                   const uint  blk_size,
+                                   const uint  worst_blk)
 {
     uint in_len, in_off;
     const uint gid = get_global_id(0);
@@ -433,7 +611,7 @@ __kernel void lzo1x_block_compress(__global const uchar *in ,
     __global uchar* op = out + gid * worst_blk;
 
     /* 标准模式：使用16K字典 */
-    uint dict[1<<D_BITS];
+    lzo_dict_t dict[1<<D_BITS];
 
     in_len = (in_off + blk_size <= in_sz) ? blk_size : (in_sz - in_off);
     if (in_len == 0) {
@@ -446,162 +624,5 @@ __kernel void lzo1x_block_compress(__global const uchar *in ,
     out_len[gid] = olen;
 }
 
-/* 原始LZO解压函数 - 与压缩级别无关 */
-static lzo_uint
-lzo1x_decompress(const lzo_bytep in, lzo_uint  in_len,
-    lzo_bytep out, lzo_uintp out_len,
-    lzo_voidp wrkmem)
-{
-    lzo_bytep op;
-    const lzo_bytep ip;
-    lzo_uint t;
-    const lzo_bytep m_pos;
-
-    const lzo_bytep const ip_end = in + in_len;
-    LZO_UNUSED(wrkmem);
-
-    *out_len = 0;
-
-    op = out;
-    ip = in;
-
-    if (*ip > 17)
-    {
-        t = *ip++ - 17;
-        if (t < 4)
-            goto match_next;
-        do *op++ = *ip++; while (--t > 0);
-        goto first_literal_run;
-    }
-
-    for (;;)
-    {
-        t = *ip++;
-        if (t >= 16)
-            goto match;
-        if (t == 0)
-        {
-            while (*ip == 0)
-            {
-                t += 255;
-                ip++;
-            }
-            t += 15 + *ip++;
-        }
-        *op++ = *ip++; *op++ = *ip++; *op++ = *ip++;
-        do *op++ = *ip++; while (--t > 0);
-    first_literal_run:
-        t = *ip++;
-        if (t >= 16)
-            goto match;
-
-        m_pos = op - (1 + M2_MAX_OFFSET);
-        m_pos -= t >> 2;
-        m_pos -= *ip++ << 2;
-
-        *op++ = *m_pos++; *op++ = *m_pos++; *op++ = *m_pos;
-        goto match_done;
-
-        for (;;) {
-        match:
-            if (t >= 64)
-            {
-                m_pos = op - 1;
-                m_pos -= (t >> 2) & 7;
-                m_pos -= *ip++ << 3;
-                t = (t >> 5) - 1;
-                goto copy_match;
-            }
-            else if (t >= 32)
-            {
-                t &= 31;
-                if (t == 0)
-                {
-                    while (*ip == 0)
-                    {
-                        t += 255;
-                        ip++;
-                    }
-                    t += 31 + *ip++;
-                }
-                m_pos = op - 1;
-                m_pos -= (ip[0] >> 2) + (ip[1] << 6);
-
-                ip += 2;
-            }
-            else if (t >= 16)
-            {
-                m_pos = op;
-                m_pos -= (t & 8) << 11;
-                t &= 7;
-                if (t == 0)
-                {
-                    while (*ip == 0)
-                    {
-                        t += 255;
-                        ip++;
-                    }
-                    t += 7 + *ip++;
-                }
-                m_pos -= (ip[0] >> 2) + (ip[1] << 6);
-
-                ip += 2;
-                if (m_pos == op)
-                    goto eof_found;
-                m_pos -= 0x4000;
-            }
-            else
-            {
-                m_pos = op - 1;
-                m_pos -= t >> 2;
-                m_pos -= *ip++ << 2;
-                *op++ = *m_pos++; *op++ = *m_pos;
-                goto match_done;
-            }
-        copy_match:
-            *op++ = *m_pos++; *op++ = *m_pos++;
-            do *op++ = *m_pos++; while (--t > 0);
-
-        match_done:
-            t = ip[-2] & 3;
-            if (t == 0)
-                break;
-
-        match_next:
-            *op++ = *ip++;
-            if (t > 1) { *op++ = *ip++; if (t > 2) { *op++ = *ip++; } }
-            t = *ip++;
-        }
-    }
-
-eof_found:
-    *out_len = pd(op, out);
-    return (ip == ip_end ? LZO_E_OK :
-        (ip < ip_end ? LZO_E_INPUT_NOT_CONSUMED : LZO_E_INPUT_OVERRUN));
-}
-
-/* 解压内核 - 使用原始LZO解压算法 */
-__kernel void lzo1x_block_decompress(
-    __global const uchar* in_buf,
-    __global const uint* off_arr,
-    __global       uchar* out_buf,
-    __global       uint* out_lens,
-    uint blk_sz,
-    uint orig_size)
-{
-    uint gid = get_global_id(0);
-    uint in_off = off_arr[gid];
-    uint in_len = off_arr[gid + 1] - in_off;
-
-    uint out_off = gid * blk_sz;
-    uint out_len = (out_off + blk_sz <= orig_size) ?
-        blk_sz : (orig_size - out_off);
-
-    __global const uchar* src = in_buf + in_off;
-    __global       uchar* dst = out_buf + out_off;
-
-    // 调用原始的lzo1x_decompress函数
-    lzo1x_decompress(src, in_len, dst, &out_len, NULL);
-
-    out_lens[gid] = out_len;
-}
+/* decompression moved to lzo1x_decompress.cl to avoid duplication */
+#endif /* LZO_NO_DEFAULT_KERNEL */

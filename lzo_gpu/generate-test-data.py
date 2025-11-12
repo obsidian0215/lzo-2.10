@@ -75,16 +75,66 @@ def generate_structured_data(size, structure_ratio=0.8):
 
     return bytes(data)
 
+
+def generate_suite(out_dir):
+    """
+    Generate a suite of diverse test files into out_dir.
+    Files created include various sizes and patterns.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    # sizes from tiny -> large
+    sizes = ["1KB", "16KB", "64KB", "256KB", "1MB", "4MB", "16MB", "64MB", "128MB"]
+    patterns = ["repeat", "structured", "mixed"]
+    print(f"Generating test suite in {out_dir} ...")
+    for sz in sizes:
+        for p in patterns:
+            fname = f"test_{sz.lower()}_{p}.dat"
+            outpath = os.path.join(out_dir, fname)
+            if os.path.exists(outpath):
+                print(f"Skipping existing {outpath}")
+                continue
+            print(f"Generating {outpath} ({sz}, pattern={p})")
+            # compute size value
+            s = sz.upper()
+            if s.endswith('KB'):
+                size_val = int(s[:-2]) * 1024
+            elif s.endswith('MB'):
+                size_val = int(s[:-2]) * 1024 * 1024
+            elif s.endswith('GB'):
+                size_val = int(s[:-2]) * 1024 * 1024 * 1024
+            else:
+                size_val = int(s)
+            if p == "repeat":
+                data = generate_repeated_pattern(size_val, pattern_size=64, pattern_density=0.7)
+            elif p == "structured":
+                data = generate_structured_data(size_val)
+            else:
+                half = size_val // 2
+                data = generate_repeated_pattern(half, pattern_size=64, pattern_density=0.7) + generate_structured_data(size_val - half)
+            with open(outpath, 'wb') as f:
+                f.write(data)
+    print("Test suite generation complete.")
+
 def main():
     parser = argparse.ArgumentParser(description="生成LZ4 GPU测试数据")
-    parser.add_argument("size", type=str, help="数据大小（如：64MB, 1GB）")
+    parser.add_argument("size", nargs='?', type=str, help="数据大小（如：64MB, 1GB）")
     parser.add_argument("--output", "-o", default="test_data.dat", help="输出文件名")
+    parser.add_argument("--out-dir", dest="out_dir", default="samples", help="输出目录（用于 --suite）")
     parser.add_argument("--pattern", "-p", choices=["repeat", "structured", "mixed"],
                        default="repeat", help="数据模式类型")
     parser.add_argument("--pattern-size", type=int, default=64, help="重复模式大小")
     parser.add_argument("--density", type=float, default=0.7, help="模式密度")
+    parser.add_argument("--suite", action="store_true", help="生成一套预定义的测试样例到 --out-dir 并退出")
 
     args = parser.parse_args()
+
+    # If --suite requested, generate a suite and exit
+    if args.suite:
+        generate_suite(args.out_dir)
+        return
+
+    if not args.size:
+        parser.error("size is required unless --suite is specified")
 
     # 解析大小
     size_str = args.size.upper()

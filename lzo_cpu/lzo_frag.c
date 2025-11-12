@@ -24,7 +24,7 @@
 #include "lzo_levels.h"
 
 #define MAGIC_TAG            0x4C5A       /* 'L''Z' */
-#define DEFAULT_THREAD_COUNT 4
+#define DEFAULT_THREAD_COUNT 1
 #define MIN_BLOCK_SIZE       (64u * 1024u)
 #define MAX_BLOCK_SIZE       (1024u * 1024u)
 #define LZO_WORK_MEM_SIZE    LZO1X_1_MEM_COMPRESS
@@ -728,6 +728,8 @@ int main(int argc, char **argv) {
     int mode_decompress = 0;
     int threads = DEFAULT_THREAD_COUNT;
     int do_bench = 0;
+    int bench_mode = 0; /* concise bench output (compression ratio, throughput) */
+    int verbose = 0;
 
     const char *input = NULL;
     const char *output = NULL;
@@ -737,6 +739,10 @@ int main(int argc, char **argv) {
         const char *arg = argv[i];
         if (strcmp(arg, "-d") == 0) {
             mode_decompress = 1;
+        } else if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
+            verbose = 1;
+        } else if (strcmp(arg, "--bench") == 0 || strcmp(arg, "-B") == 0) {
+            bench_mode = 1;
         } else if (strcmp(arg, "-1") == 0) {
             level = 1;
         } else if (strcmp(arg, "-2") == 0) {
@@ -825,6 +831,37 @@ int main(int argc, char **argv) {
         rc = decompress_file(input, output, threads);
     } else {
         rc = compress_file(input, output, level, threads, do_bench);
+        /* concise bench mode: if requested and not already covered by --benchmark,
+         * run a single-block measure and print a compact benchmark summary.
+         */
+        if (bench_mode && !do_bench) {
+            size_t input_size = 0;
+            unsigned char *input_buf = read_entire(input, &input_size);
+            if (input_buf) {
+                struct timeval t0, t1;
+                unsigned char *comp = NULL; size_t comp_len = 0;
+                gettimeofday(&t0, NULL);
+                int r = compress_block_level(input_buf, input_size, &comp, &comp_len, level);
+                gettimeofday(&t1, NULL);
+                if (r == LZO_E_OK) {
+                    double comp_ms = diff_ms(&t0, &t1);
+                    unsigned char *out = malloc(input_size ? input_size : 1u);
+                    struct timeval dt0, dt1;
+                    gettimeofday(&dt0, NULL);
+                    r = decompress_block(comp, comp_len, out, input_size);
+                    gettimeofday(&dt1, NULL);
+                    double decomp_ms = diff_ms(&dt0, &dt1);
+                    double comp_mb_s = input_size ? (input_size / 1048576.0) / (comp_ms / 1000.0) : 0.0;
+                    double decomp_mb_s = input_size ? (input_size / 1048576.0) / (decomp_ms / 1000.0) : 0.0;
+                    fprintf(stderr, "BENCH: in=%zu out=%zu ratio=%.2f%% comp=%.3fms(%.2fMB/s) decomp=%.3fms(%.2fMB/s)\n",
+                            input_size, comp_len, input_size ? (100.0 * comp_len / input_size) : 0.0,
+                            comp_ms, comp_mb_s, decomp_ms, decomp_mb_s);
+                    free(out);
+                }
+                free(comp);
+                free(input_buf);
+            }
+        }
     }
 
     free(auto_output);

@@ -30,6 +30,11 @@
 #define LZO_ADDR_GLOBAL  __global
 #define LZO_ADDR_LOCAL   __local
 
+/* map unsupported qualifier to nothing for older OpenCL C versions */
+#ifndef __generic
+#define __generic
+#endif
+
 #define LZO_PUBLIC(r)  r
 #define LZO_EXTERN(r)         extern LZO_PUBLIC(r)
 #define LZO_STATIC_CAST(t,e)        ((t) (e))

@@ -50,5 +50,15 @@ __pycache__/
 lzo_cpu/*.exe
 lzo_cpu/*.i
 lzo_cpu/pre*.i
+lzo_cpu/lzo_cpu
+lzo_cpu/samples/
 
+lzo_gpu/lzo_gpu
+lzo_gpu/samples/
+samples/
+lzo_gpu/*.bin
+lzo_gpu/build_kernel
+lzo_gpu/*.lzo
+lzo_gpu/*.log
+lzo_gpu/*.csv
 # end
