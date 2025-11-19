@@ -65,6 +65,14 @@ static void choose_blocking(size_t in_sz, cl_device_id dev,
 
     /* 2. ⽬标块数：CU × OCC_FACTOR，但不能多于字节数 */
     size_t tgt_blk = (size_t)cu * OCC_FACTOR;
+    /* Allow forcing a smaller target block count for testing via
+     * LZO_FORCE_NBLK environment variable (helps run CPU-style kernel
+     * on GPUs by reducing concurrent work-items). */
+    const char* env_nblk = getenv("LZO_FORCE_NBLK");
+    if (env_nblk) {
+        int v = atoi(env_nblk);
+        if (v > 0) tgt_blk = (size_t)v;
+    }
     if (tgt_blk > in_sz) tgt_blk = in_sz;        /* 每块≥1 B */
 
     /* 3. 初步块⼤⼩ = ceil(in_sz / tgt_blk) */
@@ -130,8 +138,13 @@ static cl_device_id dev;
 static void ocl_init(void)
 {
     cl_platform_id pf;
+    /* allow selecting CPU device for testing CPU-style kernels via env
+     * variable LZO_OPENCL_DEVICE=CPU; default remains GPU. */
+    const char* prefer = getenv("LZO_OPENCL_DEVICE");
+    cl_device_type dtype = CL_DEVICE_TYPE_GPU;
+    if (prefer && strcmp(prefer, "CPU") == 0) dtype = CL_DEVICE_TYPE_CPU;
     CHECK(clGetPlatformIDs(1, &pf, NULL));
-    CHECK(clGetDeviceIDs(pf, CL_DEVICE_TYPE_GPU, 1, &dev, NULL));
+    CHECK(clGetDeviceIDs(pf, dtype, 1, &dev, NULL));
     ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, NULL);
     cl_queue_properties props[] = {
         CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0
@@ -171,10 +184,42 @@ static cl_program load_prog_from_bin_or_src(const char* base, const char* cl_src
 /* Helper: load program from <base>.bin or from source file */
 static cl_program load_prog_from_bin_or_src(const char* base, const char* cl_src_path)
 {
-    char bin_path[512]; snprintf(bin_path, sizeof(bin_path), "%s.bin", base);
+    /* Normalize names: never attempt to load or print the historic
+     * "decompress" spelling for kernel/base names. Always prefer the
+     * shorter "decomp" token for file and binary names. This avoids the
+     * host producing or searching for 'lzo1x_decompress' binaries/sources. */
+    char use_base[256]; strncpy(use_base, base, sizeof(use_base)-1); use_base[sizeof(use_base)-1]='\0';
+    char use_cl_src[256]; strncpy(use_cl_src, cl_src_path, sizeof(use_cl_src)-1); use_cl_src[sizeof(use_cl_src)-1]='\0';
+    /* replace "decompress" -> "decomp" in base (if present) */
+    char* p = strstr(use_base, "decompress");
+    if (p) {
+        size_t tail_len = strlen(p + strlen("decompress"));
+        /* write 'decomp' then append trailing part */
+        strcpy(p, "decomp");
+        strcpy(p + strlen("decomp"), p + strlen("decomp") + tail_len);
+    }
+    /* replace "decompress.cl" -> "decomp.cl" in cl src path if present */
+    char* q = strstr(use_cl_src, "decompress.cl");
+    if (q) {
+        size_t tail_len2 = strlen(q + strlen("decompress.cl"));
+        strcpy(q, "decomp.cl");
+        strcpy(q + strlen("decomp.cl"), q + strlen("decomp.cl") + tail_len2);
+    }
+
+    char bin_path[512]; snprintf(bin_path, sizeof(bin_path), "%s.bin", use_base);
+    /* also prepare an alternate path inside the lzo_gpu subdir to be robust
+     * against differing working directories when running via tools/runner */
+    char bin_path_alt[512]; snprintf(bin_path_alt, sizeof(bin_path_alt), "lzo_gpu/%s.bin", use_base);
+    /* Attempt to use a precompiled binary first (robust fallback to source
+     * compilation is performed below if binary is incompatible). */
     FILE* fb = fopen(bin_path, "rb");
+    if (!fb) {
+        /* try lzo_gpu/ subdir */
+        fb = fopen(bin_path_alt, "rb");
+    }
     cl_int err; cl_program prog = NULL;
     if (fb) {
+        /* attempt to use precompiled binary; on any failure fall back to source */
         fseek(fb, 0, SEEK_END); long bsz = ftell(fb); fseek(fb, 0, SEEK_SET);
         unsigned char* bin = malloc(bsz);
         if (fread(bin,1,bsz,fb) != (size_t)bsz) { perror("fread"); fclose(fb); free(bin); exit(1); }
@@ -183,21 +228,122 @@ static cl_program load_prog_from_bin_or_src(const char* base, const char* cl_src
         prog = clCreateProgramWithBinary(ctx, 1, &dev, (const size_t*)&bsz,
             (const unsigned char**)&bin, &binary_status, &err);
         free(bin);
-        if (err != CL_SUCCESS) { fprintf(stderr, "clCreateProgramWithBinary failed\n"); exit(1); }
-        err = clBuildProgram(prog, 1, &dev, "", NULL, NULL);
-        if (err != CL_SUCCESS) {
-            size_t log_sz = 0; clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
-            char* log = malloc(log_sz+1); clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, log_sz, log, NULL); log[log_sz]='\0';
-            fprintf(stderr, "Build log:\n%s\n", log); free(log); exit(1);
+        if (err != CL_SUCCESS || binary_status != CL_SUCCESS) {
+            fprintf(stderr, "warning: precompiled binary %s.bin incompatible, falling back to source (clCreateProgramWithBinary err=%d bin_status=%d)\n", base, err, binary_status);
+            if (prog) { clReleaseProgram(prog); prog = NULL; }
+        } else {
+            err = clBuildProgram(prog, 1, &dev, "", NULL, NULL);
+            if (err != CL_SUCCESS) {
+                size_t log_sz = 0; clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
+                char* log = malloc(log_sz+1); clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, log_sz, log, NULL); log[log_sz]='\0';
+                fprintf(stderr, "Build log (from binary):\n%s\n", log); free(log);
+                fprintf(stderr, "warning: build from binary failed for %s.bin (err=%d), falling back to source\n", base, err);
+                clReleaseProgram(prog); prog = NULL;
+            }
         }
-    } else {
-        size_t src_len; char* src = read_file(cl_src_path, &src_len);
-        prog = clCreateProgramWithSource(ctx, 1, (const char**)&src, &src_len, &err); CHECK(err);
+    }
+
+    if (!prog) {
+        /* compile from source as a robust fallback
+         * If the explicit <base>.cl does not exist (common when using combined
+         * names like "lzo1x_1_comp_atomic"), try to locate and combine the
+         * core and frontend sources: e.g. "lzo1x_1.cl" + "lzo1x_comp_atomic.cl".
+         */
+        size_t src_len = 0; char* src = NULL;
+        /* try source in current dir, otherwise try lzo_gpu/ subdir */
+        FILE* fchk = fopen(use_cl_src, "rb");
+        if (!fchk) {
+            char use_cl_src_alt[512]; snprintf(use_cl_src_alt, sizeof(use_cl_src_alt), "lzo_gpu/%s", use_cl_src);
+            fchk = fopen(use_cl_src_alt, "rb");
+            if (fchk) {
+                fclose(fchk);
+                src = read_file(use_cl_src_alt, &src_len);
+            }
+        } else {
+            fclose(fchk);
+            src = read_file(use_cl_src, &src_len);
+        }
+        if (!src) {
+            /* If this base is a decompressor base (only two decompressor kernels exist),
+             * do NOT attempt to split and combine core+frontend — simply report missing
+             * source and exit. This prevents the loader from trying to construct
+             * combined names for decompressor kernels. */
+            if (strncmp(use_base, "lzo1x_decomp", strlen("lzo1x_decomp")) == 0) {
+                fprintf(stderr, "source file %s not found and decompressor base will not be combined\n", use_cl_src);
+                exit(1);
+            }
+            /* attempt to split base into core_front and construct filenames */
+            char base_copy[256]; strncpy(base_copy, use_base, sizeof(base_copy)-1); base_copy[sizeof(base_copy)-1]='\0';
+            char* sep = strchr(base_copy, '_');
+            if (sep) {
+                *sep = '\0'; char* core = base_copy; char* front = sep + 1;
+                char core_fname[256]; char frontend_fname[256];
+                snprintf(core_fname, sizeof(core_fname), "%s.cl", core);
+                /* frontend in kernel_base was formed by stripping a leading
+                 * "lzo1x_" from frontend names; restore it when trying file
+                 * names (i.e. try "lzo1x_%s.cl"). */
+                snprintf(frontend_fname, sizeof(frontend_fname), "lzo1x_%s.cl", front);
+                /* try reading core + frontend */
+                size_t core_len=0, front_len=0; char* core_src = NULL; char* front_src = NULL;
+                FILE* fcore = fopen(core_fname, "rb");
+                FILE* ffront = fopen(frontend_fname, "rb");
+                /* try lzo_gpu/ prefixed filenames if not found in cwd */
+                if (!fcore) {
+                    char core_fname_alt[256]; snprintf(core_fname_alt, sizeof(core_fname_alt), "lzo_gpu/%s", core_fname);
+                    fcore = fopen(core_fname_alt, "rb");
+                    if (fcore) { fclose(fcore); core_src = read_file(core_fname_alt, &core_len); }
+                } else { fclose(fcore); core_src = read_file(core_fname, &core_len); }
+                if (!ffront) {
+                    char frontend_fname_alt[256]; snprintf(frontend_fname_alt, sizeof(frontend_fname_alt), "lzo_gpu/%s", frontend_fname);
+                    ffront = fopen(frontend_fname_alt, "rb");
+                    if (ffront) { fclose(ffront); front_src = read_file(frontend_fname_alt, &front_len); }
+                } else { fclose(ffront); front_src = read_file(frontend_fname, &front_len); }
+                if (!core_src || !front_src) {
+                    if (core_src) free(core_src);
+                    if (front_src) free(front_src);
+                    fprintf(stderr, "source files not found for combined kernel: %s and %s\n", core_fname, frontend_fname);
+                    exit(1);
+                }
+                /* remove any #include "lzo1x_*.cl" lines from frontend to avoid
+                 * re-including a default core; produce a cleaned frontend body. */
+                char* cleaned = malloc(front_len + 1);
+                size_t outp = 0; size_t pos = 0;
+                while (pos < front_len) {
+                    /* find line end */
+                    size_t line_start = pos; while (pos < front_len && front_src[pos] != '\n') pos++;
+                    size_t line_len = pos - line_start;
+                    /* check if line contains #include and lzo1x_ */
+                    if (!(line_len > 0 && strstr(front_src + line_start, "#include") && strstr(front_src + line_start, "lzo1x_"))) {
+                        memcpy(cleaned + outp, front_src + line_start, line_len);
+                        outp += line_len;
+                        if (pos < front_len && front_src[pos] == '\n') { cleaned[outp++] = '\n'; pos++; }
+                    } else {
+                        /* skip this include line including trailing newline if present */
+                        if (pos < front_len && front_src[pos] == '\n') pos++;
+                    }
+                }
+                cleaned[outp] = '\0';
+                /* build combined source: core first, then cleaned frontend */
+                src_len = core_len + outp + 32;
+                src = malloc(src_len);
+                snprintf(src, src_len, "/* combined: %s + %s */\n%s\n/* frontend (cleaned) */\n%s", core_fname, frontend_fname, core_src, cleaned);
+                free(core_src); free(front_src); free(cleaned);
+            } else {
+                fprintf(stderr, "source file %s not found and base not splittable\n", cl_src_path);
+                exit(1);
+            }
+        } else {
+            /* src was loaded from current dir or lzo_gpu/; nothing to do */
+        }
+
+        /* create program from assembled source */
+        prog = clCreateProgramWithSource(ctx, 1, (const char**)&src, &src_len, &err);
+        if (err != CL_SUCCESS) { fprintf(stderr, "clCreateProgramWithSource failed (err=%d)\n", err); free(src); exit(1); }
         err = clBuildProgram(prog, 1, &dev, "", NULL, NULL);
         if (err != CL_SUCCESS) {
             size_t log_sz = 0; clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
             char* log = malloc(log_sz+1); clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, log_sz, log, NULL); log[log_sz]='\0';
-            fprintf(stderr, "Build log:\n%s\n", log); free(log); exit(1);
+            fprintf(stderr, "Build log (from source):\n%s\n", log); free(log); free(src); exit(1);
         }
         free(src);
     }
@@ -221,6 +367,7 @@ int main(int argc, char** argv)
     int suppress_non_data = 0; /* when writing to stdout (-), suppress non-data prints */
     int show_help = 0;
     const char *comp_level = "1"; /* compression level: "1", "1k", "1l", "1o" */
+    const char *strategy = "none"; /* publish strategy: none, atomic, usehost */
 
     /* pass 1: only detect mode (-d) and help, to know how to parse verify */
     for (int i = 1; i < argc; ++i) {
@@ -239,6 +386,11 @@ int main(int argc, char** argv)
             output_path = argv[++i];
             output_explicit = 1;
             if (strcmp(output_path, "-") == 0) suppress_non_data = 1;
+            continue;
+        }
+        if (strcmp(arg, "--strategy") == 0) {
+            if (i + 1 >= argc) { fprintf(stderr, "missing argument for %s\n", arg); return 1; }
+            strategy = argv[++i];
             continue;
         }
         if (strcmp(arg, "-L") == 0 || strcmp(arg, "--level") == 0) {
@@ -314,7 +466,29 @@ int main(int argc, char** argv)
     uint64_t t_io_after = now_ns();
     ocl_init();
     uint64_t t_ocl_init = now_ns();
-        cl_program prog_d = load_prog_from_bin_or_src("lzo1x_decompress", "lzo1x_decompress.cl");
+        /* allow selecting a vectorized decompressor via env var LZO_DECOMP_VEC=1
+         * If not set, auto-detect from device capabilities: require
+         * CL_DEVICE_MEM_BASE_ADDR_ALIGN >= 128 (bits => 16 bytes) and
+         * CL_DEVICE_PREFERRED_VECTOR_WIDTH_CHAR >= 16 to enable vec path.
+         */
+        const char* devec_env = getenv("LZO_DECOMP_VEC");
+        int devec_flag = 0;
+        if (devec_env) {
+            devec_flag = (strcmp(devec_env, "1") == 0);
+        } else {
+            cl_uint mem_align_bits = 0, pref_char = 0;
+            clGetDeviceInfo(dev, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(mem_align_bits), &mem_align_bits, NULL);
+            clGetDeviceInfo(dev, CL_DEVICE_PREFERRED_VECTOR_WIDTH_CHAR, sizeof(pref_char), &pref_char, NULL);
+            if (mem_align_bits >= 128 && pref_char >= 16) devec_flag = 1;
+        }
+        const char* decomp_base = devec_flag ? "lzo1x_decomp_vec" : "lzo1x_decomp";
+        const char* decomp_src  = devec_flag ? "lzo1x_decomp_vec.cl" : "lzo1x_decomp.cl";
+        /* Emit stable, parseable identifiers for aggregation tools */
+        if (!suppress_non_data) {
+            printf("KERNEL=%s\n", decomp_base);
+            printf("STRATEGY=%s\n", devec_flag ? "vec" : "scalar");
+        }
+        cl_program prog_d = load_prog_from_bin_or_src(decomp_base, decomp_src);
         cl_int err; cl_kernel krn_d = clCreateKernel(prog_d, "lzo1x_block_decompress", &err); CHECK(err);
 
     cl_mem d_comp = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, comp_sz, p, &err); CHECK(err);
@@ -359,33 +533,42 @@ int main(int argc, char** argv)
         if (!suppress_non_data) puts("verify OK");
     }
 
-    /* decide whether to write output: compute default path if necessary */
-    if (!output_path) {
-        const char* in = lz_path;
-        size_t L = strlen(in);
-        int ends_lzo = (L >= 4 && strcmp(in + L - 4, ".lzo") == 0);
-        size_t outL = ends_lzo ? (L - 4) : (L + 4);
-        char* def = (char*)malloc(outL + 1);
-        if (ends_lzo) { memcpy(def, in, L - 4); def[L - 4] = '\0'; }
-        else { memcpy(def, in, L); memcpy(def + L, ".raw", 4); def[L + 4] = '\0'; }
-        output_path = def;
-    }
+    /* decide whether to write output:
+       - If user requested --verify (decompress mode) and did not explicitly pass -o,
+         do NOT write the decompressed file (only perform in-memory verification).
+       - If user explicitly passed -o, honor it and write output as requested. */
+    if (verify_path && !output_explicit) {
+        /* skip writing decompressed output when verify requested without -o */
+        if (!suppress_non_data) puts("verify mode: not writing decompressed output (no -o given)");
+    } else {
+        /* compute default output path if not explicitly provided */
+        if (!output_path) {
+            const char* in = lz_path;
+            size_t L = strlen(in);
+            int ends_lzo = (L >= 4 && strcmp(in + L - 4, ".lzo") == 0);
+            size_t outL = ends_lzo ? (L - 4) : (L + 4);
+            char* def = (char*)malloc(outL + 1);
+            if (ends_lzo) { memcpy(def, in, L - 4); def[L - 4] = '\0'; }
+            else { memcpy(def, in, L); memcpy(def + L, ".raw", 4); def[L + 4] = '\0'; }
+            output_path = def;
+        }
 
-    if (output_path) {
-        if (strcmp(output_path, "-") == 0) {
-            /* write raw data to stdout (only data) */
-            if (fwrite(out2, 1, orig_sz, stdout) != orig_sz) { perror("stdout write"); }
-            fflush(stdout);
-        } else {
-            if (verify_path && strcmp(output_path, verify_path) == 0) {
-                fprintf(stderr, "refusing to write output to the same path as --verify reference: %s\n", output_path);
-                return 1;
+        if (output_path) {
+            if (strcmp(output_path, "-") == 0) {
+                /* write raw data to stdout (only data) */
+                if (fwrite(out2, 1, orig_sz, stdout) != orig_sz) { perror("stdout write"); }
+                fflush(stdout);
+            } else {
+                if (verify_path && strcmp(output_path, verify_path) == 0) {
+                    fprintf(stderr, "refusing to write output to the same path as --verify reference: %s\n", output_path);
+                    return 1;
+                }
+                FILE* fo = fopen(output_path, "wb");
+                if (!fo) { perror(output_path); return 1; }
+                if (fwrite(out2, 1, orig_sz, fo) != orig_sz) { perror("fwrite"); fclose(fo); return 1; }
+                fclose(fo);
+                if (!suppress_non_data) printf("wrote %s\n", output_path);
             }
-            FILE* fo = fopen(output_path, "wb");
-            if (!fo) { perror(output_path); return 1; }
-            if (fwrite(out2, 1, orig_sz, fo) != orig_sz) { perror("fwrite"); fclose(fo); return 1; }
-            fclose(fo);
-            if (!suppress_non_data) printf("wrote %s\n", output_path);
         }
     }
 
@@ -429,9 +612,80 @@ int main(int argc, char** argv)
         fprintf(stderr, "unknown compression level: %s\n", comp_level);
         return 1;
     }
+    /* If a strategy was requested, select the corresponding comp frontend.
+       To allow using precompiled binaries for core×frontend combinations
+       we form a combined kernel base name: <core>_<frontend>. For example
+       'lzo1x_1' + 'lzo1x_comp_atomic' -> 'lzo1x_1_lzo1x_comp_atomic'. */
+    char core_base[64]; strcpy(core_base, kernel_base);
+    /* Always select a compression frontend: treat 'none' as the generic
+     * comp frontend (lzo1x_comp). Map 'usehost' to the delayed frontend
+     * variant which provides host-assisted behavior in some setups. */
+    {
+        const char *frontend = NULL;
+        if (strcmp(strategy, "none") == 0) {
+            frontend = "lzo1x_comp";
+        } else if (strcmp(strategy, "atomic") == 0) {
+            frontend = "lzo1x_comp_atomic";
+        } else if (strcmp(strategy, "usehost") == 0) {
+            /* usehost: use same frontend as 'none' (host-backed buffers but same frontend) */
+            frontend = "lzo1x_comp";
+        } else {
+            fprintf(stderr, "unknown strategy: %s\n", strategy); return 1;
+        }
+
+        /* combine core and frontend so the loader will find precompiled combo binaries
+           strip a leading "lzo1x_" from the frontend name to avoid duplicated prefix */
+        const char *frontend_short = frontend;
+        if (strncmp(frontend, "lzo1x_", 6) == 0) frontend_short = frontend + 6;
+        snprintf(kernel_base, sizeof(kernel_base), "%s_%s", core_base, frontend_short);
+    }
     snprintf(cl_src, sizeof(cl_src), "%s.cl", kernel_base);
+    /* Emit stable, parseable identifiers for aggregation tools */
+    {
+        const char* strat = (strcmp(strategy, "none") == 0) ? "scalar" : strategy;
+        if (!debug && !suppress_non_data) {
+            /* keep non-verbose prints consistent: print kernel and strategy */
+            printf("KERNEL=%s\n", kernel_base);
+            printf("STRATEGY=%s\n", strat);
+        } else if (!suppress_non_data) {
+            printf("KERNEL=%s\n", kernel_base);
+            printf("STRATEGY=%s\n", strat);
+        }
+    }
     cl_program prog_c = load_prog_from_bin_or_src(kernel_base, cl_src);
-    cl_int err; cl_kernel krn_c = clCreateKernel(prog_c, "lzo1x_block_compress", &err); CHECK(err);
+    cl_int err;
+    /* select kernel function name according to the kernel_base we loaded
+     * Use canonical exported symbol 'lzo1x_block_compress' from frontends.
+     */
+    char krn_name[64];
+    strcpy(krn_name, "lzo1x_block_compress");
+    cl_kernel krn_c = clCreateKernel(prog_c, krn_name, &err);
+    if (err != CL_SUCCESS) {
+        /* Simplified fallback: report available kernels and force a single
+         * source rebuild retry. Avoid multiple name-specific fallbacks — precompile
+         * step should produce binaries matching canonical exported symbol.
+         */
+        if (err == CL_INVALID_KERNEL_NAME) {
+            size_t kn_sz = 0;
+            clGetProgramInfo(prog_c, CL_PROGRAM_KERNEL_NAMES, 0, NULL, &kn_sz);
+            if (kn_sz > 0) {
+                char* kn = malloc(kn_sz + 1);
+                clGetProgramInfo(prog_c, CL_PROGRAM_KERNEL_NAMES, kn_sz, kn, NULL);
+                kn[kn_sz] = '\0';
+                fprintf(stderr, "kernel '%s' not found; available kernels: %s\n", krn_name, kn);
+                free(kn);
+            } else {
+                fprintf(stderr, "kernel '%s' not found and program reports no kernel names\n", krn_name);
+            }
+            /* Force a source-built program and retry once */
+            clReleaseProgram(prog_c);
+            prog_c = load_prog_from_bin_or_src(kernel_base, cl_src);
+            krn_c = clCreateKernel(prog_c, krn_name, &err);
+            if (err != CL_SUCCESS) { fprintf(stderr, "clCreateKernel after source rebuild failed (err=%d)\n", err); exit(1); }
+        } else {
+            fprintf(stderr, "clCreateKernel failed for %s (err=%d)\n", krn_name, err); exit(1);
+        }
+    }
 
     /* choose blocking dynamically (uses GPU CU count and ALIGN_BYTES) */
     size_t blk = 0, nblk = 0;
@@ -441,7 +695,34 @@ int main(int argc, char** argv)
 
     cl_mem d_in = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, in_sz, in_buf, &err); CHECK(err);
     cl_mem d_out = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, out_cap, NULL, &err); CHECK(err);
-    cl_mem d_len = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, nblk * sizeof(cl_uint), NULL, &err); CHECK(err);
+    /* map_mode: 0=default CL_MEM_WRITE_ONLY + clEnqueueReadBuffer
+     * 1=ALLOC_HOST_PTR + clEnqueueMapBuffer
+     * 2=USE_HOST_PTR with host pointer (posix_memalign)
+     */
+    int map_mode = 0;
+    /* comp frontends use the mapped/host-len approach */
+    /* comp frontends use the mapped/host-len approach */
+    if (strncmp(kernel_base, "lzo1x_comp", strlen("lzo1x_comp")) == 0 ||
+        strncmp(kernel_base, "lzo1x_gpu_port", strlen("lzo1x_gpu_port")) == 0) map_mode = 1;
+    /* special-case: if strategy==usehost, request USE_HOST_PTR backing */
+    if (strcmp(strategy, "usehost") == 0) map_mode = 2;
+
+    cl_mem d_len;
+    void* host_len_ptr = NULL;
+    size_t len_bytes = nblk * sizeof(cl_uint);
+    if (map_mode == 1) {
+        d_len = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, len_bytes, NULL, &err); CHECK(err);
+    } else if (map_mode == 2) {
+        /* allocate host pointer aligned to 64 bytes */
+        int rc = posix_memalign(&host_len_ptr, 64, len_bytes);
+        if (rc != 0) host_len_ptr = malloc(len_bytes);
+        memset(host_len_ptr, 0, len_bytes);
+        d_len = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, len_bytes, host_len_ptr, &err); CHECK(err);
+    } else {
+        d_len = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, len_bytes, NULL, &err); CHECK(err);
+    }
+
+
 
     CHECK(clSetKernelArg(krn_c, 0, sizeof(cl_mem), &d_in));
     CHECK(clSetKernelArg(krn_c, 1, sizeof(cl_mem), &d_out));
@@ -455,8 +736,21 @@ int main(int argc, char** argv)
     uint64_t t_exec_end = now_ns();
 
     cl_uint* len_arr = malloc(nblk * sizeof(cl_uint)); uint64_t t_len_read_start = now_ns();
-    CHECK(clEnqueueReadBuffer(q, d_len, CL_TRUE, 0, nblk * sizeof(cl_uint), len_arr, 0, NULL, NULL));
-    uint64_t t_len_read_end = now_ns();
+    uint64_t t_len_read_end = t_len_read_start;
+    if (map_mode == 1) {
+        void* mapped = clEnqueueMapBuffer(q, d_len, CL_TRUE, CL_MAP_READ, 0, len_bytes, 0, NULL, NULL, &err);
+        CHECK(err);
+        memcpy(len_arr, mapped, len_bytes);
+        CHECK(clEnqueueUnmapMemObject(q, d_len, mapped, 0, NULL, NULL));
+        t_len_read_end = now_ns();
+    } else if (map_mode == 2) {
+        /* host_len_ptr contains the backing store for d_len */
+        if (host_len_ptr) memcpy(len_arr, host_len_ptr, len_bytes);
+        t_len_read_end = now_ns();
+    } else {
+        CHECK(clEnqueueReadBuffer(q, d_len, CL_TRUE, 0, len_bytes, len_arr, 0, NULL, NULL));
+        t_len_read_end = now_ns();
+    }
 
     if (debug) {
         fprintf(stderr, "Per-block compressed lengths (nblk=%zu):\n", nblk);
@@ -466,16 +760,46 @@ int main(int argc, char** argv)
     }
 
     size_t out_sz = 0; for (size_t i = 0; i < nblk; ++i) out_sz += len_arr[i];
-    unsigned char* out_buf = malloc(out_sz);
+    unsigned char* out_buf = NULL;
     size_t host_off = 0;
     /* bulk-read entire device output buffer once to avoid many small PCIe transfers */
     unsigned char* dev_out = malloc(out_cap); uint64_t t_bulk_read_start = now_ns();
     CHECK(clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, out_cap, dev_out, 0, NULL, NULL));
     uint64_t t_bulk_read_end = now_ns();
+    /* debug: dump first 32 bytes of first block to help diagnose visibility */
+    if (debug) {
+        fprintf(stderr, "dev_out[0..31]:");
+        for (size_t i = 0; i < 32 && i < out_cap; ++i) fprintf(stderr, " %02x", dev_out[i]);
+        fprintf(stderr, "\n");
+    }
+
+    /* If kernel didn't populate `out_len` (all zeros), try reconstructing per-block
+     * lengths from the device output buffer: we expect the kernel to write a
+     * little-endian 32-bit length at the start of each block region as a
+     * robust fallback (the `lzo1x_gpu_port` variant does this). */
+    if (out_sz == 0) {
+        for (size_t i = 0; i < nblk; ++i) {
+            size_t dev_off = i * worst_blk;
+            if (dev_off + 4 <= out_cap) {
+                uint32_t v = (uint32_t)dev_out[dev_off + 0]
+                           | ((uint32_t)dev_out[dev_off + 1] << 8)
+                           | ((uint32_t)dev_out[dev_off + 2] << 16)
+                           | ((uint32_t)dev_out[dev_off + 3] << 24);
+                len_arr[i] = v;
+                out_sz += v;
+            } else {
+                len_arr[i] = 0;
+            }
+        }
+    }
+
+    out_buf = malloc(out_sz);
     for (size_t i = 0; i < nblk; ++i) {
         size_t dev_off = i * worst_blk;
-        memcpy(out_buf + host_off, dev_out + dev_off, len_arr[i]);
-        host_off += len_arr[i];
+        if (len_arr[i] > 0) {
+            memcpy(out_buf + host_off, dev_out + dev_off, len_arr[i]);
+            host_off += len_arr[i];
+        }
     }
     free(dev_out);
 
@@ -517,7 +841,20 @@ int main(int argc, char** argv)
         uint32_t* off_arr = malloc((nblk + 1) * sizeof(uint32_t)); off_arr[0] = 0;
         for (size_t i = 0; i < nblk; ++i) off_arr[i+1] = off_arr[i] + len_arr[i];
 
-        cl_program prog_d = load_prog_from_bin_or_src("lzo1x_decompress", "lzo1x_decompress.cl");
+        /* choose vectorized decompress kernel if requested for verify */
+        const char* devec2 = getenv("LZO_DECOMP_VEC");
+        int devec_flag2 = 0;
+        if (devec2) {
+            devec_flag2 = (strcmp(devec2, "1") == 0);
+        } else {
+            cl_uint mem_align_bits2 = 0, pref_char2 = 0;
+            clGetDeviceInfo(dev, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(mem_align_bits2), &mem_align_bits2, NULL);
+            clGetDeviceInfo(dev, CL_DEVICE_PREFERRED_VECTOR_WIDTH_CHAR, sizeof(pref_char2), &pref_char2, NULL);
+            if (mem_align_bits2 >= 128 && pref_char2 >= 16) devec_flag2 = 1;
+        }
+        const char* decomp_base2 = devec_flag2 ? "lzo1x_decomp_vec" : "lzo1x_decomp";
+        const char* decomp_src2  = devec_flag2 ? "lzo1x_decomp_vec.cl" : "lzo1x_decomp.cl";
+        cl_program prog_d = load_prog_from_bin_or_src(decomp_base2, decomp_src2);
         cl_kernel krn_d = clCreateKernel(prog_d, "lzo1x_block_decompress", &err); CHECK(err);
         cl_mem d_comp = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, out_sz, out_buf, &err); CHECK(err);
         cl_mem d_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, (nblk + 1) * sizeof(cl_uint), off_arr, &err); CHECK(err);

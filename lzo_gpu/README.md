@@ -28,12 +28,17 @@ Notes
 Regression script
 -----------------
 A helper script `run_samples_levels.sh` is provided to run multi-level regression tests over `../samples/`.
-It compresses and decompresses each sample for each supported level and writes outputs to `test_outputs/<level>/`.
+It compresses each sample for each supported level and writes compressed `.lzo` outputs to `test_outputs_levels/<level>/`.
+
+Important: when `--verify` is used for decompression, the program will not write the decompressed output unless an explicit `-o` is given. The regression script and experiment runners use `--verify` without `-o` by default to avoid creating large decompressed files on disk; they rely on the verify exit status to determine correctness.
 
 Example
 -------
   cd lzo_gpu
   make
   ./lzo_gpu -L 1k ../samples/test_16kb_mixed.dat -o out.lzo
+  # Verify only, do not write decompressed output:
+  ./lzo_gpu -d --verify ../samples/test_16kb_mixed.dat out.lzo
+  # If you do need the decompressed file, pass -o explicitly:
   ./lzo_gpu -d --verify ../samples/test_16kb_mixed.dat out.lzo -o out.dec
 

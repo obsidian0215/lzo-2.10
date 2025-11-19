@@ -11,6 +11,11 @@
 *.lo
 *.la
 *.out
+*.pid
+*.bin
+*.csv
+*.log
+*.lzo
 
 # preprocessed/source-generated files
 *.i
@@ -48,6 +53,7 @@ __pycache__/
 # If there are specific build outputs in subdirs, add them explicitly
 # e.g. ignore any lzo_cpu executables or preprocessed outputs
 lzo_cpu/*.exe
+
 lzo_cpu/*.i
 lzo_cpu/pre*.i
 lzo_cpu/lzo_cpu
@@ -56,9 +62,10 @@ lzo_cpu/samples/
 lzo_gpu/lzo_gpu
 lzo_gpu/samples/
 samples/
-lzo_gpu/*.bin
 lzo_gpu/build_kernel
-lzo_gpu/*.lzo
-lzo_gpu/*.log
-lzo_gpu/*.csv
+
+exp_results/
+build/
+param_scan_*/
+archived/
 # end

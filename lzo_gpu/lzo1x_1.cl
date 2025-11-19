@@ -27,8 +27,8 @@
    compiler to choose the best addressing mode. This aligns behavior with
    lzo1x_1k/1l/1o and avoids forced global-address-space loads which can be
    slower on some OpenCL implementations. */
-#define lzo_memops_TU0p __generic void *
-#define lzo_memops_TU1p __generic unsigned char *
+#define lzo_memops_TU0p __global void *
+#define lzo_memops_TU1p __global unsigned char *
 
 #define lzo_memops_set_TU1p     volatile lzo_memops_TU1p
 #define lzo_memops_move_TU1p    lzo_memops_TU1p
@@ -43,33 +43,33 @@
     *(lzo_memops_set_TU1p) (lzo_memops_TU0p) (dd) = LZO_BYTE(cc); \
     LZO_BLOCK_END
 
-#define LZO_MEMOPS_COPY1(dd,ss)   *((__generic uchar *)(dd)) = *((__generic const uchar *)(ss))
-#define LZO_MEMOPS_COPY2(dd,ss)   *((__generic ushort*)(dd)) = *((__generic const ushort*)(ss))
+#define LZO_MEMOPS_COPY1(dd,ss)   *((__global uchar *)(dd)) = *((__global const uchar *)(ss))
+#define LZO_MEMOPS_COPY2(dd,ss)   *((__global ushort*)(dd)) = *((__global const ushort*)(ss))
 
-static inline void LZO_MEMOPS_COPY4(void *dd, const void *ss)
+static inline void LZO_MEMOPS_COPY4(__global void *dd, const __global void *ss)
 {
     if (lzo_ptr_aligned(dd,4) && lzo_ptr_aligned(ss,4))
-        *((__generic uint*)dd) =  *((__generic const uint*)ss);
+        *((__global uint*)dd) =  *((__global const uint*)ss);
     else {
-        uchar4 v = vload4(0, (__generic const uchar*)ss);
-        vstore4(v,0,(__generic uchar*)dd);
+        uchar4 v = vload4(0, (__global const uchar*)ss);
+        vstore4(v,0,(__global uchar*)dd);
     }
 }
 
-static inline void LZO_MEMOPS_COPY8(void *dd, const void *ss)
+static inline void LZO_MEMOPS_COPY8(__global void *dd, const __global void *ss)
 {
     if (lzo_ptr_aligned(dd,8) && lzo_ptr_aligned(ss,8))
-        *((__generic ulong*)dd) = *((__generic const ulong*)ss);
+        *((__global ulong*)dd) = *((__global const ulong*)ss);
     else {
-        uchar8 v = vload8(0, (__generic const uchar*)ss);
-        vstore8(v,0,(__generic uchar*)dd);
+        uchar8 v = vload8(0, (__global const uchar*)ss);
+        vstore8(v,0,(__global uchar*)dd);
     }
 }
 
-static inline void LZO_MEMOPS_COPYN(void *dd, const void *ss, uint nn)
+static inline void LZO_MEMOPS_COPYN(__global void *dd, const __global void *ss, uint nn)
 {
-    __generic uchar *d = (__generic uchar*)dd;
-    __generic const uchar *s = (__generic const uchar*)ss;
+    __global uchar *d = (__global uchar*)dd;
+    __global const uchar *s = (__global const uchar*)ss;
 
     /* 先搬 64-bit 带齐尾数 */
     while (nn >= 8 && lzo_ptr_aligned(d,8) && lzo_ptr_aligned(s,8))
@@ -83,12 +83,12 @@ static inline void LZO_MEMOPS_COPYN(void *dd, const void *ss, uint nn)
     for (; nn; --nn) *d++ = *s++;
 }
 
-static inline uint lzo_memops_get_le32(const void *pp)
+static inline uint lzo_memops_get_le32(const __global void *pp)
 {
-    const __generic uchar *p = (const __generic uchar*)pp;
+    const __global uchar *p = (const __global uchar*)pp;
 
     if (lzo_ptr_aligned(p,4))
-        return as_uint(*((const __generic uint*)p));      /* 1 × 32-bit load */
+        return as_uint(*((const __global uint*)p));      /* 1 × 32-bit load */
 
     return  (uint)p[0]        |
            ((uint)p[1] <<  8) |
@@ -130,13 +130,12 @@ static inline uint lzo_memops_get_le32(const void *pp)
 #define lzo_dict_t lzo_uint16_t
 
 #if 1
-/* 标准版本：使用14位字典 (原始)，但大型 per-work-item dict 导致在某些设备上私有内存溢出/溢写到全局内存。
-    为了对比与其它变体，这里临时将 D_BITS 降低到 11，以减少每个 work-item 的字典内存占用。
-    这是一次小型实验性改动，可在确认效果后恢复或采用更稳健的优化（如使用 __local 或全局字典）。 */
+/* 默认使用 14 位字典（与原始实现一致）。如果调用方在包含前定义了
+   `D_BITS`，则保持调用者指定的值。这个宏块只是提供默认值。 */
 #endif
-#define D_BITS_REDUCED_EXPERIMENT 11
-#define D_BITS          D_BITS_REDUCED_EXPERIMENT
-#define D_BITS          14
+#ifndef D_BITS
+#define D_BITS 14
+#endif
 #define D_INDEX1(d,p)       d = DM(DMUL(0x21,DX3(p,5,5,6)) >> 5)
 #define D_INDEX2(d,p)       d = (d & (D_MASK & 0x7ff)) ^ (D_HIGH | 0x1f)
 #define DINDEX(dv,p)        DM(((DMUL(0x1824429d,dv)) >> (32-D_BITS)))
@@ -624,5 +623,5 @@ __kernel void lzo1x_block_compress(__global const uchar *in ,
     out_len[gid] = olen;
 }
 
-/* decompression moved to lzo1x_decompress.cl to avoid duplication */
+/* decompression moved to lzo1x_decomp.cl to avoid duplication */
 #endif /* LZO_NO_DEFAULT_KERNEL */

@@ -447,4 +447,4 @@ __kernel void lzo1x_block_compress(__global const uchar *in ,
     out_len[gid] = olen;
 }
 
-/* decompression moved to lzo1x_decompress.cl to avoid duplication */
+/* decompression moved to lzo1x_decomp.cl to avoid duplication */

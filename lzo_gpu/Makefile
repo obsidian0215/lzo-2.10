@@ -6,7 +6,7 @@ LDFLAGS ?= -lOpenCL
 ## attempt to precompile kernels that aren't actually in the tree.
 CL_SOURCES := $(wildcard *.cl)
 
-all: build_kernel lzo_gpu precompile-all
+all: build_kernel lzo_gpu precompile-combos
 
 build_kernel: build_kernel.c
 	$(CC) $(CFLAGS) -o build_kernel build_kernel.c $(LDFLAGS)
@@ -24,7 +24,7 @@ precompile: build_kernel
 		if [ ! -f "$$src" ]; then echo "Kernel source $$src not found"; exit 1; fi; \
 		./build_kernel $$src $${src%%.cl}.bin; \
 	else \
-		$(MAKE) precompile-all; \
+		$(MAKE) precompile-combos; \
 	fi
 
 
@@ -39,6 +39,14 @@ precompile-all:
 			./build_kernel $$f $$bn || exit 1; \
 		done; \
 	fi
+
+# Build combinations of core kernels and frontend strategies into precompiled binaries.
+# For each core (like lzo1x_1, lzo1x_1k, ...) and each frontend wrapper (atomic/delayed/usehost/...)
+# create a temporary directory, copy the frontend there and copy the chosen core as
+# `lzo1x_1.cl` so that the frontend's `#include "lzo1x_1.cl"` picks up the selected core.
+# Output binaries are named `<core>_<frontend>.bin` (both basenames without .cl).
+precompile-combos: build_kernel
+	@./tools/precompile_combos.sh
 
 .PHONY: help check-opencl testdata
 
