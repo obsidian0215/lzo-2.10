@@ -50,7 +50,7 @@ fi
 if [ -n "${LZO_STRATEGIES:-}" ]; then
   read -r -a STRATEGIES <<< "$(echo "$LZO_STRATEGIES" | tr ',' ' ')"
 else
-  STRATEGIES=(none atomic usehost)
+  STRATEGIES=(none atomic)
 fi
 
 if [ -n "${LZO_WG_SIZE:-}" ]; then
@@ -117,8 +117,9 @@ for comp_level in "${COMP_LEVELS[@]}"; do
               out_lzo="$tmp_run_dir/lzo_out_${sname}_run${r}.lzo"
               logf="$cfg_dir_mode/${sname}_run${r}.log"
 
-              echo "[Run $total_runs] COMP=$comp_level MODE=$mode WG=$wg VLEN=$v SAMPLE=$sname R=$r -> $logf"
-              echo "# COMP=$comp_level MODE=$mode WG=$wg VLEN=$v SAMPLE=$sname R=$r" > "$logf"
+              # Make log header explicit: include strategy and mark the decomp-mode
+              echo "[Run $total_runs] COMP=$comp_level STRATEGY=$strategy DECOMP_MODE=$mode WG=$wg VLEN=$v SAMPLE=$sname R=$r -> $logf"
+              echo "# COMP=$comp_level STRATEGY=$strategy DECOMP_MODE=$mode WG=$wg VLEN=$v SAMPLE=$sname R=$r" > "$logf"
               echo "Compressing: $sample -> $out_lzo" >> "$logf"
 
               # construct strategy argument: omit when 'none'
@@ -134,8 +135,23 @@ for comp_level in "${COMP_LEVELS[@]}"; do
                 printf "# DRY-RUN CMD: (cd \"%s\" && %s)\n" "$WRAPDIR" "${COMP_CMD[*]}" | tee -a "$logf"
                 compress_status=0
               else
-                (cd "$WRAPDIR" && "${COMP_CMD[@]}") >> "$logf" 2>&1 || true
+                (
+                  cd "$WRAPDIR"
+                  "${COMP_CMD[@]}"
+                ) >> "$logf" 2>&1
                 compress_status=$?
+                timestamp=$(date --iso-8601=seconds 2>/dev/null || date)
+                if [ "$compress_status" -ne 0 ]; then
+                  if [ "$compress_status" -gt 128 ]; then
+                    sig=$((compress_status-128))
+                    signame=$(kill -l "$sig" 2>/dev/null || echo "SIG$sig")
+                    printf "[Run %d] COMP failed: signal %d (%s) at %s (rc=%d)\n" "$total_runs" "$sig" "$signame" "$timestamp" "$compress_status" | tee -a "$logf"
+                  else
+                    printf "[Run %d] COMP failed: exit %d at %s\n" "$total_runs" "$compress_status" "$timestamp" | tee -a "$logf"
+                  fi
+                else
+                  printf "[Run %d] COMP exit 0 at %s\n" "$total_runs" "$timestamp" >> "$logf"
+                fi
               fi
 
               echo "Decompress+verify" >> "$logf"
@@ -143,8 +159,23 @@ for comp_level in "${COMP_LEVELS[@]}"; do
                 printf "# DRY-RUN CMD: (cd \"%s\" && %s)\n" "$WRAPDIR" "${DECMD[*]}" | tee -a "$logf"
                 verify_status=0
               else
-                (cd "$WRAPDIR" && "${DECMD[@]}") >> "$logf" 2>&1 || true
+                (
+                  cd "$WRAPDIR"
+                  "${DECMD[@]}"
+                ) >> "$logf" 2>&1
                 verify_status=$?
+                timestamp=$(date --iso-8601=seconds 2>/dev/null || date)
+                if [ "$verify_status" -ne 0 ]; then
+                  if [ "$verify_status" -gt 128 ]; then
+                    sig=$((verify_status-128))
+                    signame=$(kill -l "$sig" 2>/dev/null || echo "SIG$sig")
+                    printf "[Run %d] VERIFY failed: signal %d (%s) at %s (rc=%d)\n" "$total_runs" "$sig" "$signame" "$timestamp" "$verify_status" | tee -a "$logf"
+                  else
+                    printf "[Run %d] VERIFY failed: exit %d at %s\n" "$total_runs" "$verify_status" "$timestamp" | tee -a "$logf"
+                  fi
+                else
+                  printf "[Run %d] VERIFY exit 0 at %s\n" "$total_runs" "$timestamp" >> "$logf"
+                fi
               fi
 
               if [ $verify_status -eq 0 ]; then

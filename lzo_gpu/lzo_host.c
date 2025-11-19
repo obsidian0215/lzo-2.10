@@ -184,27 +184,8 @@ static cl_program load_prog_from_bin_or_src(const char* base, const char* cl_src
 /* Helper: load program from <base>.bin or from source file */
 static cl_program load_prog_from_bin_or_src(const char* base, const char* cl_src_path)
 {
-    /* Normalize names: never attempt to load or print the historic
-     * "decompress" spelling for kernel/base names. Always prefer the
-     * shorter "decomp" token for file and binary names. This avoids the
-     * host producing or searching for 'lzo1x_decompress' binaries/sources. */
     char use_base[256]; strncpy(use_base, base, sizeof(use_base)-1); use_base[sizeof(use_base)-1]='\0';
     char use_cl_src[256]; strncpy(use_cl_src, cl_src_path, sizeof(use_cl_src)-1); use_cl_src[sizeof(use_cl_src)-1]='\0';
-    /* replace "decompress" -> "decomp" in base (if present) */
-    char* p = strstr(use_base, "decompress");
-    if (p) {
-        size_t tail_len = strlen(p + strlen("decompress"));
-        /* write 'decomp' then append trailing part */
-        strcpy(p, "decomp");
-        strcpy(p + strlen("decomp"), p + strlen("decomp") + tail_len);
-    }
-    /* replace "decompress.cl" -> "decomp.cl" in cl src path if present */
-    char* q = strstr(use_cl_src, "decompress.cl");
-    if (q) {
-        size_t tail_len2 = strlen(q + strlen("decompress.cl"));
-        strcpy(q, "decomp.cl");
-        strcpy(q + strlen("decomp.cl"), q + strlen("decomp.cl") + tail_len2);
-    }
 
     char bin_path[512]; snprintf(bin_path, sizeof(bin_path), "%s.bin", use_base);
     /* also prepare an alternate path inside the lzo_gpu subdir to be robust
@@ -367,7 +348,7 @@ int main(int argc, char** argv)
     int suppress_non_data = 0; /* when writing to stdout (-), suppress non-data prints */
     int show_help = 0;
     const char *comp_level = "1"; /* compression level: "1", "1k", "1l", "1o" */
-    const char *strategy = "none"; /* publish strategy: none, atomic, usehost */
+    const char *strategy = "none"; /* publish strategy: none, atomic */
 
     /* pass 1: only detect mode (-d) and help, to know how to parse verify */
     for (int i = 1; i < argc; ++i) {
@@ -618,17 +599,13 @@ int main(int argc, char** argv)
        'lzo1x_1' + 'lzo1x_comp_atomic' -> 'lzo1x_1_lzo1x_comp_atomic'. */
     char core_base[64]; strcpy(core_base, kernel_base);
     /* Always select a compression frontend: treat 'none' as the generic
-     * comp frontend (lzo1x_comp). Map 'usehost' to the delayed frontend
-     * variant which provides host-assisted behavior in some setups. */
+     * comp frontend (lzo1x_comp). */
     {
         const char *frontend = NULL;
         if (strcmp(strategy, "none") == 0) {
             frontend = "lzo1x_comp";
         } else if (strcmp(strategy, "atomic") == 0) {
             frontend = "lzo1x_comp_atomic";
-        } else if (strcmp(strategy, "usehost") == 0) {
-            /* usehost: use same frontend as 'none' (host-backed buffers but same frontend) */
-            frontend = "lzo1x_comp";
         } else {
             fprintf(stderr, "unknown strategy: %s\n", strategy); return 1;
         }
@@ -693,8 +670,19 @@ int main(int argc, char** argv)
     size_t worst_blk = lzo_worst(blk);
     size_t out_cap = nblk * worst_blk;
 
-    cl_mem d_in = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, in_sz, in_buf, &err); CHECK(err);
-    cl_mem d_out = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, out_cap, NULL, &err); CHECK(err);
+    if (debug) {
+        fprintf(stderr, "DBG: choose_blocking -> in_sz=%zu blk=%zu nblk=%zu worst_blk=%zu out_cap=%zu\n",
+                in_sz, blk, nblk, worst_blk, out_cap);
+    }
+
+    if (debug) fprintf(stderr, "DBG: creating d_in size=%zu\n", in_sz);
+    cl_mem d_in = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, in_sz, in_buf, &err);
+    if (debug) fprintf(stderr, "DBG: created d_in err=%d\n", err);
+    CHECK(err);
+    if (debug) fprintf(stderr, "DBG: creating d_out size=%zu\n", out_cap);
+    cl_mem d_out = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, out_cap, NULL, &err);
+    if (debug) fprintf(stderr, "DBG: created d_out err=%d\n", err);
+    CHECK(err);
     /* map_mode: 0=default CL_MEM_WRITE_ONLY + clEnqueueReadBuffer
      * 1=ALLOC_HOST_PTR + clEnqueueMapBuffer
      * 2=USE_HOST_PTR with host pointer (posix_memalign)
@@ -704,25 +692,18 @@ int main(int argc, char** argv)
     /* comp frontends use the mapped/host-len approach */
     if (strncmp(kernel_base, "lzo1x_comp", strlen("lzo1x_comp")) == 0 ||
         strncmp(kernel_base, "lzo1x_gpu_port", strlen("lzo1x_gpu_port")) == 0) map_mode = 1;
-    /* special-case: if strategy==usehost, request USE_HOST_PTR backing */
-    if (strcmp(strategy, "usehost") == 0) map_mode = 2;
+    /* No special 'usehost' strategy supported any more; only map_mode 0/1 are used. */
 
     cl_mem d_len;
-    void* host_len_ptr = NULL;
     size_t len_bytes = nblk * sizeof(cl_uint);
     if (map_mode == 1) {
         d_len = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, len_bytes, NULL, &err); CHECK(err);
-    } else if (map_mode == 2) {
-        /* allocate host pointer aligned to 64 bytes */
-        int rc = posix_memalign(&host_len_ptr, 64, len_bytes);
-        if (rc != 0) host_len_ptr = malloc(len_bytes);
-        memset(host_len_ptr, 0, len_bytes);
-        d_len = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, len_bytes, host_len_ptr, &err); CHECK(err);
     } else {
-        d_len = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, len_bytes, NULL, &err); CHECK(err);
+        if (debug) fprintf(stderr, "DBG: map_mode=0 creating d_len len_bytes=%zu\n", len_bytes);
+        d_len = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, len_bytes, NULL, &err);
+        if (debug) fprintf(stderr, "DBG: created d_len err=%d\n", err);
+        CHECK(err);
     }
-
-
 
     CHECK(clSetKernelArg(krn_c, 0, sizeof(cl_mem), &d_in));
     CHECK(clSetKernelArg(krn_c, 1, sizeof(cl_mem), &d_out));
@@ -743,11 +724,8 @@ int main(int argc, char** argv)
         memcpy(len_arr, mapped, len_bytes);
         CHECK(clEnqueueUnmapMemObject(q, d_len, mapped, 0, NULL, NULL));
         t_len_read_end = now_ns();
-    } else if (map_mode == 2) {
-        /* host_len_ptr contains the backing store for d_len */
-        if (host_len_ptr) memcpy(len_arr, host_len_ptr, len_bytes);
-        t_len_read_end = now_ns();
     } else {
+        /* Default: perform explicit blocking read to fetch lengths from device */
         CHECK(clEnqueueReadBuffer(q, d_len, CL_TRUE, 0, len_bytes, len_arr, 0, NULL, NULL));
         t_len_read_end = now_ns();
     }
@@ -764,7 +742,9 @@ int main(int argc, char** argv)
     size_t host_off = 0;
     /* bulk-read entire device output buffer once to avoid many small PCIe transfers */
     unsigned char* dev_out = malloc(out_cap); uint64_t t_bulk_read_start = now_ns();
+    if (debug) fprintf(stderr, "DBG: about to clEnqueueReadBuffer d_out size=%zu\n", out_cap);
     CHECK(clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, out_cap, dev_out, 0, NULL, NULL));
+    if (debug) fprintf(stderr, "DBG: clEnqueueReadBuffer completed\n");
     uint64_t t_bulk_read_end = now_ns();
     /* debug: dump first 32 bytes of first block to help diagnose visibility */
     if (debug) {
@@ -778,6 +758,12 @@ int main(int argc, char** argv)
      * little-endian 32-bit length at the start of each block region as a
      * robust fallback (the `lzo1x_gpu_port` variant does this). */
     if (out_sz == 0) {
+        /* Attempt to recover per-block lengths from device output buffer.
+         * Guard against interpreting arbitrary bytes as huge lengths which
+         * can lead to oversized allocations and crashes. Accept a length
+         * only if it is non-zero and reasonably bounded by `worst_blk` and
+         * `out_cap`. Accumulate into a temporary size and check overflow. */
+        size_t tmp_out_sz = 0;
         for (size_t i = 0; i < nblk; ++i) {
             size_t dev_off = i * worst_blk;
             if (dev_off + 4 <= out_cap) {
@@ -785,15 +771,57 @@ int main(int argc, char** argv)
                            | ((uint32_t)dev_out[dev_off + 1] << 8)
                            | ((uint32_t)dev_out[dev_off + 2] << 16)
                            | ((uint32_t)dev_out[dev_off + 3] << 24);
-                len_arr[i] = v;
-                out_sz += v;
+                /* sanity checks */
+                if (v == 0 || v > worst_blk || v > out_cap) {
+                    len_arr[i] = 0;
+                } else {
+                    /* check overflow before adding */
+                    if (tmp_out_sz + (size_t)v < tmp_out_sz) {
+                        len_arr[i] = 0;
+                    } else {
+                        len_arr[i] = v;
+                        tmp_out_sz += (size_t)v;
+                    }
+                }
             } else {
                 len_arr[i] = 0;
             }
         }
+        out_sz = tmp_out_sz;
+        if (out_sz == 0) {
+            fprintf(stderr, "ERR: failed to recover per-block lengths from device output; aborting\n");
+            free(dev_out);
+            free(len_arr);
+            /* cleanup and exit with error */
+            clReleaseMemObject(d_in); clReleaseMemObject(d_out); clReleaseMemObject(d_len);
+            clReleaseKernel(krn_c); clReleaseProgram(prog_c);
+            clReleaseCommandQueue(q); clReleaseContext(ctx);
+            free(in_buf);
+            return 1;
+        }
     }
 
+    if (out_sz > out_cap) {
+        fprintf(stderr, "ERR: computed total output size (%zu) exceeds device capacity (%zu); aborting\n", out_sz, out_cap);
+        free(dev_out);
+        free(len_arr);
+        clReleaseMemObject(d_in); clReleaseMemObject(d_out); clReleaseMemObject(d_len);
+        clReleaseKernel(krn_c); clReleaseProgram(prog_c);
+        clReleaseCommandQueue(q); clReleaseContext(ctx);
+        free(in_buf);
+        return 1;
+    }
     out_buf = malloc(out_sz);
+    if (!out_buf) {
+        fprintf(stderr, "ERR: malloc(%zu) failed\n", out_sz);
+        free(dev_out);
+        free(len_arr);
+        clReleaseMemObject(d_in); clReleaseMemObject(d_out); clReleaseMemObject(d_len);
+        clReleaseKernel(krn_c); clReleaseProgram(prog_c);
+        clReleaseCommandQueue(q); clReleaseContext(ctx);
+        free(in_buf);
+        return 1;
+    }
     for (size_t i = 0; i < nblk; ++i) {
         size_t dev_off = i * worst_blk;
         if (len_arr[i] > 0) {
