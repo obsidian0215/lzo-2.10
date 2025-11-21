@@ -18,6 +18,7 @@ if not os.path.isfile(CSV):
 rows=[]
 with open(CSV,'r',newline='') as fh:
     r=csv.DictReader(fh)
+    use_mode = ('mode' in (r.fieldnames or []))
     for row in r:
         # convert numeric fields
         try:
@@ -41,7 +42,10 @@ top_decomp=top_n_by('decomp_mean',15)
 top_comp=top_n_by('comp_mean',15)
 
 def bar_plot(list_rows,key,title,fname, ylabel):
-    labels=[f"{r['comp']}/{r['mode']}/wg{r['wg']}/v{r['vlen']}" for r in list_rows]
+    if use_mode:
+        labels=[f"{r['comp']}/{r.get('mode','')} / wg{r['wg']}" for r in list_rows]
+    else:
+        labels=[f"{r['comp']} / wg{r['wg']}" for r in list_rows]
     vals=[r[key] for r in list_rows]
     errs=[r[key.replace('mean','stdev')] if (key=='decomp_mean' or key=='comp_mean') else 0 for r in list_rows]
     x=np.arange(len(labels))
@@ -79,18 +83,30 @@ with open(REPORT,'w') as rep:
     rep.write('# LZO GPU Throughput Summary\n\n')
     rep.write('This report summarizes compression and decompression throughput across the parameter scan.\n\n')
     rep.write('## Top configurations by Decompression mean throughput\n\n')
-    rep.write('| Rank | COMP/MODE | strategy | decomp_mode | WG | VLEN | samples | decomp_mean (MB/s) | decomp_median | decomp_stdev |\n')
-    rep.write('|---:|---|---|---:|---:|---:|---:|---:|---:|---:|\n')
-    for i,r in enumerate(top_decomp,1):
-        rep.write(f"| {i} | {r['comp']}/{r['mode']} | {r['strategy']} | {r['decomp_mode']} | {r['wg']} | {r['vlen']} | {r['samples']} | {r['decomp_mean']:.2f} | {r['decomp_median']} | {r['decomp_stdev']:.2f} |\n")
+    if use_mode:
+        rep.write('| Rank | COMP/MODE | WG | samples | decomp_mean (MB/s) | decomp_median | decomp_stdev |\n')
+        rep.write('|---:|---|---:|---:|---:|---:|---:|\n')
+        for i,r in enumerate(top_decomp,1):
+            rep.write(f"| {i} | {r['comp']}/{r.get('mode','')} | {r['wg']} | {r['samples']} | {r['decomp_mean']:.2f} | {r['decomp_median']} | {r['decomp_stdev']:.2f} |\n")
+    else:
+        rep.write('| Rank | COMP | WG | samples | decomp_mean (MB/s) | decomp_median | decomp_stdev |\n')
+        rep.write('|---:|---|---:|---:|---:|---:|---:|\n')
+        for i,r in enumerate(top_decomp,1):
+            rep.write(f"| {i} | {r['comp']} | {r['wg']} | {r['samples']} | {r['decomp_mean']:.2f} | {r['decomp_median']} | {r['decomp_stdev']:.2f} |\n")
     rep.write('\n')
     rep.write('![Top decomp](' + os.path.relpath(plots[0], start=os.path.dirname(REPORT)) + ')\n\n')
 
     rep.write('## Top configurations by Compression mean throughput\n\n')
-    rep.write('| Rank | COMP/MODE | strategy | decomp_mode | WG | VLEN | samples | comp_mean (MB/s) | comp_median | comp_stdev |\n')
-    rep.write('|---:|---|---|---:|---:|---:|---:|---:|---:|---:|\n')
-    for i,r in enumerate(top_comp,1):
-        rep.write(f"| {i} | {r['comp']}/{r['mode']} | {r['strategy']} | {r['decomp_mode']} | {r['wg']} | {r['vlen']} | {r['samples']} | {r['comp_mean']:.2f} | {r['comp_median']} | {r['comp_stdev']:.2f} |\n")
+    if use_mode:
+        rep.write('| Rank | COMP/MODE | WG | samples | comp_mean (MB/s) | comp_median | comp_stdev |\n')
+        rep.write('|---:|---|---:|---:|---:|---:|---:|\n')
+        for i,r in enumerate(top_comp,1):
+            rep.write(f"| {i} | {r['comp']}/{r.get('mode','')} | {r['wg']} | {r['samples']} | {r['comp_mean']:.2f} | {r['comp_median']} | {r['comp_stdev']:.2f} |\n")
+    else:
+        rep.write('| Rank | COMP | WG | samples | comp_mean (MB/s) | comp_median | comp_stdev |\n')
+        rep.write('|---:|---|---:|---:|---:|---:|---:|\n')
+        for i,r in enumerate(top_comp,1):
+            rep.write(f"| {i} | {r['comp']} | {r['wg']} | {r['samples']} | {r['comp_mean']:.2f} | {r['comp_median']} | {r['comp_stdev']:.2f} |\n")
     rep.write('\n')
     rep.write('![Top comp](' + os.path.relpath(plots[1], start=os.path.dirname(REPORT)) + ')\n\n')
 

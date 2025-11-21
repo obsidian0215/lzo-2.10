@@ -65,7 +65,7 @@ if os.path.exists(ANAL):
             if not np.isnan(cb) and not np.isnan(db):
                 comp_mb.append(cb)
                 decomp_mb.append(db)
-                labels.append(f"{rec.get('core','')}+{rec.get('strategy','')}")
+                labels.append(f"{rec.get('core','')}")
 
 if not os.path.exists(ANAL):
     print('Analysis CSV not found:', ANAL, '\nNo plots generated. Run tools/run_lzo_gpu.sh analyze to produce analysis_summary.csv under exp_results/lzo_gpu/logs')

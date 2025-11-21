@@ -13,7 +13,6 @@ fi
 
 FRONTS=(
     lzo1x_comp.cl
-    lzo1x_comp_atomic.cl
 )
 
 # ensure certain canonical cores and decompressors are always precompiled

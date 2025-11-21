@@ -1,7 +1,21 @@
 #!/usr/bin/env bash
 # Lightweight, single-file parameter-scan runner for lzo_gpu
 
-set -euo pipefail
+# Enable strict mode. Support both bash and zsh (zsh uses `setopt PIPE_FAIL`).
+# In most cases the script runs under `bash` due to the shebang; but make the
+# settings defensive so sourcing under zsh or other shells doesn't break.
+set -e
+set -u
+if [ -n "${BASH_VERSION:-}" ]; then
+  # bash supports the combined form
+  set -o pipefail
+elif [ -n "${ZSH_VERSION:-}" ]; then
+  # zsh uses setopt to enable pipefail
+  setopt PIPE_FAIL || true
+else
+  # try the POSIX-ish form, ignore if not supported
+  set -o pipefail 2>/dev/null || true
+fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRAPDIR="$ROOT/lzo_gpu"
 OUT_DIR="${OUT_DIR:-$ROOT/exp_results/lzo_gpu/logs/param_scans}"
@@ -50,7 +64,7 @@ fi
 if [ -n "${LZO_STRATEGIES:-}" ]; then
   read -r -a STRATEGIES <<< "$(echo "$LZO_STRATEGIES" | tr ',' ' ')"
 else
-  STRATEGIES=(none atomic)
+  STRATEGIES=(none)
 fi
 
 if [ -n "${LZO_WG_SIZE:-}" ]; then
@@ -59,10 +73,23 @@ else
   WG_SIZES=(32 64 128 256)
 fi
 
-if [ -n "${LZO_VLEN:-}" ]; then
-  read -r -a VLEN <<< "$(echo "$LZO_VLEN" | tr ',' ' ')"
+
+# Map modes: do not include MAP_MODE by default. Only include MAP_MODE when
+# the environment variable LZO_MAP_MODES is set (comma-separated list of 0/1).
+# To force the map behavior at runtime you can still set LZO_FORCE_MAP in the
+# environment when invoking the runner (this affects the host binary).
+if [ -n "${LZO_MAP_MODES:-}" ]; then
+  read -r -a MAP_MODES <<< "$(echo "$LZO_MAP_MODES" | tr ',' ' ')"
+  # Validate allowed values: only 0 or 1 are permitted
+  for mm in "${MAP_MODES[@]}"; do
+    if [ "$mm" != "0" ] && [ "$mm" != "1" ]; then
+      echo "Invalid MAP_MODE value: $mm. Allowed values are 0 or 1." >&2
+      exit 2
+    fi
+  done
 else
-  VLEN=(1 2 4 8)
+  # If not explicitly configured, do not include a MAP_MODE dimension.
+  MAP_MODES=()
 fi
 
 # gather samples
@@ -90,8 +117,7 @@ fi
 
 for comp_level in "${COMP_LEVELS[@]}"; do
   for wg in "${WG_SIZES[@]}"; do
-    for v in "${VLEN[@]}"; do
-      for sample in "${SAMPLES[@]}"; do
+    for sample in "${SAMPLES[@]}"; do
         relpath="${sample#${SAMPLES_DIR}/}"
         if [ "$relpath" = "$sample" ]; then relpath="$(basename "$sample")"; fi
         rel_sanitized=$(printf "%s" "$relpath" | sed 's/[^A-Za-z0-9._-]/_/g')
@@ -99,14 +125,22 @@ for comp_level in "${COMP_LEVELS[@]}"; do
         sname="${rel_sanitized}_${sample_hash}"
 
         for r in $(seq 1 "$REPEATS"); do
-          for strategy in "${STRATEGIES[@]}"; do
-            for mode in base vec; do
-              devec_val=0
-              if [ "$mode" = "vec" ]; then devec_val=1; fi
-              total_runs=$((total_runs+1))
+            # default: no MAP_MODE unless user explicitly configured LZO_MAP_MODES
+            mapm=""
+            if [ ${#MAP_MODES[@]} -gt 0 ]; then
+              # choose the first (and typically only) configured map mode
+              mapm="${MAP_MODES[0]}"
+            fi
+            # No decomp-mode dimension (always base); drop the extra directory level
+            devec_val=0
+            total_runs=$((total_runs+1))
 
-              cfg_dir_mode="$OUT_DIR/comp_${comp_level}/strategy_${strategy}/decomp_${mode}/wg_${wg}_v_${v}"
-              mkdir -p "$cfg_dir_mode"
+            if [ -n "$mapm" ]; then
+              cfg_dir_mode="$OUT_DIR/comp_${comp_level}/map_${mapm}/wg_${wg}"
+            else
+              cfg_dir_mode="$OUT_DIR/comp_${comp_level}/wg_${wg}"
+            fi
+            mkdir -p "$cfg_dir_mode"
 
               if type lzo_mktemp_dir >/dev/null 2>&1; then
                 lzo_mktemp_dir tmp_run_dir || tmp_run_dir=$(mktemp -d /tmp/lzo_gpu_tmp.XXXXXX)
@@ -117,18 +151,21 @@ for comp_level in "${COMP_LEVELS[@]}"; do
               out_lzo="$tmp_run_dir/lzo_out_${sname}_run${r}.lzo"
               logf="$cfg_dir_mode/${sname}_run${r}.log"
 
-              # Make log header explicit: include strategy and mark the decomp-mode
-              echo "[Run $total_runs] COMP=$comp_level STRATEGY=$strategy DECOMP_MODE=$mode WG=$wg VLEN=$v SAMPLE=$sname R=$r -> $logf"
-              echo "# COMP=$comp_level STRATEGY=$strategy DECOMP_MODE=$mode WG=$wg VLEN=$v SAMPLE=$sname R=$r" > "$logf"
-              echo "Compressing: $sample -> $out_lzo" >> "$logf"
-
-              # construct strategy argument: omit when 'none'
-              strategy_arg=()
-              if [ "$strategy" != "none" ]; then
-                strategy_arg=(--strategy "$strategy")
+              # Make log header explicit: include map-mode (decomp-mode always base, omit)
+              if [ -n "$mapm" ]; then
+                echo "[Run $total_runs] COMP=$comp_level MAP_MODE=$mapm WG=$wg SAMPLE=$sname R=$r -> $logf"
+                echo "# COMP=$comp_level MAP_MODE=$mapm WG=$wg SAMPLE=$sname R=$r" > "$logf"
+              else
+                echo "[Run $total_runs] COMP=$comp_level WG=$wg SAMPLE=$sname R=$r -> $logf"
+                echo "# COMP=$comp_level WG=$wg SAMPLE=$sname R=$r" > "$logf"
               fi
-
-              COMP_CMD=(env LZO_DECOMP_VEC=$devec_val LZO_WG_SIZE=$wg LZO_VLEN=$v "$LZO_BIN" $LZO_DEBUG_FLAG -L "$comp_level" "${strategy_arg[@]}" "$sample" -o "$out_lzo")
+              echo "Compressing: $sample -> $out_lzo" >> "$logf"
+              # no strategy argument (strategy dimension removed)
+              strategy_arg=()
+              # Do not set LZO_FORCE_MAP here; leave mapping behavior to the
+              # host (or to explicit LZO_FORCE_MAP if you configured it).
+              # LZO_VLEN is metadata only (host does not use it), so do not export it to the child process
+              COMP_CMD=(env LZO_DECOMP_VEC=$devec_val LZO_WG_SIZE=$wg "$LZO_BIN" $LZO_DEBUG_FLAG -L "$comp_level" "${strategy_arg[@]}" "$sample" -o "$out_lzo")
               DECMD=(env LZO_DECOMP_VEC=$devec_val "$LZO_BIN" -d --verify "$sample" "$out_lzo")
 
               if [ "$DRY_RUN" = "1" ]; then
@@ -190,8 +227,5 @@ for comp_level in "${COMP_LEVELS[@]}"; do
           done
         done
       done
-    done
-  done
-done
 
 echo "Full param scan finished. Total runs: $total_runs. Logs under $OUT_DIR"

@@ -348,7 +348,6 @@ int main(int argc, char** argv)
     int suppress_non_data = 0; /* when writing to stdout (-), suppress non-data prints */
     int show_help = 0;
     const char *comp_level = "1"; /* compression level: "1", "1k", "1l", "1o" */
-    const char *strategy = "none"; /* publish strategy: none, atomic */
 
     /* pass 1: only detect mode (-d) and help, to know how to parse verify */
     for (int i = 1; i < argc; ++i) {
@@ -369,11 +368,7 @@ int main(int argc, char** argv)
             if (strcmp(output_path, "-") == 0) suppress_non_data = 1;
             continue;
         }
-        if (strcmp(arg, "--strategy") == 0) {
-            if (i + 1 >= argc) { fprintf(stderr, "missing argument for %s\n", arg); return 1; }
-            strategy = argv[++i];
-            continue;
-        }
+        /* --strategy option removed: strategy dimension is no longer supported */
         if (strcmp(arg, "-L") == 0 || strcmp(arg, "--level") == 0) {
             if (i + 1 >= argc) { fprintf(stderr, "missing argument for %s\n", arg); return 1; }
             comp_level = argv[++i];
@@ -452,22 +447,26 @@ int main(int argc, char** argv)
          * CL_DEVICE_MEM_BASE_ADDR_ALIGN >= 128 (bits => 16 bytes) and
          * CL_DEVICE_PREFERRED_VECTOR_WIDTH_CHAR >= 16 to enable vec path.
          */
+        /* Use explicit environment variable to enable vectorized decompressor.
+         * Previously we auto-detected device capabilities and enabled vec by
+         * default. Change behavior: default to the scalar decompressor unless
+         * `LZO_DECOMP_VEC=1` is set. This avoids surprising runtime selection
+         * and makes experimental runs deterministic. */
         const char* devec_env = getenv("LZO_DECOMP_VEC");
         int devec_flag = 0;
         if (devec_env) {
             devec_flag = (strcmp(devec_env, "1") == 0);
         } else {
-            cl_uint mem_align_bits = 0, pref_char = 0;
-            clGetDeviceInfo(dev, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(mem_align_bits), &mem_align_bits, NULL);
-            clGetDeviceInfo(dev, CL_DEVICE_PREFERRED_VECTOR_WIDTH_CHAR, sizeof(pref_char), &pref_char, NULL);
-            if (mem_align_bits >= 128 && pref_char >= 16) devec_flag = 1;
+            /* no env override: default to scalar (devec_flag == 0)
+             * (do not auto-detect device vector width anymore)
+             */
+            devec_flag = 0;
         }
         const char* decomp_base = devec_flag ? "lzo1x_decomp_vec" : "lzo1x_decomp";
         const char* decomp_src  = devec_flag ? "lzo1x_decomp_vec.cl" : "lzo1x_decomp.cl";
         /* Emit stable, parseable identifiers for aggregation tools */
         if (!suppress_non_data) {
             printf("KERNEL=%s\n", decomp_base);
-            printf("STRATEGY=%s\n", devec_flag ? "vec" : "scalar");
         }
         cl_program prog_d = load_prog_from_bin_or_src(decomp_base, decomp_src);
         cl_int err; cl_kernel krn_d = clCreateKernel(prog_d, "lzo1x_block_decompress", &err); CHECK(err);
@@ -593,41 +592,18 @@ int main(int argc, char** argv)
         fprintf(stderr, "unknown compression level: %s\n", comp_level);
         return 1;
     }
-    /* If a strategy was requested, select the corresponding comp frontend.
-       To allow using precompiled binaries for core×frontend combinations
-       we form a combined kernel base name: <core>_<frontend>. For example
-       'lzo1x_1' + 'lzo1x_comp_atomic' -> 'lzo1x_1_lzo1x_comp_atomic'. */
+    /* Select the generic compression frontend (strategy dimension removed). */
     char core_base[64]; strcpy(core_base, kernel_base);
-    /* Always select a compression frontend: treat 'none' as the generic
-     * comp frontend (lzo1x_comp). */
     {
-        const char *frontend = NULL;
-        if (strcmp(strategy, "none") == 0) {
-            frontend = "lzo1x_comp";
-        } else if (strcmp(strategy, "atomic") == 0) {
-            frontend = "lzo1x_comp_atomic";
-        } else {
-            fprintf(stderr, "unknown strategy: %s\n", strategy); return 1;
-        }
-
-        /* combine core and frontend so the loader will find precompiled combo binaries
-           strip a leading "lzo1x_" from the frontend name to avoid duplicated prefix */
+        const char *frontend = "lzo1x_comp";
         const char *frontend_short = frontend;
         if (strncmp(frontend, "lzo1x_", 6) == 0) frontend_short = frontend + 6;
         snprintf(kernel_base, sizeof(kernel_base), "%s_%s", core_base, frontend_short);
     }
     snprintf(cl_src, sizeof(cl_src), "%s.cl", kernel_base);
     /* Emit stable, parseable identifiers for aggregation tools */
-    {
-        const char* strat = (strcmp(strategy, "none") == 0) ? "scalar" : strategy;
-        if (!debug && !suppress_non_data) {
-            /* keep non-verbose prints consistent: print kernel and strategy */
-            printf("KERNEL=%s\n", kernel_base);
-            printf("STRATEGY=%s\n", strat);
-        } else if (!suppress_non_data) {
-            printf("KERNEL=%s\n", kernel_base);
-            printf("STRATEGY=%s\n", strat);
-        }
+    if (!suppress_non_data) {
+        printf("KERNEL=%s\n", kernel_base);
     }
     cl_program prog_c = load_prog_from_bin_or_src(kernel_base, cl_src);
     cl_int err;
@@ -688,11 +664,23 @@ int main(int argc, char** argv)
      * 2=USE_HOST_PTR with host pointer (posix_memalign)
      */
     int map_mode = 0;
-    /* comp frontends use the mapped/host-len approach */
-    /* comp frontends use the mapped/host-len approach */
-    if (strncmp(kernel_base, "lzo1x_comp", strlen("lzo1x_comp")) == 0 ||
-        strncmp(kernel_base, "lzo1x_gpu_port", strlen("lzo1x_gpu_port")) == 0) map_mode = 1;
-    /* No special 'usehost' strategy supported any more; only map_mode 0/1 are used. */
+    /* Default to explicit reads (map_mode=0) for all kernels. Individual
+     * experiments can still force mapping via LZO_FORCE_MAP=1. */
+    /* Allow overriding map_mode via environment for testing/comparison.
+     * Set environment variable LZO_FORCE_MAP=0 or =1 to force explicit read
+     * or alloc-host+map respectively. Helpful to produce two test binaries
+     * that exercise map==0 vs map==1 deterministically. */
+    const char* force_map_s = getenv("LZO_FORCE_MAP");
+    if (force_map_s) {
+        int fm = atoi(force_map_s);
+        if (fm == 0 || fm == 1) {
+            if (debug) fprintf(stderr, "DBG: forcing map_mode from env LZO_FORCE_MAP=%d\n", fm);
+            map_mode = fm;
+        } else {
+            if (debug) fprintf(stderr, "DBG: LZO_FORCE_MAP='%s' ignored (not 0 or 1)\n", force_map_s);
+        }
+    }
+    /* The 'usehost' strategy has been removed; only map_mode 0/1 are used. */
 
     cl_mem d_len;
     size_t len_bytes = nblk * sizeof(cl_uint);
@@ -754,9 +742,8 @@ int main(int argc, char** argv)
     }
 
     /* If kernel didn't populate `out_len` (all zeros), try reconstructing per-block
-     * lengths from the device output buffer: we expect the kernel to write a
-     * little-endian 32-bit length at the start of each block region as a
-     * robust fallback (the `lzo1x_gpu_port` variant does this). */
+     * lengths from the device output buffer: we expect the kernel to write a little-endian
+     * 32-bit length at the start of each block region as a robust fallback. */
     if (out_sz == 0) {
         /* Attempt to recover per-block lengths from device output buffer.
          * Guard against interpreting arbitrary bytes as huge lengths which

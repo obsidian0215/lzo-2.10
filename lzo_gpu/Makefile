@@ -41,7 +41,7 @@ precompile-all:
 	fi
 
 # Build combinations of core kernels and frontend strategies into precompiled binaries.
-# For each core (like lzo1x_1, lzo1x_1k, ...) and each frontend wrapper (atomic/delayed/usehost/...)
+# For each core (like lzo1x_1, lzo1x_1k, ...) and each frontend wrapper (atomic/delayed/...)
 # create a temporary directory, copy the frontend there and copy the chosen core as
 # `lzo1x_1.cl` so that the frontend's `#include "lzo1x_1.cl"` picks up the selected core.
 # Output binaries are named `<core>_<frontend>.bin` (both basenames without .cl).

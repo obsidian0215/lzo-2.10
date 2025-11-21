@@ -1,5 +1,5 @@
 
-/* Copied from lzo1x_gpu_port.cl — comp frontend (none/delayed/usehost use this frontend)
+/* Copied from lzo1x_gpu_port.cl — comp frontend (none/delayed use this frontend)
  * This file provides the wrapper exported as 'lzo1x_block_compress' and
  * the reference core include so host can select the wrapper symbol.
  */

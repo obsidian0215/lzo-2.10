@@ -24,9 +24,14 @@ OUTCSV = args.out if args.out else DEFAULT_OUT
 
 COMP_RE = re.compile(r"\[COMP\s*\].*orig=([0-9]+)\s+comp=([0-9]+).*kernel=([0-9.]+)\s+ms.*total=([0-9.]+)\s+ms.*thrpt=([0-9.]+)\s+MB/s", re.M)
 DECOMP_RE = re.compile(r"\[DECOMP\].*orig=([0-9]+)\s+comp=([0-9]+).*kernel=([0-9.]+)\s+ms.*total=([0-9.]+)\s+ms.*thrpt=([0-9.]+)\s+MB/s", re.M)
-HEADER_LINE_RE = re.compile(r"^#\s*COMP=(?P<comp>\S+).*MODE=(?P<mode>\S+).*WG=(?P<wg>\S+).*VLEN=(?P<vlen>\S+).*SAMPLE=(?P<sample>\S+).*R=(?P<run>\d+)")
-# The header format in some logs may differ; try a looser header capture
-LOOSE_HEADER_RE = re.compile(r"#\s*COMP=(?P<comp>\S+).*MODE=(?P<mode>\S+).*SAMPLE=(?P<sample>\S+).*R=(?P<run>\d+)")
+HEADER_LINE_RE = re.compile(r"^#\s*COMP=(?P<comp>\S+)(?:.*MAP_MODE=(?P<map_mode>\S+))?.*WG=(?P<wg>\S+).*SAMPLE=(?P<sample>\S+).*R=(?P<run>\d+)")
+# The header format in some logs may differ; try a looser header capture.
+# MAP_MODE is optional in newer logs, so make that group optional here as well.
+LOOSE_HEADER_RE = re.compile(r"#\s*COMP=(?P<comp>\S+)(?:.*MAP_MODE=(?P<map_mode>\S+))?.*SAMPLE=(?P<sample>\S+).*R=(?P<run>\d+)")
+
+# strategy may still be printed by the host binary as a separate line; prefer
+# extracting it from the log contents rather than inferring from directory names.
+STRAT_RE = re.compile(r"^STRATEGY=(?P<strategy>\S+)", re.M)
 
 rows = []
 if not os.path.isdir(INDIR):
@@ -41,7 +46,7 @@ if not os.path.isdir(INDIR):
         w.writeheader()
     print('Wrote empty summary CSV ->', OUTCSV)
     raise SystemExit(0)
-# Directory layout: <INDIR>/comp_<level>/decomp_{base,vec}/wg_<wg>_v_<vlen>/*.log
+# Directory layout: <INDIR>/comp_<level>/map_<mode>/wg_<wg>/*.log
 for comp_dir in sorted(os.listdir(INDIR)):
     if not comp_dir.startswith('comp_'):
         continue
@@ -50,26 +55,37 @@ for comp_dir in sorted(os.listdir(INDIR)):
         continue
     # comp_dir is like 'comp_1' or 'comp_gpuport'
     core = comp_dir
-    for decomp_mode in sorted(os.listdir(comp_path)):
-        decomp_path = os.path.join(comp_path, decomp_mode)
-        if not os.path.isdir(decomp_path):
-            continue
-        # strategy mapping: prefer 'base' or 'vec' when present in directory name
-        if 'base' in decomp_mode:
-            strategy = 'base'
-        elif 'vec' in decomp_mode:
-            strategy = 'vec'
+    # Support two layouts:
+    # 1) comp_<level>/map_<mode>/wg_<wg>/...  (when MAP_MODE configured)
+    # 2) comp_<level>/wg_<wg>/...            (when MAP_MODE not present)
+    for entry in sorted(os.listdir(comp_path)):
+        # handle map_<mode> subdirs
+        if entry.startswith('map_'):
+            map_path = os.path.join(comp_path, entry)
+            if not os.path.isdir(map_path):
+                continue
+            parent_for_cfgs = map_path
+        elif entry.startswith('wg_'):
+            # no map_ level; cfgs live directly under comp_path (wg_* entries)
+            parent_for_cfgs = comp_path
         else:
-            strategy = decomp_mode
-        # iterate per-workgroup/vlen configuration directories
-        for cfg in sorted(os.listdir(decomp_path)):
-            cfg_path = os.path.join(decomp_path, cfg)
+            continue
+        for cfg in sorted(os.listdir(parent_for_cfgs)):
+            cfg_path = os.path.join(parent_for_cfgs, cfg)
             if not os.path.isdir(cfg_path):
                 continue
-            for fname in sorted(os.listdir(cfg_path)):
+            # If we previously took a map_ entry, ensure we only iterate cfgs under that map dir
+            if entry.startswith('map_'):
+                cfg_dir = cfg_path
+            else:
+                # entry was a wg_ inside comp_path, skip non-wg entries here
+                if not cfg.startswith('wg_'):
+                    continue
+                cfg_dir = cfg_path
+            for fname in sorted(os.listdir(cfg_dir)):
                 if not fname.endswith('.log'):
                     continue
-                fpath = os.path.join(cfg_path, fname)
+                fpath = os.path.join(cfg_dir, fname)
             try:
                 with open(fpath, 'r', errors='ignore') as f:
                     data = f.read()
@@ -87,6 +103,9 @@ for comp_dir in sorted(os.listdir(INDIR)):
                 m2 = re.match(r'(?P<sample>.+)_run(?P<run>\d+)\.log', fname)
                 if m2:
                     sample = m2.group('sample'); run = m2.group('run')
+            # prefer strategy printed by the host binary inside the log (if present)
+            sm = STRAT_RE.search(data)
+            strategy = sm.group('strategy') if sm else 'none'
             comp_vals = {'orig':None,'comp':None,'kernel':None,'total':None,'thrpt':None}
             decomp_vals = {'orig':None,'comp':None,'kernel':None,'total':None,'thrpt':None}
             mcomp = COMP_RE.search(data)
