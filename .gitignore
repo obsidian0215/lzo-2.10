@@ -68,4 +68,8 @@ exp_results/
 build/
 param_scan_*/
 archived/
+minilzo_cpu/
+lzo_hybrid/
+lzo_gpu_client
+lzo_gpu_daemon
 # end

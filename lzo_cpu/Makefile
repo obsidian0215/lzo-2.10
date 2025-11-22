@@ -25,7 +25,7 @@ default:
 CPPFLAGS = -I. -I./src -I./include -I./include/lzo
 
 # Match the successful gcc build: C11, O2, NDEBUG, pthread
-GCC_CFLAGS = -std=c11 -O2 -DNDEBUG -Wall -fomit-frame-pointer -pthread
+GCC_CFLAGS = -std=c11 -s -O2 -DNDEBUG -Wall -fomit-frame-pointer -pthread
 
 
 #

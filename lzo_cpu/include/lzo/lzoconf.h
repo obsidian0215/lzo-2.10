@@ -29,6 +29,12 @@
 #ifndef __LZOCONF_H_INCLUDED
 #define __LZOCONF_H_INCLUDED 1
 
+/* Force-disable assembly helpers for the lzo_cpu subtree so that
+ * pure-C implementations are used. This makes builds portable and
+ * independent from arch-specific assembler files. */
+#undef LZO_USE_ASM
+#define LZO_USE_ASM 0
+
 #define LZO_VERSION             0x20a0  /* 2.10 */
 #define LZO_VERSION_STRING      "2.10"
 #define LZO_VERSION_DATE        "Mar 01 2017"

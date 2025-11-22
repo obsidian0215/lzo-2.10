@@ -1,12 +1,12 @@
 CC ?= gcc
-CFLAGS ?= -O2 -Wall
+CFLAGS ?= -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200
 LDFLAGS ?= -lOpenCL
 
 ## Automatically discover .cl sources present in this directory so we don't
 ## attempt to precompile kernels that aren't actually in the tree.
 CL_SOURCES := $(wildcard *.cl)
 
-all: build_kernel lzo_gpu precompile-combos
+all: build_kernel lzo_gpu lzo_gpu_daemon lzo_gpu_client precompile-combos
 
 build_kernel: build_kernel.c
 	$(CC) $(CFLAGS) -o build_kernel build_kernel.c $(LDFLAGS)
@@ -15,6 +15,14 @@ build_kernel: build_kernel.c
 # build the GPU host CLI
 lzo_gpu: lzo_host.c
 	$(CC) $(CFLAGS) -o lzo_gpu lzo_host.c $(LDFLAGS)
+
+# build the GPU daemon
+lzo_gpu_daemon: lzo_gpu_daemon.c daemon_compress.c daemon_decompress.c
+	$(CC) $(CFLAGS) -o lzo_gpu_daemon lzo_gpu_daemon.c daemon_compress.c daemon_decompress.c $(LDFLAGS) -lpthread
+
+# build the GPU client
+lzo_gpu_client: lzo_gpu_client.c
+	$(CC) $(CFLAGS) -o lzo_gpu_client lzo_gpu_client.c
 
 precompile: build_kernel
 	# If KERNEL is specified, build only that kernel (basename without .cl)
@@ -95,6 +103,6 @@ testdata:
 	python3 generate-test-data.py --suite --out-dir "$$OUTDIR" || (echo "failed to generate test data"; exit 1)
 
 clean:
-	rm -f build_kernel lzo_gpu *.bin
+	rm -f build_kernel lzo_gpu lzo_gpu_daemon lzo_gpu_client *.bin
 
-.PHONY: all build_kernel precompile precompile-all clean
+.PHONY: all build_kernel lzo_gpu lzo_gpu_daemon lzo_gpu_client precompile precompile-all clean

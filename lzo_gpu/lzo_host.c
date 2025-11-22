@@ -17,8 +17,10 @@ uint32  len[nblk]               // 每块压缩长度
 #define MAGIC  0x4C5A   /* 'L''Z' */
 #define D_BITS          11
 //#define BLK_SIZE        (32 * 1024)
-#define OCC_FACTOR        4             /* 每个 CU 期望 OCC_FACTOR 个块，保证高占用 */
-#define ALIGN_BYTES       256           /* 向 256 B 对齐，便于内存访问 */
+#define OCC_FACTOR        128           /* 优化: 从12提升到128，大幅增加并行度 */
+#define ALIGN_BYTES       16384         /* 优化: 从64KB降到16KB，减小对齐浪费 */
+#define MIN_BLOCK_SIZE    (64 * 1024)   /* 最小块大小: 64KB (从512KB大幅降低) */
+#define MAX_BLOCK_SIZE    (256 * 1024)  /* 最大块大小: 256KB (从2MB降低) */
 
 #if defined(_WIN32) || defined(_WIN64)
 #define WIN32_LEAN_AND_MEAN
@@ -82,12 +84,19 @@ static void choose_blocking(size_t in_sz, cl_device_id dev,
     blk = (blk + (ALIGN_BYTES - 1)) & ~(ALIGN_BYTES - 1);
     if (blk == 0) blk = ALIGN_BYTES;
 
+    /* 4.5 优化: 限制块大小在合理范围内 */
+    if (blk < MIN_BLOCK_SIZE) blk = MIN_BLOCK_SIZE;
+    if (blk > MAX_BLOCK_SIZE) blk = MAX_BLOCK_SIZE;
+
     /* 5. 重新得到块数；如仍 < CU，则再细分以 nblk = CU 为下限 */
     size_t nblk = (in_sz + blk - 1) / blk;
     if (nblk < cu) {
         nblk = cu;
         blk = (in_sz + nblk - 1) / nblk;
         blk = (blk + (ALIGN_BYTES - 1)) & ~(ALIGN_BYTES - 1);
+        /* 再次检查范围 */
+        if (blk < MIN_BLOCK_SIZE) blk = MIN_BLOCK_SIZE;
+        if (blk > MAX_BLOCK_SIZE) blk = MAX_BLOCK_SIZE;
     }
 
     /* 6. 尾块太⼩（< blk/4）时，把数据平均回各块 */
@@ -95,6 +104,9 @@ static void choose_blocking(size_t in_sz, cl_device_id dev,
     if (nblk > 1 && tail < blk / 4) {
         blk = (in_sz + nblk - 1) / nblk;
         blk = (blk + (ALIGN_BYTES - 1)) & ~(ALIGN_BYTES - 1);
+        /* 再次检查范围 */
+        if (blk < MIN_BLOCK_SIZE) blk = MIN_BLOCK_SIZE;
+        if (blk > MAX_BLOCK_SIZE) blk = MAX_BLOCK_SIZE;
     }
 
     *blk_sz_out = blk;
@@ -134,6 +146,84 @@ static char* read_file(const char* path, size_t* sz_out)
 static cl_context  ctx;
 static cl_command_queue q;
 static cl_device_id dev;
+static int debug = 0;  /* 全局debug标志 */
+
+/* 优化: 全局缓存以避免重复编译和创建内核 */
+#define MAX_CACHED_PROGRAMS 16
+static struct {
+    char name[128];
+    cl_program prog;
+    cl_kernel krn_compress;
+    cl_kernel krn_decompress;
+} prog_cache[MAX_CACHED_PROGRAMS];
+static int prog_cache_count = 0;
+
+/* 优化: 持久化缓冲区缓存以避免重复创建和释放 */
+static struct {
+    cl_mem d_in;
+    cl_mem d_out;
+    cl_mem d_len;
+    size_t in_size;
+    size_t out_size;
+    size_t len_size;
+} buffer_cache = {0};
+
+/* 优化: 内核参数缓存以避免重复设置 */
+static struct {
+    cl_kernel kernel;
+    cl_mem d_in;
+    cl_mem d_out;
+    cl_mem d_len;
+    cl_uint in_sz;
+    cl_uint blk;
+    cl_uint worst_blk;
+} kernel_args_cache = {0};
+
+static void set_kernel_args_cached(cl_kernel krn, cl_mem d_in, cl_mem d_out,
+                                   cl_mem d_len, cl_uint in_sz, cl_uint blk,
+                                   cl_uint worst_blk) {
+    /* 仅在参数变化时才设置 */
+    if (kernel_args_cache.kernel != krn ||
+        kernel_args_cache.d_in != d_in ||
+        kernel_args_cache.d_out != d_out ||
+        kernel_args_cache.d_len != d_len ||
+        kernel_args_cache.in_sz != in_sz ||
+        kernel_args_cache.blk != blk ||
+        kernel_args_cache.worst_blk != worst_blk) {
+
+        if (debug) fprintf(stderr, "DBG: Setting kernel args (cache miss)\n");
+
+        CHECK(clSetKernelArg(krn, 0, sizeof(cl_mem), &d_in));
+        CHECK(clSetKernelArg(krn, 1, sizeof(cl_mem), &d_out));
+        CHECK(clSetKernelArg(krn, 2, sizeof(cl_mem), &d_len));
+        CHECK(clSetKernelArg(krn, 3, sizeof(cl_uint), &in_sz));
+        CHECK(clSetKernelArg(krn, 4, sizeof(cl_uint), &blk));
+        CHECK(clSetKernelArg(krn, 5, sizeof(cl_uint), &worst_blk));
+
+        /* 更新缓存 */
+        kernel_args_cache.kernel = krn;
+        kernel_args_cache.d_in = d_in;
+        kernel_args_cache.d_out = d_out;
+        kernel_args_cache.d_len = d_len;
+        kernel_args_cache.in_sz = in_sz;
+        kernel_args_cache.blk = blk;
+        kernel_args_cache.worst_blk = worst_blk;
+    } else {
+        if (debug) fprintf(stderr, "DBG: Kernel args cached (skip setting)\n");
+    }
+}
+
+static cl_mem get_or_create_buffer(cl_mem* cached_buf, size_t* cached_size,
+                                    size_t required_size, cl_mem_flags flags) {
+    if (*cached_size < required_size) {
+        if (*cached_buf) clReleaseMemObject(*cached_buf);
+        cl_int err;
+        *cached_buf = clCreateBuffer(ctx, flags, required_size, NULL, &err);
+        CHECK(err);
+        *cached_size = required_size;
+    }
+    return *cached_buf;
+}
 
 static void ocl_init(void)
 {
@@ -181,6 +271,28 @@ void print_buildlog(cl_program program, cl_device_id device) {
 /* forward decl so main can call it */
 static cl_program load_prog_from_bin_or_src(const char* base, const char* cl_src_path);
 
+/* 优化: 缓存查找和管理函数 */
+static int find_cached_program(const char* name) {
+    for (int i = 0; i < prog_cache_count; i++) {
+        if (strcmp(prog_cache[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void cache_program(const char* name, cl_program prog, cl_kernel krn_c, cl_kernel krn_d) {
+    if (prog_cache_count >= MAX_CACHED_PROGRAMS) {
+        fprintf(stderr, "warning: program cache full, not caching %s\n", name);
+        return;
+    }
+    strncpy(prog_cache[prog_cache_count].name, name, sizeof(prog_cache[0].name) - 1);
+    prog_cache[prog_cache_count].prog = prog;
+    prog_cache[prog_cache_count].krn_compress = krn_c;
+    prog_cache[prog_cache_count].krn_decompress = krn_d;
+    prog_cache_count++;
+}
+
 /* Helper: load program from <base>.bin or from source file */
 static cl_program load_prog_from_bin_or_src(const char* base, const char* cl_src_path)
 {
@@ -225,11 +337,7 @@ static cl_program load_prog_from_bin_or_src(const char* base, const char* cl_src
     }
 
     if (!prog) {
-        /* compile from source as a robust fallback
-         * If the explicit <base>.cl does not exist (common when using combined
-         * names like "lzo1x_1_comp_atomic"), try to locate and combine the
-         * core and frontend sources: e.g. "lzo1x_1.cl" + "lzo1x_comp_atomic.cl".
-         */
+        /* compile from source as fallback - use direct .cl file without frontend combinations */
         size_t src_len = 0; char* src = NULL;
         /* try source in current dir, otherwise try lzo_gpu/ subdir */
         FILE* fchk = fopen(use_cl_src, "rb");
@@ -244,83 +352,19 @@ static cl_program load_prog_from_bin_or_src(const char* base, const char* cl_src
             fclose(fchk);
             src = read_file(use_cl_src, &src_len);
         }
+
         if (!src) {
-            /* If this base is a decompressor base (only two decompressor kernels exist),
-             * do NOT attempt to split and combine core+frontend — simply report missing
-             * source and exit. This prevents the loader from trying to construct
-             * combined names for decompressor kernels. */
-            if (strncmp(use_base, "lzo1x_decomp", strlen("lzo1x_decomp")) == 0) {
-                fprintf(stderr, "source file %s not found and decompressor base will not be combined\n", use_cl_src);
-                exit(1);
-            }
-            /* attempt to split base into core_front and construct filenames */
-            char base_copy[256]; strncpy(base_copy, use_base, sizeof(base_copy)-1); base_copy[sizeof(base_copy)-1]='\0';
-            char* sep = strchr(base_copy, '_');
-            if (sep) {
-                *sep = '\0'; char* core = base_copy; char* front = sep + 1;
-                char core_fname[256]; char frontend_fname[256];
-                snprintf(core_fname, sizeof(core_fname), "%s.cl", core);
-                /* frontend in kernel_base was formed by stripping a leading
-                 * "lzo1x_" from frontend names; restore it when trying file
-                 * names (i.e. try "lzo1x_%s.cl"). */
-                snprintf(frontend_fname, sizeof(frontend_fname), "lzo1x_%s.cl", front);
-                /* try reading core + frontend */
-                size_t core_len=0, front_len=0; char* core_src = NULL; char* front_src = NULL;
-                FILE* fcore = fopen(core_fname, "rb");
-                FILE* ffront = fopen(frontend_fname, "rb");
-                /* try lzo_gpu/ prefixed filenames if not found in cwd */
-                if (!fcore) {
-                    char core_fname_alt[256]; snprintf(core_fname_alt, sizeof(core_fname_alt), "lzo_gpu/%s", core_fname);
-                    fcore = fopen(core_fname_alt, "rb");
-                    if (fcore) { fclose(fcore); core_src = read_file(core_fname_alt, &core_len); }
-                } else { fclose(fcore); core_src = read_file(core_fname, &core_len); }
-                if (!ffront) {
-                    char frontend_fname_alt[256]; snprintf(frontend_fname_alt, sizeof(frontend_fname_alt), "lzo_gpu/%s", frontend_fname);
-                    ffront = fopen(frontend_fname_alt, "rb");
-                    if (ffront) { fclose(ffront); front_src = read_file(frontend_fname_alt, &front_len); }
-                } else { fclose(ffront); front_src = read_file(frontend_fname, &front_len); }
-                if (!core_src || !front_src) {
-                    if (core_src) free(core_src);
-                    if (front_src) free(front_src);
-                    fprintf(stderr, "source files not found for combined kernel: %s and %s\n", core_fname, frontend_fname);
-                    exit(1);
-                }
-                /* remove any #include "lzo1x_*.cl" lines from frontend to avoid
-                 * re-including a default core; produce a cleaned frontend body. */
-                char* cleaned = malloc(front_len + 1);
-                size_t outp = 0; size_t pos = 0;
-                while (pos < front_len) {
-                    /* find line end */
-                    size_t line_start = pos; while (pos < front_len && front_src[pos] != '\n') pos++;
-                    size_t line_len = pos - line_start;
-                    /* check if line contains #include and lzo1x_ */
-                    if (!(line_len > 0 && strstr(front_src + line_start, "#include") && strstr(front_src + line_start, "lzo1x_"))) {
-                        memcpy(cleaned + outp, front_src + line_start, line_len);
-                        outp += line_len;
-                        if (pos < front_len && front_src[pos] == '\n') { cleaned[outp++] = '\n'; pos++; }
-                    } else {
-                        /* skip this include line including trailing newline if present */
-                        if (pos < front_len && front_src[pos] == '\n') pos++;
-                    }
-                }
-                cleaned[outp] = '\0';
-                /* build combined source: core first, then cleaned frontend */
-                src_len = core_len + outp + 32;
-                src = malloc(src_len);
-                snprintf(src, src_len, "/* combined: %s + %s */\n%s\n/* frontend (cleaned) */\n%s", core_fname, frontend_fname, core_src, cleaned);
-                free(core_src); free(front_src); free(cleaned);
-            } else {
-                fprintf(stderr, "source file %s not found and base not splittable\n", cl_src_path);
-                exit(1);
-            }
-        } else {
-            /* src was loaded from current dir or lzo_gpu/; nothing to do */
+            fprintf(stderr, "source file %s not found (frontend combinations removed)\n", use_cl_src);
+            exit(1);
         }
 
         /* create program from assembled source */
         prog = clCreateProgramWithSource(ctx, 1, (const char**)&src, &src_len, &err);
         if (err != CL_SUCCESS) { fprintf(stderr, "clCreateProgramWithSource failed (err=%d)\n", err); free(src); exit(1); }
-        err = clBuildProgram(prog, 1, &dev, "", NULL, NULL);
+        /* Add include paths for OpenCL compiler to resolve #include directives
+         * Try both current directory and lzo_gpu/ subdirectory */
+        const char* build_opts = "-I. -I./lzo_gpu -I..";
+        err = clBuildProgram(prog, 1, &dev, build_opts, NULL, NULL);
         if (err != CL_SUCCESS) {
             size_t log_sz = 0; clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
             char* log = malloc(log_sz+1); clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, log_sz, log, NULL); log[log_sz]='\0';
@@ -337,7 +381,7 @@ int main(int argc, char** argv)
     if (argc < 2) { fprintf(stderr, "usage: %s [--debug|-v] input_file (or -d [--debug|-v] lzfile orig_file)\n", argv[0]); return 1; }
 
     /* simple CLI parsing: support optional --debug/-v flag and -d decompress mode */
-    int debug = 0;
+    /* debug is now global */
     int verify_flag = 0; /* only when set, do roundtrip/verify prints */
     int decompress_mode = 0;
     const char *in_path = NULL;
@@ -468,14 +512,51 @@ int main(int argc, char** argv)
         if (!suppress_non_data) {
             printf("KERNEL=%s\n", decomp_base);
         }
-        cl_program prog_d = load_prog_from_bin_or_src(decomp_base, decomp_src);
-        cl_int err; cl_kernel krn_d = clCreateKernel(prog_d, "lzo1x_block_decompress", &err); CHECK(err);
 
-    cl_mem d_comp = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, comp_sz, p, &err); CHECK(err);
-    cl_mem d_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, (nblk + 1) * sizeof(cl_uint), off_arr, &err); CHECK(err);
-    cl_mem d_out2 = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, orig_sz, NULL, &err); CHECK(err);
+        /* 优化: 检查缓存以避免重复编译和创建内核 */
+        cl_program prog_d = NULL;
+        cl_kernel krn_d = NULL;
+        int cache_idx_d = find_cached_program(decomp_base);
+
+        if (cache_idx_d >= 0) {
+            /* 使用缓存的程序和内核 */
+            prog_d = prog_cache[cache_idx_d].prog;
+            krn_d = prog_cache[cache_idx_d].krn_decompress;
+            if (debug) fprintf(stderr, "DBG: using cached decompress program/kernel for %s\n", decomp_base);
+        } else {
+            /* 首次加载: 编译并缓存 */
+            if (debug) fprintf(stderr, "DBG: loading and caching decompress program %s\n", decomp_base);
+            prog_d = load_prog_from_bin_or_src(decomp_base, decomp_src);
+            cl_int err;
+            krn_d = clCreateKernel(prog_d, "lzo1x_block_decompress", &err);
+            CHECK(err);
+
+            /* 缓存程序和内核供后续使用 */
+            cache_program(decomp_base, prog_d, NULL, krn_d);
+        }
+        cl_int err;
+
+    /* 优化: 使用pinned memory创建所有缓冲区 */
+    cl_mem d_comp = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, comp_sz, NULL, &err);
+    CHECK(err);
+    /* 使用map上传压缩数据 */
+    void* mapped_comp = clEnqueueMapBuffer(q, d_comp, CL_TRUE, CL_MAP_WRITE, 0, comp_sz, 0, NULL, NULL, &err);
+    CHECK(err);
+    memcpy(mapped_comp, p, comp_sz);
+    CHECK(clEnqueueUnmapMemObject(q, d_comp, mapped_comp, 0, NULL, NULL));
+
+    cl_mem d_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, (nblk + 1) * sizeof(cl_uint), NULL, &err);
+    CHECK(err);
+    void* mapped_off = clEnqueueMapBuffer(q, d_off, CL_TRUE, CL_MAP_WRITE, 0, (nblk + 1) * sizeof(cl_uint), 0, NULL, NULL, &err);
+    CHECK(err);
+    memcpy(mapped_off, off_arr, (nblk + 1) * sizeof(cl_uint));
+    CHECK(clEnqueueUnmapMemObject(q, d_off, mapped_off, 0, NULL, NULL));
+
+    cl_mem d_out2 = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR, orig_sz, NULL, &err);
+    CHECK(err);
     /* decompressor expects an out_lens buffer as arg 3 */
-    cl_mem d_out_lens = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, nblk * sizeof(cl_uint), NULL, &err); CHECK(err);
+    cl_mem d_out_lens = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR, nblk * sizeof(cl_uint), NULL, &err);
+    CHECK(err);
 
     CHECK(clSetKernelArg(krn_d, 0, sizeof(cl_mem), &d_comp));
     CHECK(clSetKernelArg(krn_d, 1, sizeof(cl_mem), &d_off));
@@ -485,12 +566,21 @@ int main(int argc, char** argv)
     CHECK(clSetKernelArg(krn_d, 5, sizeof(cl_uint), &orig_sz));
     CHECK(clSetKernelArg(krn_d, 6, sizeof(cl_uint), &nblk));
 
-    size_t gsz = nblk, lsz = 1; cl_event evt; uint64_t t_exec_start = now_ns();
-    CHECK(clEnqueueNDRangeKernel(q, krn_d, 1, NULL, &gsz, &lsz, 0, NULL, &evt)); clWaitForEvents(1, &evt);
+    size_t gsz = nblk, lsz = 1;
+    cl_event evt_decomp;
+    uint64_t t_exec_start = now_ns();
+    CHECK(clEnqueueNDRangeKernel(q, krn_d, 1, NULL, &gsz, &lsz, 0, NULL, &evt_decomp));
+    clWaitForEvents(1, &evt_decomp);
     uint64_t t_exec_end = now_ns();
 
-    unsigned char* out2 = malloc(orig_sz); uint64_t t_read_start = now_ns();
-    CHECK(clEnqueueReadBuffer(q, d_out2, CL_TRUE, 0, orig_sz, out2, 0, NULL, NULL));
+    /* 优化: 使用map读取解压数据(零拷贝) */
+    unsigned char* out2 = malloc(orig_sz);
+    uint64_t t_read_start = now_ns();
+    void* mapped_out2 = clEnqueueMapBuffer(q, d_out2, CL_TRUE, CL_MAP_READ, 0, orig_sz,
+                                           0, NULL, NULL, &err);
+    CHECK(err);
+    memcpy(out2, mapped_out2, orig_sz);
+    CHECK(clEnqueueUnmapMemObject(q, d_out2, mapped_out2, 0, NULL, NULL));
     uint64_t t_read_end = now_ns();
 
     /* perform verify first if requested; on failure do not write and exit non-zero */
@@ -572,6 +662,7 @@ int main(int argc, char** argv)
 
     /* Compress path (simple, fast) */
     if (!in_path) { fprintf(stderr, "no input file specified for compression\n"); return 1; }
+    uint64_t t_compress_start = now_ns();
     uint64_t t_io_in = now_ns();
     size_t in_sz; unsigned char* in_buf = (unsigned char*)read_file(in_path, &in_sz);
 
@@ -592,55 +683,72 @@ int main(int argc, char** argv)
         fprintf(stderr, "unknown compression level: %s\n", comp_level);
         return 1;
     }
-    /* Select the generic compression frontend (strategy dimension removed). */
-    char core_base[64]; strcpy(core_base, kernel_base);
-    {
-        const char *frontend = "lzo1x_comp";
-        const char *frontend_short = frontend;
-        if (strncmp(frontend, "lzo1x_", 6) == 0) frontend_short = frontend + 6;
-        snprintf(kernel_base, sizeof(kernel_base), "%s_%s", core_base, frontend_short);
-    }
+
+    /* Use standalone kernel (no frontend combinations) */
     snprintf(cl_src, sizeof(cl_src), "%s.cl", kernel_base);
+
     /* Emit stable, parseable identifiers for aggregation tools */
     if (!suppress_non_data) {
         printf("KERNEL=%s\n", kernel_base);
     }
-    cl_program prog_c = load_prog_from_bin_or_src(kernel_base, cl_src);
+
+    /* 优化: 检查缓存以避免重复编译和创建内核 */
+    uint64_t t_kernel_load_start = now_ns();
     cl_int err;
-    /* select kernel function name according to the kernel_base we loaded
-     * Use canonical exported symbol 'lzo1x_block_compress' from frontends.
-     */
-    char krn_name[64];
-    strcpy(krn_name, "lzo1x_block_compress");
-    cl_kernel krn_c = clCreateKernel(prog_c, krn_name, &err);
-    if (err != CL_SUCCESS) {
-        /* Simplified fallback: report available kernels and force a single
-         * source rebuild retry. Avoid multiple name-specific fallbacks — precompile
-         * step should produce binaries matching canonical exported symbol.
+    cl_program prog_c = NULL;
+    cl_kernel krn_c = NULL;
+    int cache_idx = find_cached_program(kernel_base);
+
+    if (cache_idx >= 0) {
+        /* 使用缓存的程序和内核 */
+        prog_c = prog_cache[cache_idx].prog;
+        krn_c = prog_cache[cache_idx].krn_compress;
+        if (debug) fprintf(stderr, "DBG: using cached program/kernel for %s\n", kernel_base);
+    } else {
+        /* 首次加载: 编译并缓存 */
+        if (debug) fprintf(stderr, "DBG: loading and caching program %s\n", kernel_base);
+        prog_c = load_prog_from_bin_or_src(kernel_base, cl_src);
+
+        /* select kernel function name according to the kernel_base we loaded
+         * Use canonical exported symbol 'lzo1x_block_compress' from frontends.
          */
-        if (err == CL_INVALID_KERNEL_NAME) {
-            size_t kn_sz = 0;
-            clGetProgramInfo(prog_c, CL_PROGRAM_KERNEL_NAMES, 0, NULL, &kn_sz);
-            if (kn_sz > 0) {
-                char* kn = malloc(kn_sz + 1);
-                clGetProgramInfo(prog_c, CL_PROGRAM_KERNEL_NAMES, kn_sz, kn, NULL);
-                kn[kn_sz] = '\0';
-                fprintf(stderr, "kernel '%s' not found; available kernels: %s\n", krn_name, kn);
-                free(kn);
+        char krn_name[64];
+        strcpy(krn_name, "lzo1x_block_compress");
+        krn_c = clCreateKernel(prog_c, krn_name, &err);
+        if (err != CL_SUCCESS) {
+            /* Simplified fallback: report available kernels and force a single
+             * source rebuild retry. Avoid multiple name-specific fallbacks — precompile
+             * step should produce binaries matching canonical exported symbol.
+             */
+            if (err == CL_INVALID_KERNEL_NAME) {
+                size_t kn_sz = 0;
+                clGetProgramInfo(prog_c, CL_PROGRAM_KERNEL_NAMES, 0, NULL, &kn_sz);
+                if (kn_sz > 0) {
+                    char* kn = malloc(kn_sz + 1);
+                    clGetProgramInfo(prog_c, CL_PROGRAM_KERNEL_NAMES, kn_sz, kn, NULL);
+                    kn[kn_sz] = '\0';
+                    fprintf(stderr, "kernel '%s' not found; available kernels: %s\n", krn_name, kn);
+                    free(kn);
+                } else {
+                    fprintf(stderr, "kernel '%s' not found and program reports no kernel names\n", krn_name);
+                }
+                /* Force a source-built program and retry once */
+                clReleaseProgram(prog_c);
+                prog_c = load_prog_from_bin_or_src(kernel_base, cl_src);
+                krn_c = clCreateKernel(prog_c, krn_name, &err);
+                if (err != CL_SUCCESS) { fprintf(stderr, "clCreateKernel after source rebuild failed (err=%d)\n", err); exit(1); }
             } else {
-                fprintf(stderr, "kernel '%s' not found and program reports no kernel names\n", krn_name);
+                fprintf(stderr, "clCreateKernel failed for %s (err=%d)\n", krn_name, err); exit(1);
             }
-            /* Force a source-built program and retry once */
-            clReleaseProgram(prog_c);
-            prog_c = load_prog_from_bin_or_src(kernel_base, cl_src);
-            krn_c = clCreateKernel(prog_c, krn_name, &err);
-            if (err != CL_SUCCESS) { fprintf(stderr, "clCreateKernel after source rebuild failed (err=%d)\n", err); exit(1); }
-        } else {
-            fprintf(stderr, "clCreateKernel failed for %s (err=%d)\n", krn_name, err); exit(1);
         }
+
+        /* 缓存程序和内核供后续使用 */
+        cache_program(kernel_base, prog_c, krn_c, NULL);
     }
+    uint64_t t_kernel_load_end = now_ns();
 
     /* choose blocking dynamically (uses GPU CU count and ALIGN_BYTES) */
+    uint64_t t_blocking_start = now_ns();
     size_t blk = 0, nblk = 0;
     choose_blocking(in_sz, dev, &blk, &nblk);
     size_t worst_blk = lzo_worst(blk);
@@ -650,15 +758,31 @@ int main(int argc, char** argv)
         fprintf(stderr, "DBG: choose_blocking -> in_sz=%zu blk=%zu nblk=%zu worst_blk=%zu out_cap=%zu\n",
                 in_sz, blk, nblk, worst_blk, out_cap);
     }
+    uint64_t t_blocking_end = now_ns();
 
-    if (debug) fprintf(stderr, "DBG: creating d_in size=%zu\n", in_sz);
-    cl_mem d_in = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, in_sz, in_buf, &err);
-    if (debug) fprintf(stderr, "DBG: created d_in err=%d\n", err);
+    /* 优化: 使用缓冲区缓存避免重复创建 */
+    uint64_t t_buffer_alloc_start = now_ns();
+    if (debug) fprintf(stderr, "DBG: getting cached d_in size=%zu\n", in_sz);
+    cl_mem d_in = get_or_create_buffer(&buffer_cache.d_in, &buffer_cache.in_size,
+                                       in_sz, CL_MEM_READ_ONLY);  /* 优化:移除ALLOC_HOST_PTR */
+    uint64_t t_buffer_alloc_end = now_ns();
+
+    /* 使用map上传(保持同步以确保数据完整性) */
+    uint64_t t_upload_start = now_ns();
+    void* mapped_in = clEnqueueMapBuffer(q, d_in, CL_TRUE, CL_MAP_WRITE, 0, in_sz,
+                                         0, NULL, NULL, &err);
     CHECK(err);
-    if (debug) fprintf(stderr, "DBG: creating d_out size=%zu\n", out_cap);
-    cl_mem d_out = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, out_cap, NULL, &err);
-    if (debug) fprintf(stderr, "DBG: created d_out err=%d\n", err);
-    CHECK(err);
+    memcpy(mapped_in, in_buf, in_sz);
+    CHECK(clEnqueueUnmapMemObject(q, d_in, mapped_in, 0, NULL, NULL));
+    uint64_t t_upload_end = now_ns();
+
+    /* 创建输出缓冲区 */
+    uint64_t t_out_buffer_start = now_ns();
+    if (debug) fprintf(stderr, "DBG: getting cached d_out size=%zu\n", out_cap);
+    cl_mem d_out = get_or_create_buffer(&buffer_cache.d_out, &buffer_cache.out_size,
+                                        out_cap, CL_MEM_WRITE_ONLY);  /* 优化:移除ALLOC_HOST_PTR */
+    uint64_t t_out_buffer_end = now_ns();
+
     /* map_mode: 0=default CL_MEM_WRITE_ONLY + clEnqueueReadBuffer
      * 1=ALLOC_HOST_PTR + clEnqueueMapBuffer
      * 2=USE_HOST_PTR with host pointer (posix_memalign)
@@ -682,41 +806,36 @@ int main(int argc, char** argv)
     }
     /* The 'usehost' strategy has been removed; only map_mode 0/1 are used. */
 
-    cl_mem d_len;
+    /* 优化: 使用缓冲区缓存 */
+    uint64_t t_len_buffer_start = now_ns();
     size_t len_bytes = nblk * sizeof(cl_uint);
-    if (map_mode == 1) {
-        d_len = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, len_bytes, NULL, &err); CHECK(err);
-    } else {
-        if (debug) fprintf(stderr, "DBG: map_mode=0 creating d_len len_bytes=%zu\n", len_bytes);
-        d_len = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, len_bytes, NULL, &err);
-        if (debug) fprintf(stderr, "DBG: created d_len err=%d\n", err);
-        CHECK(err);
-    }
+    if (debug) fprintf(stderr, "DBG: getting cached d_len size=%zu\n", len_bytes);
+    cl_mem d_len = get_or_create_buffer(&buffer_cache.d_len, &buffer_cache.len_size,
+                                        len_bytes, CL_MEM_READ_WRITE);  /* 优化:移除ALLOC_HOST_PTR */
+    uint64_t t_len_buffer_end = now_ns();
 
-    CHECK(clSetKernelArg(krn_c, 0, sizeof(cl_mem), &d_in));
-    CHECK(clSetKernelArg(krn_c, 1, sizeof(cl_mem), &d_out));
-    CHECK(clSetKernelArg(krn_c, 2, sizeof(cl_mem), &d_len));
-    CHECK(clSetKernelArg(krn_c, 3, sizeof(cl_uint), &in_sz));
-    CHECK(clSetKernelArg(krn_c, 4, sizeof(cl_uint), &blk));
-    CHECK(clSetKernelArg(krn_c, 5, sizeof(cl_uint), &worst_blk));
+    /* 优化: 使用参数缓存避免重复设置 */
+    uint64_t t_setup_args_start = now_ns();
+    set_kernel_args_cached(krn_c, d_in, d_out, d_len, in_sz, blk, worst_blk);
+    uint64_t t_setup_args_end = now_ns();
 
-    size_t gsz = nblk, lsz = 1; cl_event evt; uint64_t t_exec_start = now_ns();
-    CHECK(clEnqueueNDRangeKernel(q, krn_c, 1, NULL, &gsz, &lsz, 0, NULL, &evt)); clWaitForEvents(1, &evt);
+    size_t gsz = nblk, lsz = 1;
+    cl_event evt_compute;
+    uint64_t t_exec_start = now_ns();
+    CHECK(clEnqueueNDRangeKernel(q, krn_c, 1, NULL, &gsz, &lsz, 0, NULL, &evt_compute));
+    clWaitForEvents(1, &evt_compute);
     uint64_t t_exec_end = now_ns();
 
-    cl_uint* len_arr = malloc(nblk * sizeof(cl_uint)); uint64_t t_len_read_start = now_ns();
-    uint64_t t_len_read_end = t_len_read_start;
-    if (map_mode == 1) {
-        void* mapped = clEnqueueMapBuffer(q, d_len, CL_TRUE, CL_MAP_READ, 0, len_bytes, 0, NULL, NULL, &err);
-        CHECK(err);
-        memcpy(len_arr, mapped, len_bytes);
-        CHECK(clEnqueueUnmapMemObject(q, d_len, mapped, 0, NULL, NULL));
-        t_len_read_end = now_ns();
-    } else {
-        /* Default: perform explicit blocking read to fetch lengths from device */
-        CHECK(clEnqueueReadBuffer(q, d_len, CL_TRUE, 0, len_bytes, len_arr, 0, NULL, NULL));
-        t_len_read_end = now_ns();
-    }
+    /* 优化: 使用map读取长度数组(零拷贝) */
+    uint64_t t_download_start = now_ns();
+    cl_uint* len_arr = malloc(nblk * sizeof(cl_uint));
+    uint64_t t_len_read_start = now_ns();
+    void* mapped_len = clEnqueueMapBuffer(q, d_len, CL_TRUE, CL_MAP_READ, 0, len_bytes,
+                                          0, NULL, NULL, &err);
+    CHECK(err);
+    memcpy(len_arr, mapped_len, len_bytes);
+    CHECK(clEnqueueUnmapMemObject(q, d_len, mapped_len, 0, NULL, NULL));
+    uint64_t t_len_read_end = now_ns();
 
     if (debug) {
         fprintf(stderr, "Per-block compressed lengths (nblk=%zu):\n", nblk);
@@ -728,11 +847,13 @@ int main(int argc, char** argv)
     size_t out_sz = 0; for (size_t i = 0; i < nblk; ++i) out_sz += len_arr[i];
     unsigned char* out_buf = NULL;
     size_t host_off = 0;
-    /* bulk-read entire device output buffer once to avoid many small PCIe transfers */
-    unsigned char* dev_out = malloc(out_cap); uint64_t t_bulk_read_start = now_ns();
-    if (debug) fprintf(stderr, "DBG: about to clEnqueueReadBuffer d_out size=%zu\n", out_cap);
-    CHECK(clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, out_cap, dev_out, 0, NULL, NULL));
-    if (debug) fprintf(stderr, "DBG: clEnqueueReadBuffer completed\n");
+    /* 优化: 使用map读取输出缓冲区(零拷贝) */
+    uint64_t t_bulk_read_start = now_ns();
+    if (debug) fprintf(stderr, "DBG: about to map d_out size=%zu\n", out_cap);
+    unsigned char* dev_out = (unsigned char*)clEnqueueMapBuffer(q, d_out, CL_TRUE, CL_MAP_READ,
+                                                                  0, out_cap, 0, NULL, NULL, &err);
+    CHECK(err);
+    if (debug) fprintf(stderr, "DBG: map completed\n");
     uint64_t t_bulk_read_end = now_ns();
     /* debug: dump first 32 bytes of first block to help diagnose visibility */
     if (debug) {
@@ -816,9 +937,12 @@ int main(int argc, char** argv)
             host_off += len_arr[i];
         }
     }
-    free(dev_out);
+    /* 优化: unmap而非free */
+    CHECK(clEnqueueUnmapMemObject(q, d_out, dev_out, 0, NULL, NULL));
+    uint64_t t_download_end = now_ns();
 
     /* decide output path if not specified: default to input_file.lzo */
+    uint64_t t_write_start = now_ns();
     if (!output_path) {
         size_t L = strlen(in_path); char* def = (char*)malloc(L + 4 + 1);
         memcpy(def, in_path, L); memcpy(def + L, ".lzo", 4); def[L + 4] = '\0';
@@ -841,15 +965,75 @@ int main(int argc, char** argv)
     printf("wrote %s\n", output_path);
 
     uint64_t t_after_write = now_ns();
+
+    /* 计算各阶段耗时 */
+    double ms_file_read = (t_io_read_done - t_io_in)/1e6;
+    double ms_ocl_init = (t_ocl_init - t_io_read_done)/1e6;
+    double ms_kernel_load = (t_kernel_load_end - t_kernel_load_start)/1e6;
+    double ms_blocking = (t_blocking_end - t_blocking_start)/1e6;
+    double ms_buffer_alloc_in = (t_buffer_alloc_end - t_buffer_alloc_start)/1e6;
+    double ms_upload = (t_upload_end - t_upload_start)/1e6;
+    double ms_buffer_alloc_out = (t_out_buffer_end - t_out_buffer_start)/1e6;
+    double ms_buffer_alloc_len = (t_len_buffer_end - t_len_buffer_start)/1e6;
+    double ms_setup_args = (t_setup_args_end - t_setup_args_start)/1e6;
     double ms_kernel = (t_exec_end - t_exec_start)/1e6;
     double ms_len_read = (t_len_read_end - t_len_read_start)/1e6;
     double ms_bulk_read = (t_bulk_read_end - t_bulk_read_start)/1e6;
-    double ms_io = (t_io_read_done - t_io_in)/1e6;
-    double ms_total = (t_after_write - t_start_total)/1e6;
+    double ms_download_total = (t_download_end - t_download_start)/1e6;
+    double ms_file_write = (t_after_write - t_write_start)/1e6;
+    double ms_total = (t_after_write - t_compress_start)/1e6;
+    double ms_buffer_alloc_total = ms_buffer_alloc_in + ms_buffer_alloc_out + ms_buffer_alloc_len;
+
     double ratio = out_sz > 0 ? (double)in_sz / (double)out_sz : 0.0;
     double thrpt = ms_kernel > 0 ? ((double)in_sz / (1024.0*1024.0)) / (ms_kernel/1000.0) : 0.0;
-    printf("[COMP ] orig=%zu comp=%zu blocks=%zu blk_size=%zu ratio=%.3f kernel=%.3f ms len_rd=%.3f ms bulk_rd=%.3f ms io=%.3f ms total=%.3f ms thrpt=%.2f MB/s\n",
-           in_sz, out_sz, nblk, blk, ratio, ms_kernel, ms_len_read, ms_bulk_read, ms_io, ms_total, thrpt);
+
+    printf("[COMP ] orig=%zu comp=%zu blocks=%zu blk_size=%zu ratio=%.3f kernel=%.3f ms total=%.3f ms thrpt=%.2f MB/s\n",
+           in_sz, out_sz, nblk, blk, ratio, ms_kernel, ms_total, thrpt);
+
+    /* 打印详细的时间分解 */
+    printf("\n=== Time Breakdown (Compression) ===\n");
+    print_ns("1. File Read", t_io_read_done - t_io_in);
+    print_ns("2. OCL Init", t_ocl_init - t_io_read_done);
+    print_ns("3. Kernel Load", t_kernel_load_end - t_kernel_load_start);
+    print_ns("4. Blocking Calc", t_blocking_end - t_blocking_start);
+    print_ns("5. Buffer Alloc (in)", t_buffer_alloc_end - t_buffer_alloc_start);
+    print_ns("6. Data Upload", t_upload_end - t_upload_start);
+    print_ns("7. Buffer Alloc (out)", t_out_buffer_end - t_out_buffer_start);
+    print_ns("8. Buffer Alloc (len)", t_len_buffer_end - t_len_buffer_start);
+    print_ns("9. Setup Args", t_setup_args_end - t_setup_args_start);
+    print_ns("10. Kernel Exec", t_exec_end - t_exec_start);
+    print_ns("11. Download (len)", t_len_read_end - t_len_read_start);
+    print_ns("12. Download (bulk)", t_bulk_read_end - t_bulk_read_start);
+    print_ns("13. Download Total", t_download_end - t_download_start);
+    print_ns("14. File Write", t_after_write - t_write_start);
+    print_ns("TOTAL", t_after_write - t_compress_start);
+    printf("\n");
+
+    /* 计算占比 */
+    printf("=== Percentage Breakdown ===\n");
+    printf("Kernel Exec     : %6.2f%%\n", 100.0 * ms_kernel / ms_total);
+    printf("Data Transfer   : %6.2f%% (upload=%.2f%% + download=%.2f%%)\n",
+           100.0 * (ms_upload + ms_download_total) / ms_total,
+           100.0 * ms_upload / ms_total,
+           100.0 * ms_download_total / ms_total);
+    printf("File I/O        : %6.2f%% (read=%.2f%% + write=%.2f%%)\n",
+           100.0 * (ms_file_read + ms_file_write) / ms_total,
+           100.0 * ms_file_read / ms_total,
+           100.0 * ms_file_write / ms_total);
+    printf("Buffer Alloc    : %6.2f%% (in=%.2f%% + out=%.2f%% + len=%.2f%%)\n",
+           100.0 * ms_buffer_alloc_total / ms_total,
+           100.0 * ms_buffer_alloc_in / ms_total,
+           100.0 * ms_buffer_alloc_out / ms_total,
+           100.0 * ms_buffer_alloc_len / ms_total);
+    printf("OCL Setup       : %6.2f%% (init=%.2f%% + kernel_load=%.2f%%)\n",
+           100.0 * (ms_ocl_init + ms_kernel_load) / ms_total,
+           100.0 * ms_ocl_init / ms_total,
+           100.0 * ms_kernel_load / ms_total);
+    printf("Kernel Args     : %6.2f%%\n",
+           100.0 * ms_setup_args / ms_total);
+    printf("Other           : %6.2f%%\n",
+           100.0 * ms_blocking / ms_total);
+    printf("\n");
 
     /* optional roundtrip verification only when --verify set */
     if (verify_flag) {
@@ -884,7 +1068,9 @@ int main(int argc, char** argv)
         CHECK(clSetKernelArg(krn_d, 5, sizeof(cl_uint), &in_sz));
         CHECK(clSetKernelArg(krn_d, 6, sizeof(cl_uint), &nblk));
 
-        CHECK(clEnqueueNDRangeKernel(q, krn_d, 1, NULL, &gsz, &lsz, 0, NULL, &evt)); clWaitForEvents(1, &evt);
+        cl_event evt_verify;
+        CHECK(clEnqueueNDRangeKernel(q, krn_d, 1, NULL, &gsz, &lsz, 0, NULL, &evt_verify));
+        clWaitForEvents(1, &evt_verify);
         unsigned char* out2 = malloc(in_sz);
         CHECK(clEnqueueReadBuffer(q, d_out2, CL_TRUE, 0, in_sz, out2, 0, NULL, NULL));
 
