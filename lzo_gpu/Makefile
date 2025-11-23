@@ -1,6 +1,6 @@
 CC ?= gcc
 CFLAGS ?= -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200
-LDFLAGS ?= -lOpenCL
+LDFLAGS ?= -lOpenCL -lm
 
 ## Automatically discover .cl sources present in this directory so we don't
 ## attempt to precompile kernels that aren't actually in the tree.

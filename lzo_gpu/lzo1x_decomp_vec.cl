@@ -90,6 +90,127 @@ static inline void LZO_MEMOPS_COPYN(__generic void *dd, const __generic void *ss
     for (; nn; --nn) *d++ = *s++;
 }
 
+/* 优化的匹配拷贝函数 - 用于解压中的COPY指令 (向量化优化) */
+static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos, uint len)
+{
+    /* 向量化匹配拷贝 (ROI: ⭐⭐⭐⭐)
+     * 优化策略:
+     * 1. 使用uchar16/uchar8向量拷贝长匹配
+     * 2. 处理重叠拷贝 (offset < 16)
+     * 3. RLE模式检测和优化
+     * 4. 尾部使用标量拷贝
+     */
+
+    uint offset = op - m_pos;
+
+    /* 长距离匹配：可以安全使用向量拷贝 */
+    if (offset >= 16) {
+        /* 16字节向量拷贝 */
+        while (len >= 16) {
+            uchar16 v = vload16(0, m_pos);
+            vstore16(v, 0, op);
+            op += 16; m_pos += 16; len -= 16;
+        }
+
+        /* 8字节向量拷贝 */
+        if (len >= 8) {
+            uchar8 v = vload8(0, m_pos);
+            vstore8(v, 0, op);
+            op += 8; m_pos += 8; len -= 8;
+        }
+
+        /* 4字节向量拷贝 */
+        if (len >= 4) {
+            uchar4 v = vload4(0, m_pos);
+            vstore4(v, 0, op);
+            op += 4; m_pos += 4; len -= 4;
+        }
+    }
+    /* 中距离匹配：可以使用8字节向量 */
+    else if (offset >= 8) {
+        /* 8字节向量拷贝 */
+        while (len >= 8) {
+            uchar8 v = vload8(0, m_pos);
+            vstore8(v, 0, op);
+            op += 8; m_pos += 8; len -= 8;
+        }
+
+        /* 4字节向量拷贝 */
+        if (len >= 4) {
+            uchar4 v = vload4(0, m_pos);
+            vstore4(v, 0, op);
+            op += 4; m_pos += 4; len -= 4;
+        }
+    }
+    /* 短距离匹配：可能重叠，需要特殊处理 */
+    else if (offset > 0) {
+        /* RLE模式检测：offset=1时是字节重复 */
+        if (offset == 1) {
+            uchar c = *m_pos;
+            /* 向量化填充 */
+            uchar16 fill16 = (uchar16)(c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c);
+            uchar8 fill8 = (uchar8)(c,c,c,c,c,c,c,c);
+
+            while (len >= 16) {
+                vstore16(fill16, 0, op);
+                op += 16; len -= 16;
+            }
+            while (len >= 8) {
+                vstore8(fill8, 0, op);
+                op += 8; len -= 8;
+            }
+            while (len--) *op++ = c;
+            return;
+        }
+
+        /* offset=2: 重复2字节模式 */
+        if (offset == 2 && len >= 8) {
+            uchar2 pattern = vload2(0, m_pos);
+            uchar8 pat8 = (uchar8)(pattern.s0, pattern.s1, pattern.s0, pattern.s1,
+                                    pattern.s0, pattern.s1, pattern.s0, pattern.s1);
+            while (len >= 8) {
+                vstore8(pat8, 0, op);
+                op += 8; len -= 8;
+            }
+        }
+        /* offset=3: 重复3字节模式 */
+        else if (offset == 3 && len >= 6) {
+            uchar c0 = m_pos[0], c1 = m_pos[1], c2 = m_pos[2];
+            while (len >= 3) {
+                op[0] = c0; op[1] = c1; op[2] = c2;
+                op += 3; len -= 3;
+            }
+        }
+        /* offset=4: 重复4字节模式 */
+        else if (offset == 4 && len >= 8) {
+            uchar4 pattern = vload4(0, m_pos);
+            uchar8 pat8 = (uchar8)(pattern.s0, pattern.s1, pattern.s2, pattern.s3,
+                                    pattern.s0, pattern.s1, pattern.s2, pattern.s3);
+            while (len >= 8) {
+                vstore8(pat8, 0, op);
+                op += 8; len -= 8;
+            }
+        }
+        /* offset=5-7: 先拷贝一个周期，然后可以用向量 */
+        else if (offset <= 7 && len >= offset * 2) {
+            /* 先拷贝一个模式周期 */
+            for (uint i = 0; i < offset; i++)
+                op[i] = m_pos[i];
+            op += offset; len -= offset;
+
+            /* 现在可以从op-offset拷贝到op */
+            while (len >= 8 && offset >= 4) {
+                uchar8 v = vload8(0, op - offset);
+                vstore8(v, 0, op);
+                op += 8; len -= 8;
+            }
+        }
+    }
+
+    /* 尾部逐字节拷贝 */
+    while (len--) *op++ = *m_pos++;
+}
+
 static inline uint lzo_memops_get_le32(const __generic void *pp)
 {
     const __generic uchar *p = (__generic const uchar*)pp;
@@ -233,8 +354,9 @@ lzo1x_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint  in_len,
                 goto match_done;
             }
         copy_match:
-            *op++ = *m_pos++; *op++ = *m_pos++;
-            do *op++ = *m_pos++; while (--t > 0);
+            /* 使用优化的向量化拷贝 */
+            COPY_MATCH(op, m_pos, t + 2);
+            op += t + 2;
 
         match_done:
             t = ip[-2] & 3;
