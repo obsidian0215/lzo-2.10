@@ -114,12 +114,14 @@ int decompress_with_daemon(const char* input, const char* output)
     // 处理响应
     if (resp.status == 0) {
         printf("解压缩成功: %s -> %s\n", input, output);
+        /*
         printf("  压缩大小: %ld bytes (%.2f MB)\n", req.input_size, req.input_size / 1048576.0);
         printf("  原始大小: %ld bytes (%.2f MB)\n", resp.output_size, resp.output_size / 1048576.0);
         printf("  扩展比:   %.4f:1\n", (double)resp.output_size / req.input_size);
         printf("  耗时:     %.3f ms\n", resp.time_us / 1000.0);
         printf("  吞吐量:   %.2f MB/s\n", (resp.output_size / 1048576.0) / (resp.time_us / 1000000.0));
         printf("  %s\n", resp.message);
+        */
         return 0;
     } else {
         fprintf(stderr, "解压缩失败: %s\n", resp.message);
@@ -196,6 +198,7 @@ int compress_with_daemon(const char* input, const char* output, int level)
     // 处理响应
     if (resp.status == 0) {
         printf("压缩成功: %s -> %s\n", input, output);
+        /*
         printf("  原始大小: %ld bytes (%.2f MB)\n", req.input_size, req.input_size / 1048576.0);
         printf("  压缩大小: %ld bytes (%.2f MB)\n", resp.output_size, resp.output_size / 1048576.0);
         printf("  压缩比:   %.4f:1 (节省 %.2f%%)\n",
@@ -208,6 +211,7 @@ int compress_with_daemon(const char* input, const char* output, int level)
                resp.read_us/1000.0, resp.buffer_us/1000.0, resp.upload_us/1000.0, resp.kernel_us/1000.0,
                resp.download_us/1000.0, resp.write_us/1000.0, resp.cleanup_us/1000.0);
         printf("  %s\n", resp.message);
+        */
         return 0;
     } else {
         fprintf(stderr, "压缩失败: %s\n", resp.message);

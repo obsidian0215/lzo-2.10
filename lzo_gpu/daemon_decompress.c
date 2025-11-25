@@ -1,5 +1,7 @@
 /*
  * daemon_decompress.c - 守护进程解压缩核心逻辑
+ *
+ * Phase 7.2: 同步Pinned Memory和Buffer缓存优化
  */
 
 #include <CL/cl.h>
@@ -20,6 +22,38 @@ static inline uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* Phase 7.2: Buffer缓存机制 */
+static struct {
+    cl_mem d_comp;
+    cl_mem d_off;
+    cl_mem d_out;
+    cl_mem d_out_lens;
+    size_t comp_size;
+    size_t off_size;
+    size_t out_size;
+    size_t lens_size;
+} decomp_buffer_cache = {0};
+
+static cl_mem get_or_create_buffer(cl_context ctx, cl_mem* cached_buf, size_t* cached_size,
+                                    size_t required_size, cl_mem_flags flags, cl_int* err_out) {
+    if (*cached_size < required_size) {
+        if (*cached_buf) {
+            clReleaseMemObject(*cached_buf);
+            *cached_buf = NULL;
+            *cached_size = 0;
+        }
+        /* Phase 6.1: 使用Pinned Memory */
+        *cached_buf = clCreateBuffer(ctx, flags | CL_MEM_ALLOC_HOST_PTR,
+                                     required_size, NULL, err_out);
+        if (*err_out == CL_SUCCESS) {
+            *cached_size = required_size;
+        }
+    } else {
+        *err_out = CL_SUCCESS;
+    }
+    return *cached_buf;
 }
 
 /* 读取文件 */
@@ -54,13 +88,18 @@ static void* read_file_data(const char* path, size_t* size_out) {
 /*
  * 守护进程解压缩函数
  * 复用预分配的OpenCL资源,仅执行必要的解压缩操作
+ *
+ * Phase 7.2更新:
+ * - Pinned Memory优化
+ * - Buffer缓存机制
  */
 int daemon_decompress(
     /* OpenCL资源 (已初始化,复用) */
     cl_context ctx,
     cl_command_queue queue,
     cl_device_id device,
-    cl_kernel kernel,         // 解压缩kernel
+    cl_kernel kernel,         // 解压缩kernel (标量或向量)
+    int prefer_vec,           // caller indicates this call was intended for vectorized kernel
     /* 请求参数 */
     const char* input_path,
     const char* output_path,
@@ -71,31 +110,60 @@ int daemon_decompress(
     cl_int err;
     uint64_t t_start = now_ns();
 
-    // 1. 读取压缩文件
-    size_t lz_sz;
-    unsigned char* lz_buf = read_file_data(input_path, &lz_sz);
-    if (!lz_buf) {
-        fprintf(stderr, "[DECOMP] 读取文件失败: %s\n", input_path);
+    // 1. 打开文件并读取头部
+    FILE* f_in = fopen(input_path, "rb");
+    if (!f_in) {
+        perror("fopen input");
         return -1;
     }
 
-    // 2. 解析LZO文件头
-    unsigned char* p = lz_buf;
-    uint16_t magic = *(uint16_t*)p; p += 2;
+    // 读取魔数
+    uint16_t magic;
+    if (fread(&magic, sizeof(magic), 1, f_in) != 1) {
+        perror("fread magic");
+        fclose(f_in);
+        return -1;
+    }
     if (magic != MAGIC) {
         fprintf(stderr, "[DECOMP] 错误的文件格式 (magic=0x%04x, 期望=0x%04x)\n", magic, MAGIC);
-        free(lz_buf);
+        fclose(f_in);
         return -1;
     }
 
-    uint32_t orig_sz = *(uint32_t*)p; p += 4;
-    uint32_t blk_sz = *(uint32_t*)p; p += 4;
-    uint32_t nblk = *(uint32_t*)p; p += 4;
-    uint32_t* len_arr = (uint32_t*)p; p += 4 * nblk;
-    size_t comp_sz = lz_sz - (p - lz_buf);
+    // 读取头部信息
+    uint32_t orig_sz, blk_sz, nblk;
+    if (fread(&orig_sz, sizeof(orig_sz), 1, f_in) != 1 ||
+        fread(&blk_sz, sizeof(blk_sz), 1, f_in) != 1 ||
+        fread(&nblk, sizeof(nblk), 1, f_in) != 1) {
+        perror("fread header");
+        fclose(f_in);
+        return -1;
+    }
 
-    printf("[DECOMP] 文件信息: 原始=%u, 块大小=%u, 块数=%u, 压缩数据=%zu\n",
-           orig_sz, blk_sz, nblk, comp_sz);
+    // 读取长度数组
+    uint32_t* len_arr = malloc(nblk * sizeof(uint32_t));
+    if (!len_arr) {
+        perror("malloc len_arr");
+        fclose(f_in);
+        return -1;
+    }
+    if (fread(len_arr, sizeof(uint32_t), nblk, f_in) != nblk) {
+        perror("fread len_arr");
+        free(len_arr);
+        fclose(f_in);
+        return -1;
+    }
+
+    // 计算压缩数据大小
+    long current_pos = ftell(f_in);
+    fseek(f_in, 0, SEEK_END);
+    long file_sz = ftell(f_in);
+    fseek(f_in, current_pos, SEEK_SET);
+    size_t comp_sz = file_sz - current_pos;
+
+    /* Always print file summary so tests / logs have consistent output (not debug-only) */
+    fprintf(stderr, "[DECOMP] 文件信息: 原始=%u, 块大小=%u, 块数=%u, 压缩数据=%zu\n",
+            orig_sz, blk_sz, nblk, comp_sz);
 
     // 3. 计算偏移数组
     uint32_t* off_arr = malloc((nblk + 1) * sizeof(uint32_t));
@@ -103,58 +171,57 @@ int daemon_decompress(
     for (uint32_t i = 0; i < nblk; ++i) {
         off_arr[i+1] = off_arr[i] + len_arr[i];
     }
+    free(len_arr); // 长度数组不再需要
 
-    // 4. 创建OpenCL缓冲区
+    // 4. Phase 7.2: 使用Buffer缓存 + Pinned Memory
     uint64_t t_buf_start = now_ns();
 
-    cl_mem d_comp = clCreateBuffer(ctx, CL_MEM_READ_ONLY, comp_sz, NULL, &err);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "[DECOMP] 创建压缩数据缓冲区失败: %d\n", err);
-        free(lz_buf);
-        free(off_arr);
-        return -1;
-    }
+    cl_mem d_comp = get_or_create_buffer(ctx, &decomp_buffer_cache.d_comp,
+                                         &decomp_buffer_cache.comp_size,
+                                         comp_sz, CL_MEM_READ_ONLY, &err);
+    CHECK(err);
 
-    cl_mem d_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY, (nblk + 1) * sizeof(cl_uint), NULL, &err);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "[DECOMP] 创建偏移缓冲区失败: %d\n", err);
-        clReleaseMemObject(d_comp);
-        free(lz_buf);
-        free(off_arr);
-        return -1;
-    }
+    cl_mem d_off = get_or_create_buffer(ctx, &decomp_buffer_cache.d_off,
+                                        &decomp_buffer_cache.off_size,
+                                        (nblk + 1) * sizeof(cl_uint), CL_MEM_READ_ONLY, &err);
+    CHECK(err);
 
-    cl_mem d_out = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, orig_sz, NULL, &err);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "[DECOMP] 创建输出缓冲区失败: %d\n", err);
-        clReleaseMemObject(d_comp);
-        clReleaseMemObject(d_off);
-        free(lz_buf);
-        free(off_arr);
-        return -1;
-    }
+    cl_mem d_out = get_or_create_buffer(ctx, &decomp_buffer_cache.d_out,
+                                        &decomp_buffer_cache.out_size,
+                                        orig_sz, CL_MEM_WRITE_ONLY, &err);
+    CHECK(err);
 
-    cl_mem d_out_lens = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, nblk * sizeof(cl_uint), NULL, &err);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "[DECOMP] 创建输出长度缓冲区失败: %d\n", err);
-        clReleaseMemObject(d_comp);
-        clReleaseMemObject(d_off);
-        clReleaseMemObject(d_out);
-        free(lz_buf);
-        free(off_arr);
-        return -1;
-    }
+    cl_mem d_out_lens = get_or_create_buffer(ctx, &decomp_buffer_cache.d_out_lens,
+                                             &decomp_buffer_cache.lens_size,
+                                             nblk * sizeof(cl_uint), CL_MEM_WRITE_ONLY, &err);
+    CHECK(err);
 
     uint64_t t_buf_end = now_ns();
 
-    // 5. 上传数据
+    // 5. Phase 6.1: 使用map上传数据 (零拷贝DMA)
     uint64_t t_upload_start = now_ns();
-    err = clEnqueueWriteBuffer(queue, d_comp, CL_FALSE, 0, comp_sz, p, 0, NULL, NULL);
+
+    // 直接读取压缩数据到Pinned Memory
+    void* mapped_comp = clEnqueueMapBuffer(queue, d_comp, CL_TRUE, CL_MAP_WRITE, 0, comp_sz,
+                                           0, NULL, NULL, &err);
     CHECK(err);
 
-    err = clEnqueueWriteBuffer(queue, d_off, CL_FALSE, 0, (nblk + 1) * sizeof(cl_uint),
-                               off_arr, 0, NULL, NULL);
+    if (fread(mapped_comp, 1, comp_sz, f_in) != comp_sz) {
+        perror("fread compressed data");
+        clEnqueueUnmapMemObject(queue, d_comp, mapped_comp, 0, NULL, NULL);
+        free(off_arr);
+        fclose(f_in);
+        return -1;
+    }
+    CHECK(clEnqueueUnmapMemObject(queue, d_comp, mapped_comp, 0, NULL, NULL));
+    fclose(f_in); // 文件读取完成
+
+    // 上传偏移数组
+    void* mapped_off = clEnqueueMapBuffer(queue, d_off, CL_TRUE, CL_MAP_WRITE, 0,
+                                          (nblk + 1) * sizeof(cl_uint), 0, NULL, NULL, &err);
     CHECK(err);
+    memcpy(mapped_off, off_arr, (nblk + 1) * sizeof(cl_uint));
+    CHECK(clEnqueueUnmapMemObject(queue, d_off, mapped_off, 0, NULL, NULL));
 
     clFinish(queue);
     uint64_t t_upload_end = now_ns();
@@ -171,25 +238,57 @@ int daemon_decompress(
     uint64_t t_setup_end = now_ns();
 
     // 7. 执行kernel
-    size_t global_size = nblk;
-    size_t local_size = 1;
+    /* 优化: local_size默认使用8（与 standalone 保持一致），可通过环境变量 LZO_LOCAL_SIZE 覆盖
+       使用较大的local_size能让解压向量化/标量kernel在同一work-group共享资源，提高吞吐 */
+    size_t local_size = 8;
+    const char* ls_env = getenv("LZO_LOCAL_SIZE");
+    if (ls_env) {
+        size_t v = (size_t)atoi(ls_env);
+        if (v >= 1) local_size = v;
+    }
+    size_t global_size = ((size_t)nblk + local_size - 1) / local_size * local_size;
     uint64_t t_exec_start = now_ns();
+    /* Always log kernel launch configuration so profiler traces are visible in daemon logs */
+    fprintf(stderr, "[DECOMP] launching kernel: nblk=%u global_size=%zu local_size=%zu\n", nblk, global_size, local_size);
+    cl_event evt_exec = NULL;
     err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_size, &local_size,
-                                0, NULL, NULL);
+                                0, NULL, &evt_exec);
     CHECK(err);
-    clFinish(queue);
+    /* 等待kernel完成并获取事件级精确时间（若队列启用了profiling） */
+    clWaitForEvents(1, &evt_exec);
+    clFinish(queue);  /* 确保所有GPU操作完成后再读取结果 */
     uint64_t t_exec_end = now_ns();
 
-    // 8. 下载解压数据
-    unsigned char* out_buf = malloc(orig_sz);
-    if (!out_buf) {
-        fprintf(stderr, "[DECOMP] 分配输出缓冲区失败\n");
-        goto cleanup;
+    /* 事件profiling信息（可选） */
+    cl_ulong ev_start = 0, ev_end = 0;
+    if (evt_exec) {
+        cl_int perr = CL_SUCCESS;
+        perr = clGetEventProfilingInfo(evt_exec, CL_PROFILING_COMMAND_START, sizeof(ev_start), &ev_start, NULL);
+        if (perr != CL_SUCCESS) {
+            fprintf(stderr, "[DECOMP] profiling start info not available (err=%d)\n", perr);
+        } else {
+            cl_int perr2 = clGetEventProfilingInfo(evt_exec, CL_PROFILING_COMMAND_END, sizeof(ev_end), &ev_end, NULL);
+            if (perr2 != CL_SUCCESS) {
+                fprintf(stderr, "[DECOMP] profiling end info not available (err=%d)\n", perr2);
+            }
+        }
+        fprintf(stderr, "[DECOMP] event profiling: start=%llu end=%llu\n", (unsigned long long)ev_start, (unsigned long long)ev_end);
+        clReleaseEvent(evt_exec);
+    } else {
+        fprintf(stderr, "[DECOMP] no event returned from clEnqueueNDRangeKernel\n");
     }
 
+    // 8. Phase 6.1: 使用map下载解压数据 (零拷贝DMA)
+    /* 优化: 移除 out_buf 分配，直接从 mapped_out 写入文件 */
+    // unsigned char* out_buf = malloc(orig_sz);
+
+    /* 如果evt profiling 有效，使用它计算kernel执行时间（ns）否则回退到wall-clock */
+
     uint64_t t_download_start = now_ns();
-    err = clEnqueueReadBuffer(queue, d_out, CL_TRUE, 0, orig_sz, out_buf, 0, NULL, NULL);
+    void* mapped_out = clEnqueueMapBuffer(queue, d_out, CL_TRUE, CL_MAP_READ, 0, orig_sz,
+                                          0, NULL, NULL, &err);
     CHECK(err);
+    // memcpy(out_buf, mapped_out, orig_sz); // 移除memcpy
     uint64_t t_download_end = now_ns();
 
     // 9. 写入输出文件
@@ -197,59 +296,126 @@ int daemon_decompress(
     FILE* fout = fopen(output_path, "wb");
     if (!fout) {
         perror("fopen output");
-        free(out_buf);
-        goto cleanup;
+        clEnqueueUnmapMemObject(queue, d_out, mapped_out, 0, NULL, NULL);
+        // free(out_buf);
+        // free(lz_buf); // 已移除
+        free(off_arr);
+        return -1;
     }
 
-    if (fwrite(out_buf, 1, orig_sz, fout) != orig_sz) {
+    if (fwrite(mapped_out, 1, orig_sz, fout) != orig_sz) {
         perror("fwrite");
         fclose(fout);
-        free(out_buf);
-        goto cleanup;
+        clEnqueueUnmapMemObject(queue, d_out, mapped_out, 0, NULL, NULL);
+        // free(out_buf);
+        // free(lz_buf); // 已移除
+        free(off_arr);
+        return -1;
     }
 
     fclose(fout);
+
+    /* Unmap after writing */
+    CHECK(clEnqueueUnmapMemObject(queue, d_out, mapped_out, 0, NULL, NULL));
+
     uint64_t t_write_end = now_ns();
 
-    // 10. 清理
-    uint64_t t_cleanup_start = now_ns();
-    clReleaseMemObject(d_comp);
-    clReleaseMemObject(d_off);
-    clReleaseMemObject(d_out);
-    clReleaseMemObject(d_out_lens);
-    uint64_t t_cleanup_end = now_ns();
+    // 10. 清理输出buffer以避免GPU内存耗尽 (保留输入buffer缓存以提升性能)
+    /* 解压缩的输出buffer每次都可能很大(800MB+)，如果缓存会导致GPU内存不足
+     * 因此每次都释放输出buffer，只保留输入相关的buffer缓存 */
+    if (decomp_buffer_cache.d_out) {
+        clReleaseMemObject(decomp_buffer_cache.d_out);
+        decomp_buffer_cache.d_out = NULL;
+        decomp_buffer_cache.out_size = 0;
+    }
+    if (decomp_buffer_cache.d_out_lens) {
+        clReleaseMemObject(decomp_buffer_cache.d_out_lens);
+        decomp_buffer_cache.d_out_lens = NULL;
+        decomp_buffer_cache.lens_size = 0;
+    }
 
-    free(lz_buf);
+    // free(lz_buf); // 已移除
     free(off_arr);
-    free(out_buf);
-
+    // free(out_buf);    // 已移除
     uint64_t t_end = now_ns();
-
-    // 11. 输出统计
-    unsigned long t_buf = (t_buf_end - t_buf_start) / 1000000;
-    unsigned long t_upload = (t_upload_end - t_upload_start) / 1000000;
-    unsigned long t_setup = (t_setup_end - t_setup_start) / 1000000;
-    unsigned long t_exec = (t_exec_end - t_exec_start) / 1000000;
-    unsigned long t_download = (t_download_end - t_download_start) / 1000000;
-    unsigned long t_write = (t_write_end - t_write_start) / 1000000;
-    unsigned long t_cleanup = (t_cleanup_end - t_cleanup_start) / 1000000;
-    unsigned long t_total = (t_end - t_start) / 1000000;
-
-    printf("[TIMING] 总耗时=%lums: 缓冲区创建=%lums, 上传=%lums, Kernel设置=%lums, "
-           "Kernel执行=%lums, 下载=%lums, 写文件=%lums, 清理=%lums\n",
-           t_total, t_buf, t_upload, t_setup, t_exec, t_download, t_write, t_cleanup);
-
-    *time_us_out = t_total * 1000;  // 纳秒转微秒
+    *time_us_out = (t_end - t_start) / 1000;
     *output_size_out = orig_sz;
 
-    return 0;
+    /* 计算各阶段耗时（微秒）*/
+    unsigned long buf_us = (t_buf_end - t_buf_start) / 1000;
+    unsigned long upload_us = (t_upload_end - t_upload_start) / 1000;
+    unsigned long setup_us = (t_setup_end - t_setup_start) / 1000;
+    unsigned long exec_host_us = (t_exec_end - t_exec_start) / 1000;
+    unsigned long download_us = (t_download_end - t_download_start) / 1000;
+    unsigned long write_us = (t_write_end - t_write_start) / 1000;
 
-cleanup:
-    clReleaseMemObject(d_comp);
-    clReleaseMemObject(d_off);
-    clReleaseMemObject(d_out);
-    clReleaseMemObject(d_out_lens);
-    free(lz_buf);
-    free(off_arr);
-    return -1;
+    /* 计算基于事件的内核时间（μs），如果事件不可用则为0 */
+    unsigned long exec_us_ev = 0;
+    if (ev_start != 0 && ev_end != 0 && ev_end > ev_start) {
+        exec_us_ev = (unsigned long)((ev_end - ev_start) / 1000);
+    }
+
+    /* 输出解压缩统计信息 (always print for consistency) */
+    double ratio = comp_sz > 0 ? (double)orig_sz / (double)comp_sz : 0.0;
+    fprintf(stderr, "\n=== Decompression Statistics ===\n");
+    fprintf(stderr, "Compressed size  : %zu bytes (%.2f MB)\n", comp_sz, comp_sz / (1024.0 * 1024.0));
+    fprintf(stderr, "Output size      : %u bytes (%.2f MB)\n", orig_sz, orig_sz / (1024.0 * 1024.0));
+    fprintf(stderr, "Expansion ratio  : %.2f:1 (%.2f%% of compressed)\n", ratio, 100.0 * ratio);
+    fprintf(stderr, "Block size       : %u bytes (%u KB)\n", blk_sz, blk_sz / 1024);
+    fprintf(stderr, "Number of blocks : %u\n", nblk);
+    fprintf(stderr, "Kernel           : %s (vectorized=%s)\n",
+           prefer_vec ? "lzo1x_decomp_vec" : "lzo1x_decomp",
+           prefer_vec ? "yes" : "no");
+    fprintf(stderr, "Work groups      : global=%zu, local=%zu\n", global_size, local_size);
+    double kernel_thrpt = exec_host_us > 0 ? ((double)orig_sz / (1024.0*1024.0)) / (exec_host_us/1000000.0) : 0.0;
+    fprintf(stderr, "Throughput       : %.2f MB/s (kernel: %.2f MB/s)\n",
+           ((double)orig_sz / (1024.0*1024.0)) / (*time_us_out/1000000.0),
+           kernel_thrpt);
+    fprintf(stderr, "==============================\n\n");    /* 打印详细的时间分解（与standalone格式一致）*/
+    fprintf(stderr, "\n=== Time Breakdown (Decompression) ===\n");
+    fprintf(stderr, "1. Buffer Alloc      : %8.3f ms\n", buf_us / 1000.0);
+    fprintf(stderr, "2. Data Upload       : %8.3f ms\n", upload_us / 1000.0);
+    fprintf(stderr, "3. Setup Args        : %8.3f ms\n", setup_us / 1000.0);
+    fprintf(stderr, "4. Kernel Exec       : %8.3f ms\n", exec_host_us / 1000.0);
+    if (exec_us_ev) {
+        fprintf(stderr, "   (event profiling) : %8.3f ms\n", exec_us_ev / 1000.0);
+    }
+    fprintf(stderr, "5. Data Download     : %8.3f ms\n", download_us / 1000.0);
+    fprintf(stderr, "6. File Write        : %8.3f ms\n", write_us / 1000.0);
+    fprintf(stderr, "TOTAL                : %8.3f ms\n", *time_us_out / 1000.0);
+    fprintf(stderr, "\n");
+
+    /* 计算占比（与standalone格式一致）*/
+    fprintf(stderr, "=== Percentage Breakdown ===\n");
+    fprintf(stderr, "Kernel Exec     : %6.2f%%\n", 100.0 * exec_host_us / *time_us_out);
+    fprintf(stderr, "Data Transfer   : %6.2f%% (upload=%.2f%% + download=%.2f%%)\n",
+           100.0 * (upload_us + download_us) / *time_us_out,
+           100.0 * upload_us / *time_us_out,
+           100.0 * download_us / *time_us_out);
+    fprintf(stderr, "File I/O        : %6.2f%% (write=%.2f%%)\n",
+           100.0 * write_us / *time_us_out,
+           100.0 * write_us / *time_us_out);
+    fprintf(stderr, "Buffer Alloc    : %6.2f%%\n",
+           100.0 * buf_us / *time_us_out);
+    fprintf(stderr, "Setup Args      : %6.2f%%\n",
+           100.0 * setup_us / *time_us_out);
+    fprintf(stderr, "\n");
+
+    return 0;
+}
+
+/* 清理解压缩buffer缓存 - 外部可调用以在daemon关闭时释放资源 */
+void cleanup_decompress_buffer_cache(void) {
+    if (decomp_buffer_cache.d_comp) clReleaseMemObject(decomp_buffer_cache.d_comp);
+    if (decomp_buffer_cache.d_off) clReleaseMemObject(decomp_buffer_cache.d_off);
+    if (decomp_buffer_cache.d_out) clReleaseMemObject(decomp_buffer_cache.d_out);
+    if (decomp_buffer_cache.d_out_lens) clReleaseMemObject(decomp_buffer_cache.d_out_lens);
+    decomp_buffer_cache.d_comp = NULL;
+    decomp_buffer_cache.d_off = NULL;
+    decomp_buffer_cache.d_out = NULL;
+    decomp_buffer_cache.d_out_lens = NULL;
+    decomp_buffer_cache.comp_size = 0;
+    decomp_buffer_cache.off_size = 0;
+    decomp_buffer_cache.out_size = 0;
+    decomp_buffer_cache.lens_size = 0;
 }

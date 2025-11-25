@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+#include <time.h>
 /*
  * lzo_gpu_daemon.c - LZO GPU守护进程实现
  *
@@ -24,8 +26,8 @@
 /* 声明daemon_decompress.c中的函数 */
 extern int daemon_decompress(
     cl_context ctx, cl_command_queue queue, cl_device_id device,
-    cl_kernel kernel, const char* input_path, const char* output_path,
-    unsigned long* time_ms_out, size_t* output_size_out
+    cl_kernel kernel, int prefer_vec, const char* input_path, const char* output_path,
+    unsigned long* time_us_out, size_t* output_size_out
 );
 
 #define SOCKET_PATH "/tmp/lzo_gpu_daemon.sock"
@@ -43,8 +45,10 @@ typedef struct {
     /* 多kernel支持 - 压缩级别映射 */
     cl_program programs[4];      // lzo1x_1, 1k, 1l, 1o
     cl_kernel kernels_comp[4];   // 对应的压缩kernel
-    cl_program prog_decomp;      // 解压缩program
-    cl_kernel kernel_decomp;     // 解压缩kernel
+    cl_program prog_decomp;      // 解压缩program (标量)
+    cl_program prog_decomp_vec;  // 解压缩program (向量)
+    cl_kernel kernel_decomp;     // 解压缩kernel (标量)
+    cl_kernel kernel_decomp_vec; // 解压缩kernel (向量)
 
     /* 预分配缓冲区 */
     cl_mem d_input;
@@ -146,7 +150,8 @@ int init_opencl_resources(void)
     }
 
     // 3. 创建命令队列 (使用OpenCL 2.0的新API)
-    cl_queue_properties props[] = {0};
+    // 启用 CL_QUEUE_PROFILING_ENABLE，方便后续用事件查询精确的 kernel 执行时间
+    cl_queue_properties props[] = { CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0 };
     g_state.queue = clCreateCommandQueueWithProperties(g_state.context, g_state.device,
                                                         props, &err);
     if (err != CL_SUCCESS) {
@@ -247,15 +252,16 @@ int init_opencl_resources(void)
         }
     }
 
-    // 5. 加载解压缩kernel
-    printf("[DAEMON] 加载解压缩kernel...\n");
+decomp_done:
+    // 5. 加载解压缩kernel (标量+向量)
+    printf("[DAEMON] 加载解压缩kernel (标量+向量)...\n");
 
+    // 标量版本
     FILE* fb_decomp = fopen("lzo1x_decomp.bin", "rb");
     if (fb_decomp) {
         fseek(fb_decomp, 0, SEEK_END);
         long bsz = ftell(fb_decomp);
         fseek(fb_decomp, 0, SEEK_SET);
-
         unsigned char* bin = malloc(bsz);
         if (fread(bin, 1, bsz, fb_decomp) == (size_t)bsz) {
             cl_int binary_status;
@@ -264,74 +270,121 @@ int init_opencl_resources(void)
                                                            (const size_t*)&bsz,
                                                            (const unsigned char**)&bin,
                                                            &binary_status, &err);
-
             if (err == CL_SUCCESS && binary_status == CL_SUCCESS) {
                 err = clBuildProgram(g_state.prog_decomp, 1, &g_state.device, "-cl-std=CL2.0", NULL, NULL);
                 if (err == CL_SUCCESS) {
                     printf("[DAEMON]    - decompress: 从预编译binary加载 ✅\n");
-                    free(bin);
-                    fclose(fb_decomp);
-
                     g_state.kernel_decomp = clCreateKernel(g_state.prog_decomp,
                                                           "lzo1x_block_decompress", &err);
                     if (err != CL_SUCCESS) {
                         fprintf(stderr, "创建解压缩kernel失败 (err=%d)\n", err);
                         return -1;
                     }
-                    goto decomp_done;
                 }
             }
-            if (g_state.prog_decomp) clReleaseProgram(g_state.prog_decomp);
+            if (g_state.prog_decomp && !g_state.kernel_decomp) clReleaseProgram(g_state.prog_decomp);
         }
         free(bin);
         fclose(fb_decomp);
     }
-
     // 回退到源码编译
-    size_t src_len_decomp;
-    char* src_decomp = read_file_content("lzo1x_decomp.cl", &src_len_decomp);
-    if (!src_decomp) {
-        fprintf(stderr, "[DAEMON] 无法读取源文件: lzo1x_decomp.cl\n");
-        return -1;
-    }
-
-    g_state.prog_decomp = clCreateProgramWithSource(g_state.context, 1,
-                                                    (const char**)&src_decomp,
-                                                    &src_len_decomp, &err);
-    free(src_decomp);
-
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "[DAEMON] 创建解压缩程序失败 (err=%d)\n", err);
-        return -1;
-    }
-
-    err = clBuildProgram(g_state.prog_decomp, 1, &g_state.device, "-cl-std=CL2.0 -I.", NULL, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "[DAEMON] 编译解压缩内核失败 (err=%d)\n", err);
-        size_t log_sz;
-        clGetProgramBuildInfo(g_state.prog_decomp, g_state.device,
-                             CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
-        if (log_sz > 0) {
-            char* log = malloc(log_sz + 1);
-            clGetProgramBuildInfo(g_state.prog_decomp, g_state.device,
-                                 CL_PROGRAM_BUILD_LOG, log_sz, log, NULL);
-            log[log_sz] = '\0';
-            fprintf(stderr, "%s\n", log);
-            free(log);
+    if (!g_state.kernel_decomp) {
+        size_t src_len_decomp;
+        char* src_decomp = read_file_content("lzo1x_decomp.cl", &src_len_decomp);
+        if (!src_decomp) {
+            fprintf(stderr, "[DAEMON] 无法读取源文件: lzo1x_decomp.cl\n");
+            return -1;
         }
-        return -1;
+        g_state.prog_decomp = clCreateProgramWithSource(g_state.context, 1,
+                                                        (const char**)&src_decomp,
+                                                        &src_len_decomp, &err);
+        free(src_decomp);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "[DAEMON] 创建解压缩程序失败 (err=%d)\n", err);
+            return -1;
+        }
+        err = clBuildProgram(g_state.prog_decomp, 1, &g_state.device, "-cl-std=CL2.0 -I.", NULL, NULL);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "[DAEMON] 编译解压缩内核失败 (err=%d)\n", err);
+            size_t log_sz;
+            clGetProgramBuildInfo(g_state.prog_decomp, g_state.device,
+                                 CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
+            if (log_sz > 0) {
+                char* log = malloc(log_sz + 1);
+                clGetProgramBuildInfo(g_state.prog_decomp, g_state.device,
+                                     CL_PROGRAM_BUILD_LOG, log_sz, log, NULL);
+                log[log_sz] = '\0';
+                fprintf(stderr, "%s\n", log);
+                free(log);
+            }
+            return -1;
+        }
+        printf("[DAEMON]    - decompress: 从源码编译 ⚠️\n");
+        g_state.kernel_decomp = clCreateKernel(g_state.prog_decomp,
+                                              "lzo1x_block_decompress", &err);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "创建解压缩kernel失败 (err=%d)\n", err);
+            return -1;
+        }
     }
 
-    printf("[DAEMON]    - decompress: 从源码编译 ⚠️\n");
-
-    g_state.kernel_decomp = clCreateKernel(g_state.prog_decomp,
-                                          "lzo1x_block_decompress", &err);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "创建解压缩kernel失败 (err=%d)\n", err);
-        return -1;
+    // 向量版本
+    FILE* fb_decomp_vec = fopen("lzo1x_decomp_vec.bin", "rb");
+    if (fb_decomp_vec) {
+        fseek(fb_decomp_vec, 0, SEEK_END);
+        long bsz = ftell(fb_decomp_vec);
+        fseek(fb_decomp_vec, 0, SEEK_SET);
+        unsigned char* bin = malloc(bsz);
+        if (fread(bin, 1, bsz, fb_decomp_vec) == (size_t)bsz) {
+            cl_int binary_status;
+            g_state.prog_decomp_vec = clCreateProgramWithBinary(g_state.context, 1,
+                                                               &g_state.device,
+                                                               (const size_t*)&bsz,
+                                                               (const unsigned char**)&bin,
+                                                               &binary_status, &err);
+            if (err == CL_SUCCESS && binary_status == CL_SUCCESS) {
+                err = clBuildProgram(g_state.prog_decomp_vec, 1, &g_state.device, "-cl-std=CL2.0", NULL, NULL);
+                if (err == CL_SUCCESS) {
+                    printf("[DAEMON]    - decomp_vec: 从预编译binary加载 ✅\n");
+                    /* kernel entry in vec program uses the same kernel name
+                     * (lzo1x_block_decompress) as the scalar program; don't suffix with _vec
+                     */
+                    g_state.kernel_decomp_vec = clCreateKernel(g_state.prog_decomp_vec,
+                                                              "lzo1x_block_decompress", &err);
+                    if (err != CL_SUCCESS) {
+                        fprintf(stderr, "创建decomp_vec kernel失败 (err=%d)\n", err);
+                        g_state.kernel_decomp_vec = NULL;
+                    }
+                }
+            }
+            if (g_state.prog_decomp_vec && !g_state.kernel_decomp_vec) clReleaseProgram(g_state.prog_decomp_vec);
+        }
+        free(bin);
+        fclose(fb_decomp_vec);
     }
-
-decomp_done:
+    // 回退到源码编译
+    if (!g_state.kernel_decomp_vec) {
+        size_t src_len_decomp_vec;
+        char* src_decomp_vec = read_file_content("lzo1x_decomp_vec.cl", &src_len_decomp_vec);
+        if (src_decomp_vec) {
+            g_state.prog_decomp_vec = clCreateProgramWithSource(g_state.context, 1,
+                                                               (const char**)&src_decomp_vec,
+                                                               &src_len_decomp_vec, &err);
+            free(src_decomp_vec);
+            if (err == CL_SUCCESS) {
+                err = clBuildProgram(g_state.prog_decomp_vec, 1, &g_state.device, "-cl-std=CL2.0 -I.", NULL, NULL);
+                if (err == CL_SUCCESS) {
+                    printf("[DAEMON]    - decomp_vec: 从源码编译 ⚠️\n");
+                    g_state.kernel_decomp_vec = clCreateKernel(g_state.prog_decomp_vec,
+                                                              "lzo1x_block_decompress", &err);
+                    if (err != CL_SUCCESS) {
+                        fprintf(stderr, "创建decomp_vec kernel失败 (err=%d)\n", err);
+                        g_state.kernel_decomp_vec = NULL;
+                    }
+                }
+            }
+        }
+    }
 
     clock_gettime(CLOCK_MONOTONIC, &t_end);
     g_state.init_time_ms = (t_end.tv_sec - t_start.tv_sec) * 1000 +
@@ -340,7 +393,7 @@ decomp_done:
     printf("[DAEMON] ✅ OpenCL资源初始化完成\n");
     printf("[DAEMON]    - 上下文: 常驻内存\n");
     printf("[DAEMON]    - 压缩kernels: lzo1x_1/1k/1l/1o\n");
-    printf("[DAEMON]    - 解压缩kernel: lzo1x_decomp\n");
+    printf("[DAEMON]    - 解压缩kernel: lzo1x_decomp + lzo1x_decomp_vec\n");
     printf("[DAEMON]    - 缓冲区: 动态分配 (每次请求)\n");
     printf("[DAEMON]    - 初始化耗时: %lu ms\n", g_state.init_time_ms);
 
@@ -461,16 +514,41 @@ int handle_decompress_request(request_t* req, response_t* resp)
     unsigned long time_us;
     size_t output_size;
 
+    int prefer_vec = (g_state.kernel_decomp_vec != NULL) ? 1 : 0;
+    cl_kernel kernel = prefer_vec ? g_state.kernel_decomp_vec : g_state.kernel_decomp;
+    const char* kernel_name = prefer_vec ? "lzo1x_decomp_vec" : "lzo1x_decomp";
+    printf("[DAEMON]    - 使用解压kernel: %s\n", kernel_name);
+
     int ret = daemon_decompress(
         g_state.context,
         g_state.queue,
         g_state.device,
-        g_state.kernel_decomp,
+        kernel,
+        prefer_vec,
         req->input_path,
         req->output_path,
         &time_us,
         &output_size
     );
+
+    /* 如果向量化kernel因为不可压缩或运行失败导致非0返回，回退到标量kernel并重试（容错） */
+    if (ret != 0 && g_state.kernel_decomp && kernel != g_state.kernel_decomp) {
+        printf("[DAEMON] vectorized decompressor not suitable or failed, falling back to scalar kernel\n");
+        kernel = g_state.kernel_decomp;
+        kernel_name = "lzo1x_decomp";
+        /* prefer_vec=0 表示标量重试 */
+        ret = daemon_decompress(
+            g_state.context,
+            g_state.queue,
+            g_state.device,
+            kernel,
+            0,
+            req->input_path,
+            req->output_path,
+            &time_us,
+            &output_size
+        );
+    }
 
     if (ret == 0) {
         resp->status = 0;
@@ -493,6 +571,12 @@ int handle_decompress_request(request_t* req, response_t* resp)
 void cleanup_opencl_resources(void)
 {
     printf("[DAEMON] 清理OpenCL资源...\n");
+
+    /* 清理buffer缓存 */
+    extern void cleanup_compress_buffer_cache(void);
+    extern void cleanup_decompress_buffer_cache(void);
+    cleanup_compress_buffer_cache();
+    cleanup_decompress_buffer_cache();
 
     if (g_state.d_input) clReleaseMemObject(g_state.d_input);
     if (g_state.d_output) clReleaseMemObject(g_state.d_output);

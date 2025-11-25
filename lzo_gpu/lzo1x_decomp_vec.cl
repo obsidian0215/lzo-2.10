@@ -191,20 +191,8 @@ static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos,
                 op += 8; len -= 8;
             }
         }
-        /* offset=5-7: 先拷贝一个周期，然后可以用向量 */
-        else if (offset <= 7 && len >= offset * 2) {
-            /* 先拷贝一个模式周期 */
-            for (uint i = 0; i < offset; i++)
-                op[i] = m_pos[i];
-            op += offset; len -= offset;
-
-            /* 现在可以从op-offset拷贝到op */
-            while (len >= 8 && offset >= 4) {
-                uchar8 v = vload8(0, op - offset);
-                vstore8(v, 0, op);
-                op += 8; len -= 8;
-            }
-        }
+        /* offset=5-7: 无法安全使用vload8 (需要读取8字节但只有offset字节有效)
+         * 直接fallthrough到标量拷贝 */
     }
 
     /* 尾部逐字节拷贝 */
