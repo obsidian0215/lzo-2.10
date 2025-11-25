@@ -20,6 +20,14 @@ typedef struct {
     char output_path[256];
     int level;
     size_t input_size;
+    /* options passed to daemon (populated from env vars) */
+    int standard_copy; /* 0/1 */
+    int mt_io;        /* 0/1 */
+    int mt_threads;   /* number of IO threads */
+    int fixed_block_kb; /* 0=no fixed size, else KB */
+    int force_map;    /* 0/1 */
+    int prefer_cpu;   /* 0=gpu, 1=cpu */
+    int decomp_vec;   /* 0=scalar decomp, 1=vector (default) */
 } request_t;
 
 typedef struct {
@@ -36,6 +44,20 @@ typedef struct {
     unsigned long cleanup_us;
     char message[128];
 } response_t;
+
+/* helper: read client-side environment flags into request */
+static void fill_request_env_flags(request_t* req) {
+    const char* s;
+    s = getenv("LZO_STANDARD_COPY"); req->standard_copy = (s && atoi(s) == 1) ? 1 : 0;
+    s = getenv("LZO_MT_IO"); req->mt_io = (s && atoi(s) == 1) ? 1 : 0;
+    s = getenv("LZO_MT_IO_THREADS"); req->mt_threads = s ? atoi(s) : 4;
+    if (req->mt_threads < 1) req->mt_threads = 1;
+    if (req->mt_threads > 32) req->mt_threads = 32;
+    s = getenv("LZO_FIXED_BLOCK_SIZE"); req->fixed_block_kb = s ? atoi(s) : 0; /* KB */
+    s = getenv("LZO_FORCE_MAP"); req->force_map = (s && atoi(s) == 1) ? 1 : 0;
+    s = getenv("LZO_OPENCL_DEVICE"); req->prefer_cpu = (s && strcmp(s, "CPU") == 0) ? 1 : 0;
+    s = getenv("LZO_DECOMP_VEC"); req->decomp_vec = (s && atoi(s) == 0) ? 0 : 1; /* default 1 */
+}
 
 /*
  * 检查守护进程是否运行
@@ -94,6 +116,9 @@ int decompress_with_daemon(const char* input, const char* output)
     strncpy(req.output_path, output, sizeof(req.output_path) - 1);
     req.level = 0;  // 解压缩不需要level
     req.input_size = st.st_size;
+
+    /* fill options from env */
+    fill_request_env_flags(&req);
 
     // 发送请求
     if (send(sock, &req, sizeof(req), 0) != sizeof(req)) {
@@ -179,6 +204,9 @@ int compress_with_daemon(const char* input, const char* output, int level)
     req.level = level;
     req.input_size = st.st_size;
 
+    /* fill options from env */
+    fill_request_env_flags(&req);
+
     // 发送请求
     if (send(sock, &req, sizeof(req), 0) != sizeof(req)) {
         perror("发送请求失败");
@@ -236,9 +264,13 @@ int main(int argc, char** argv)
 
     // 解析参数
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            input = NULL; output = NULL; // force help print below
+            break;
+        }
         if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) {
             operation = 'D';
-        } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--level") == 0) {
+        } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "-L") == 0 || strcmp(argv[i], "--level") == 0) {
             if (i + 1 < argc) {
                 i++;
                 // 支持 1/1k/1l/1o 格式
@@ -276,16 +308,28 @@ int main(int argc, char** argv)
     if (!input || !output) {
         fprintf(stderr, "用法: %s [选项] <input> <output>\n", argv[0]);
         fprintf(stderr, "选项:\n");
-        fprintf(stderr, "  -l, --level <1|1k|1l|1o>  压缩级别 (默认: 1)\n");
-        fprintf(stderr, "                            1  = lzo1x_1  (标准, D_BITS=14)\n");
-        fprintf(stderr, "                            1k = lzo1x_1k (紧凑, D_BITS=11)\n");
-        fprintf(stderr, "                            1l = lzo1x_1l (轻量, D_BITS=12)\n");
-        fprintf(stderr, "                            1o = lzo1x_1o (最优, D_BITS=15)\n");
+        fprintf(stderr, "  -L, -l, --level <1|1k|1l|1o>  压缩级别 (默认: 1l)\n");
         fprintf(stderr, "  -d, --decompress          解压缩模式\n");
-        fprintf(stderr, "\n示例:\n");
-        fprintf(stderr, "  %s input.txt output.lzo           # 使用level=1压缩\n", argv[0]);
+        fprintf(stderr, "  -h, --help                Show this help\n\n");
+
+        fprintf(stderr, "Examples:\n");
+        fprintf(stderr, "  %s input.txt output.lzo           # 使用level=1l压缩\n", argv[0]);
         fprintf(stderr, "  %s -l 1k input.txt output.lzo     # 使用lzo1x_1k压缩\n", argv[0]);
-        fprintf(stderr, "  %s -d input.lzo output.txt        # 解压缩\n", argv[0]);
+        fprintf(stderr, "  %s -d input.lzo output.txt        # 解压缩\n\n", argv[0]);
+
+        fprintf(stderr, "Client / per-request options (via environment variables):\n");
+        fprintf(stderr, "  LZO_STANDARD_COPY=0|1    Request daemon to use standard host->device copy (default: 0=zero-copy)\n");
+        fprintf(stderr, "  LZO_FORCE_MAP=0|1        Force the daemon to use mapped pinned buffers (overrides LZO_STANDARD_COPY)\n");
+        fprintf(stderr, "  LZO_MT_IO=0|1            Enable multi-threaded I/O for reads/uploads (default: 0)\n");
+        fprintf(stderr, "  LZO_MT_IO_THREADS=N      Number of I/O threads (1-32; default: 4)\n");
+        fprintf(stderr, "  LZO_FIXED_BLOCK_SIZE=N   Request fixed block size (KB) for daemon (0 = adaptive)\n");
+        fprintf(stderr, "  LZO_OPENCL_DEVICE=CPU|GPU Select device preference for daemon (daemon may ignore)\n");
+        fprintf(stderr, "  LZO_DECOMP_VEC=0|1       Prefer vectorized decompressor (daemon-side; default:1)\n\n");
+
+        fprintf(stderr, "Notes:\n");
+        fprintf(stderr, "  - The client reads these environment variables and sends them per-request to the daemon.\n");
+        fprintf(stderr, "  - The daemon may choose to accept or ignore certain preferences (device choice, etc.) depending on its configuration.\n\n");
+
         return 1;
     }
 

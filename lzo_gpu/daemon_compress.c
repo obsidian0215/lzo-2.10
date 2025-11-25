@@ -15,6 +15,10 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <errno.h>
 #include <math.h>
 
 #define CHECK(err) do { if ((err) != CL_SUCCESS) { \
@@ -37,6 +41,37 @@ static inline uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* Multi-threaded pread support (same pattern as lzo_host.c) */
+typedef struct {
+    int fd;
+    void *dest; /* base pointer */
+    off_t off;  /* offset into dest */
+    size_t len; /* length to read */
+    int err;    /* errno on failure, 0 on success */
+} mt_io_arg_t;
+
+static void* mt_pread_worker(void *v) {
+    mt_io_arg_t *a = (mt_io_arg_t*)v;
+    if (!a || a->len == 0) { if (a) a->err = 0; return NULL; }
+    if ((uint64_t)a->off + (uint64_t)a->len < (uint64_t)a->off) { /* overflow */
+        a->err = EINVAL; return NULL;
+    }
+    size_t left = a->len;
+    off_t pos = a->off;
+    char *p = (char*)a->dest + pos;
+    while (left > 0) {
+        ssize_t r;
+        do {
+            r = pread(a->fd, p, left, pos);
+        } while (r < 0 && errno == EINTR);
+        if (r < 0) { a->err = errno; return NULL; }
+        if (r == 0) { /* short read */ a->err = EIO; return NULL; }
+        left -= r; p += r; pos += r;
+    }
+    a->err = 0;
+    return NULL;
 }
 
 /* Phase 7.2: 熵计算 (从standalone同步) */
@@ -310,6 +345,8 @@ int daemon_compress(
     const char* input_path,
     const char* output_path,
     int level,                // 压缩级别 1-9
+    /* options */
+    int standard_copy, int mt_io, int mt_threads, int fixed_block_kb, int force_map,
     /* 输出统计 */
     unsigned long* time_us_out,  // 总时间(微秒)
     size_t* output_size_out,
@@ -352,50 +389,271 @@ int daemon_compress(
         return -1;
     }
 
-    // Map输入缓冲区用于写入
-    void* mapped_in = clEnqueueMapBuffer(queue, d_in, CL_TRUE, CL_MAP_WRITE, 0, in_sz,
-                                         0, NULL, NULL, &err);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "[DAEMON] Map输入缓冲区失败: %d\n", err);
-        fclose(f_in);
-        return -1;
+    /* Decide whether to use standard copy or zero-copy (mapping).
+     * client can request standard_copy; force_map overrides
+     */
+    int use_standard_copy = standard_copy && !force_map ? 1 : 0;
+
+    void* mapped_in = NULL;
+    if (!use_standard_copy) {
+        /* Map输入缓冲区用于写入 (zero-copy path) */
+        mapped_in = clEnqueueMapBuffer(queue, d_in, CL_TRUE, CL_MAP_WRITE, 0, in_sz,
+                                       0, NULL, NULL, &err);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "[DAEMON] Map输入缓冲区失败: %d\n", err);
+            fclose(f_in);
+            return -1;
+        }
     }
     uint64_t t_buf_in_end = now_ns();
     unsigned long buffer_in_us = (t_buf_in_end - t_buf_in_start) / 1000;
 
-    // 3. 直接读取文件到Pinned Memory (零拷贝上传)
-    uint64_t t_fread_start = now_ns();
-    if (fread(mapped_in, 1, in_sz, f_in) != in_sz) {
-        perror("fread input");
-        clEnqueueUnmapMemObject(queue, d_in, mapped_in, 0, NULL, NULL);
+    // 3. 读取文件并根据模式选择(零拷贝 -> mapped_in; 标准拷贝 -> host buffer + upload)
+    uint64_t t_read_start2 = now_ns();
+    unsigned long read_us = 0;
+    unsigned long upload_us = 0;
+    void* host_in = NULL;
+
+    if (!use_standard_copy) {
+        /* Zero-copy path: read directly into mapped_in. Support mt_io (pread workers) */
+        if (mt_io && mt_threads > 1) {
+            /* Use pread in multiple threads into mapped_in */
+            int fd = open(input_path, O_RDONLY);
+            if (fd < 0) {
+                perror("open input");
+                clEnqueueUnmapMemObject(queue, d_in, mapped_in, 0, NULL, NULL);
+                fclose(f_in);
+                return -1;
+            }
+
+            int nthreads = mt_threads;
+            if (nthreads < 1) nthreads = 1;
+            if (nthreads > 32) nthreads = 32;
+
+            mt_io_arg_t *args = malloc(sizeof(mt_io_arg_t) * nthreads);
+            pthread_t *tids = malloc(sizeof(pthread_t) * nthreads);
+            size_t piece = (in_sz + nthreads - 1) / nthreads;
+            for (int i = 0; i < nthreads; ++i) {
+                off_t off = (off_t)i * (off_t)piece;
+                size_t len = ((size_t)off + piece > in_sz) ? (in_sz - (size_t)off) : piece;
+                args[i].fd = fd;
+                args[i].dest = mapped_in;
+                args[i].off = off;
+                args[i].len = len;
+                args[i].err = 0;
+                int rc = pthread_create(&tids[i], NULL, mt_pread_worker, &args[i]);
+                if (rc != 0) {
+                    /* fallback to single-thread read */
+                    for (int j = 0; j < i; ++j) pthread_join(tids[j], NULL);
+                    free(args); free(tids);
+                    close(fd);
+                    /* fallback to fread */
+                    uint64_t tfr = now_ns();
+                    if (fread(mapped_in, 1, in_sz, f_in) != in_sz) {
+                        perror("fread input");
+                        clEnqueueUnmapMemObject(queue, d_in, mapped_in, 0, NULL, NULL);
+                        fclose(f_in);
+                        return -1;
+                    }
+                    uint64_t tfr_end = now_ns();
+                    read_us = (tfr_end - tfr) / 1000;
+                    close(fd);
+                    goto after_zero_read;
+                }
+            }
+            /* join */
+            for (int i = 0; i < nthreads; ++i) pthread_join(tids[i], NULL);
+            /* check errors */
+            for (int i = 0; i < nthreads; ++i) {
+                if (args[i].err != 0) {
+                    errno = args[i].err;
+                    perror("pread worker");
+                    free(args); free(tids);
+                    close(fd);
+                    clEnqueueUnmapMemObject(queue, d_in, mapped_in, 0, NULL, NULL);
+                    fclose(f_in);
+                    return -1;
+                }
+            }
+            uint64_t t_read_end2 = now_ns();
+            read_us = (t_read_end2 - t_read_start2) / 1000;
+            free(args); free(tids);
+            close(fd);
+
+        } else {
+            /* Single-threaded read into mapped_in */
+            uint64_t tfr = now_ns();
+            if (fread(mapped_in, 1, in_sz, f_in) != in_sz) {
+                perror("fread input");
+                clEnqueueUnmapMemObject(queue, d_in, mapped_in, 0, NULL, NULL);
+                fclose(f_in);
+                return -1;
+            }
+            uint64_t tfr_end = now_ns();
+            read_us = (tfr_end - tfr) / 1000;
+        }
+
+after_zero_read:
         fclose(f_in);
-        return -1;
+        /* Upload time is zero since we read directly into pinned mapped buffer */
+        upload_us = 0;
+
+    } else {
+        /* Standard-copy path: read into host buffer then upload via clEnqueueWriteBuffer */
+        /* allocate aligned host buffer */
+        void* host_in = NULL;
+        int rc_mem = posix_memalign(&host_in, ALIGN_BYTES, in_sz);
+        if (rc_mem != 0 || host_in == NULL) {
+            /* fallback to malloc */
+            host_in = malloc(in_sz);
+            if (!host_in) {
+                perror("malloc host_in");
+                fclose(f_in);
+                return -1;
+            }
+        }
+
+        if (mt_io && mt_threads > 1) {
+            int fd = open(input_path, O_RDONLY);
+            if (fd < 0) {
+                perror("open input");
+                free(host_in);
+                fclose(f_in);
+                return -1;
+            }
+            int nthreads = mt_threads;
+            if (nthreads < 1) nthreads = 1;
+            if (nthreads > 32) nthreads = 32;
+            mt_io_arg_t *args = malloc(sizeof(mt_io_arg_t) * nthreads);
+            pthread_t *tids = malloc(sizeof(pthread_t) * nthreads);
+            size_t piece = (in_sz + nthreads - 1) / nthreads;
+            for (int i = 0; i < nthreads; ++i) {
+                off_t off = (off_t)i * (off_t)piece;
+                size_t len = ((size_t)off + piece > in_sz) ? (in_sz - (size_t)off) : piece;
+                args[i].fd = fd;
+                args[i].dest = host_in;
+                args[i].off = off;
+                args[i].len = len;
+                args[i].err = 0;
+                int rc = pthread_create(&tids[i], NULL, mt_pread_worker, &args[i]);
+                if (rc != 0) {
+                    for (int j = 0; j < i; ++j) pthread_join(tids[j], NULL);
+                    free(args); free(tids);
+                    close(fd);
+                    /* fallback to fread into host buffer */
+                    uint64_t tfr = now_ns();
+                    if (fread(host_in, 1, in_sz, f_in) != in_sz) {
+                        perror("fread input");
+                        free(host_in);
+                        fclose(f_in);
+                        return -1;
+                    }
+                    uint64_t tfr_end = now_ns();
+                    read_us = (tfr_end - tfr) / 1000;
+                    close(fd);
+                    goto after_std_read;
+                }
+            }
+            for (int i = 0; i < nthreads; ++i) pthread_join(tids[i], NULL);
+            for (int i = 0; i < nthreads; ++i) {
+                if (args[i].err != 0) {
+                    errno = args[i].err; perror("pread worker");
+                    free(args); free(tids); close(fd);
+                    free(host_in); fclose(f_in);
+                    return -1;
+                }
+            }
+            uint64_t t_read_end2 = now_ns();
+            read_us = (t_read_end2 - t_read_start2) / 1000;
+            free(args); free(tids); close(fd);
+
+        } else {
+            uint64_t tfr = now_ns();
+            if (fread(host_in, 1, in_sz, f_in) != in_sz) {
+                perror("fread input");
+                free(host_in); fclose(f_in); return -1;
+            }
+            uint64_t tfr_end = now_ns();
+            read_us = (tfr_end - tfr) / 1000;
+        }
+
+after_std_read:
+        fclose(f_in);
+
+        /* NOTE: do NOT upload yet; we need data available for entropy/blocking calc.
+         * Upload will be performed after choose_blocking_adaptive so that the
+         * blocking decision uses the raw host data.
+         */
     }
-    fclose(f_in);
-
-    uint64_t t_read_end = now_ns();
-    unsigned long read_us = (t_read_end - t_fread_start) / 1000;  // 只计 fread 时间
-
-    // 此时数据已在GPU可访问的内存中 (Pinned)，且在Host端也可访问 (mapped_in)
-    // 我们使用 mapped_in 进行熵计算和分块选择，无需额外的 host buffer
 
     // 4. Phase 7.2: 自适应分块策略
     uint64_t t_blocking_start = now_ns();
     size_t blk, nblk;
-    choose_blocking_adaptive(in_sz, (const unsigned char*)mapped_in, device, debug, &blk, &nblk);
+    const unsigned char* entropy_ptr = NULL;
+    if (use_standard_copy) {
+        /* host_in exists in this branch (we kept it for later upload) */
+        entropy_ptr = (const unsigned char*)host_in;
+    } else {
+        entropy_ptr = (const unsigned char*)mapped_in;
+    }
+    choose_blocking_adaptive(in_sz, entropy_ptr, device, debug, &blk, &nblk);
     uint64_t t_blocking_end = now_ns();
     unsigned long blocking_us = (t_blocking_end - t_blocking_start) / 1000;
     if (debug) {
         fprintf(stderr, "[DEBUG] blk=%zu, nblk=%zu, in_sz=%zu\n", blk, nblk, in_sz);
     }
 
-    // Unmap 输入缓冲区 (数据已就绪，且熵计算完成)
-    // 注意: 虽然 Unmap 了，但 Pinned Memory 依然存在，GPU 可以访问 d_in
-    CHECK(clEnqueueUnmapMemObject(queue, d_in, mapped_in, 0, NULL, NULL));
+    /* honor request-level fixed_block_kb if provided (overrides env) */
+    if (fixed_block_kb > 0) {
+        size_t env_blk = (size_t)fixed_block_kb * 1024;
+        if (env_blk >= MIN_BLOCK_SIZE && env_blk <= MAX_BLOCK_SIZE) {
+            if (debug) fprintf(stderr, "[DAEMON] 强制固定块大小 (request): %zu KB\n", env_blk / 1024);
+            blk = env_blk;
+            nblk = (in_sz + blk - 1) / blk;
+        }
+    }
 
-    // 这里的 upload_us 实际上包含在 read_us 中了 (因为是直接读入)，或者我们可以认为 upload_us = 0
-    // 为了保持统计兼容性，我们将 read_us 视为 I/O + Upload
-    unsigned long upload_us = 0;
+    // If zero-copy (mapped_in set) we unmap now. If standard-copy, we still need
+    // to upload host_in -> d_in so perform upload here.
+    if (!use_standard_copy) {
+        CHECK(clEnqueueUnmapMemObject(queue, d_in, mapped_in, 0, NULL, NULL));
+        /* upload_us remains 0 for zero-copy */
+    } else {
+        /* perform upload of host_in -> d_in now (measuring time) */
+        uint64_t t_upload_start2 = now_ns();
+        if (mt_io && mt_threads > 1) {
+            int nthreads = mt_threads;
+            if (nthreads < 1) nthreads = 1;
+            if (nthreads > 32) nthreads = 32;
+            cl_event *evts = malloc(sizeof(cl_event) * nthreads);
+            size_t piece = (in_sz + nthreads - 1) / nthreads;
+            for (int i = 0; i < nthreads; ++i) {
+                size_t off = (size_t)i * piece;
+                size_t len = (off + piece > in_sz) ? (in_sz - off) : piece;
+                if (len == 0) { evts[i] = NULL; continue; }
+                err = clEnqueueWriteBuffer(queue, d_in, CL_FALSE, off, len, (char*)host_in + off, 0, NULL, &evts[i]);
+                if (err != CL_SUCCESS) {
+                    fprintf(stderr, "[DAEMON] clEnqueueWriteBuffer failed: %d\n", err);
+                    free(evts); free(host_in);
+                    return -1;
+                }
+            }
+            clWaitForEvents(nthreads, evts);
+            for (int i = 0; i < nthreads; ++i) if (evts[i]) clReleaseEvent(evts[i]);
+            free(evts);
+        } else {
+            err = clEnqueueWriteBuffer(queue, d_in, CL_TRUE, 0, in_sz, host_in, 0, NULL, NULL);
+            if (err != CL_SUCCESS) {
+                fprintf(stderr, "[DAEMON] clEnqueueWriteBuffer failed: %d\n", err);
+                free(host_in);
+                return -1;
+            }
+        }
+        uint64_t t_upload_end2 = now_ns();
+        upload_us = (t_upload_end2 - t_upload_start2) / 1000;
+        /* free host buffer */
+        free(host_in);
+    }
 
     size_t worst_blk = lzo_worst(blk);
     size_t out_cap = nblk * worst_blk;

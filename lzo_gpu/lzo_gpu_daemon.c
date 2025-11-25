@@ -75,6 +75,14 @@ typedef struct {
     char output_path[256];
     int level;           // 压缩级别 1-9
     size_t input_size;
+    /* options from client/env */
+    int standard_copy; /* 0/1 */
+    int mt_io;        /* 0/1 */
+    int mt_threads;   /* number of IO threads */
+    int fixed_block_kb; /* 0=no fixed size, else KB */
+    int force_map;    /* 0/1 */
+    int prefer_cpu;   /* 0=gpu, 1=cpu */
+    int decomp_vec;   /* 0=scalar decomp, 1=vector (default) */
 } request_t;
 
 typedef struct {
@@ -406,6 +414,8 @@ extern int daemon_compress(
     cl_kernel kernel,
     const char* input_path, const char* output_path,
     int level,
+    /* options (from client request) */
+    int standard_copy, int mt_io, int mt_threads, int fixed_block_kb, int force_map,
     unsigned long* time_us, size_t* output_size,
     unsigned long* read_us, unsigned long* buffer_us, unsigned long* upload_us,
     unsigned long* kernel_us, unsigned long* download_us, unsigned long* write_us,
@@ -470,6 +480,8 @@ int handle_compress_request(request_t* req, response_t* resp)
         req->input_path,
         req->output_path,
         req->level,
+        /* options */
+        req->standard_copy, req->mt_io, req->mt_threads, req->fixed_block_kb, req->force_map,
         &time_us,
         &output_size,
         &read_us, &buffer_us, &upload_us,
@@ -735,6 +747,25 @@ void print_stats(void)
  */
 int main(int argc, char** argv)
 {
+    /* simple command-line parsing: support -h/--help */
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            fprintf(stdout, "LZO GPU 守护进程 Usage:\n");
+            fprintf(stdout, "  %s [options]\n", argv[0]);
+            fprintf(stdout, "\nOptions:\n");
+            fprintf(stdout, "  -h, --help       Show this help and exit\n");
+            fprintf(stdout, "\nEnvironment variables (daemon & client / per-request options):\n");
+            fprintf(stdout, "  LZO_STANDARD_COPY=0|1    Use standard host->device copy (default: 0 for zero-copy)\n");
+            fprintf(stdout, "  LZO_MT_IO=0|1            Enable multi-threaded I/O (pread) for reads/uploads\n");
+            fprintf(stdout, "  LZO_MT_IO_THREADS=N      Threads for multi-threaded I/O (1-32, default: 4)\n");
+            fprintf(stdout, "  LZO_FIXED_BLOCK_SIZE=N   Fixed block size in KB (overrides adaptive choice)\n");
+            fprintf(stdout, "  LZO_FORCE_MAP=0|1        Force use of mapped pinned buffer even if standard_copy=1\n");
+            fprintf(stdout, "  LZO_OPENCL_DEVICE=CPU|GPU Select OpenCL device preference for daemon (env-level)\n");
+            fprintf(stdout, "  LZO_DECOMP_VEC=0|1       Prefer vectorized decompressor if available (default:1)\n");
+            fprintf(stdout, "  LZO_FORCE_NBLK=N         (advanced) Force target number of blocks for blocking alg.\n");
+            return 0;
+        }
+    }
     printf("========================================\n");
     printf("LZO GPU守护进程\n");
     printf("========================================\n\n");

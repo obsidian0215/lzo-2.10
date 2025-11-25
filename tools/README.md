@@ -454,7 +454,7 @@ chmod +x tools/*.py tools/*.sh
 
 ## 📚 参考文档
 
-- **LZO GPU实现**: `/root/lzo-2.10/lzo_gpu/README_COMPLETE.md`
+- **LZO GPU实现**: `lzo_gpu/PERFORMANCE_SUMMARY.md`  (合并后的实现与性能说明)
 - **Hybrid模式设计**: `/root/lzo-2.10/docs/HYBRID_DESIGN.md`
 - **LZ4 GPU分析**: `/root/lz4/LZ4_GPU_ANALYSIS.md`
 

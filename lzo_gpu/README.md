@@ -1,0 +1,208 @@
+# lzo_gpu — Usage & I/O modes
+
+This document explains the three ways to run the GPU-enabled LZO compressor and the I/O and tuning options related to zero-copy / standard-copy and multi-threaded I/O.
+
+## Binaries
+- `./lzo_gpu` — Standalone, single-command compressor that initializes OpenCL resources and runs compression locally.
+- `./lzo_gpu_daemon` — Long-running daemon that initializes OpenCL once and handles requests from clients.
+- `./lzo_gpu_client` — Client program that sends compression/decompression requests to a running daemon over a unix socket.
+
+## Quick command-line usage
+The README below documents per-binary CLI flags and which environment variables they honor.
+
+### ./lzo_gpu (standalone)
+- Basic usage: ./lzo_gpu [--debug|-v] [--verify|-c] [-L <level>] [-o <out.lzo>] <input_file>
+  - -L|--level <1|1k|1l|1o|1-9> : compression level / kernel variant (default: 1l for GPU-optimized)
+  - -o|--output <path>         : output archive path (default: input + .lzo)
+  - --verify|-c                : (compress) in-memory roundtrip verify
+  - -d|--decompress             : switch to decompress mode (see help output)
+  - -h|--help                   : show help (detailed usage and environment variables)
+
+### ./lzo_gpu_daemon (daemon)
+- Basic usage: ./lzo_gpu_daemon [--help]
+  - -h|--help : print daemon usage and environment variables / per-request options
+
+### ./lzo_gpu_client (client)
+- Basic usage: ./lzo_gpu_client [--help] [-d] [-l <1|1k|1l|1o|1-9>] <input_file> <output_file>
+  - -l|--level   : compression level (used for compression requests)
+  - -d|--decompress : run in decompress mode (client will ask daemon to decompress)
+  - -h|--help    : show help and the environment variables the client will include in each request
+
+
+## Primary modes & differences
+
+### Zero-copy (default)
+- Behavior: map a pinned device buffer (CL_MEM_ALLOC_HOST_PTR) and `fread` / `pread` directly into the mapped pointer. The device can read immediately — avoids explicit host→device transfers.
+- Best for: integrated GPUs (iGPU) where mapped host pages are directly accessible by the device.
+- Controlled by: `LZO_STANDARD_COPY=0` (default).
+
+### Standard-copy
+- Behavior: allocate a host buffer (aligned), read file into it, then explicitly upload via `clEnqueueWriteBuffer` into a device buffer.
+- Best for: discrete GPUs (dGPU) or drivers where explicit upload path behaves better.
+- Enabled by: `LZO_STANDARD_COPY=1`.
+
+### Multi-threaded I/O (pread + parallel uploads)
+- Behavior: split the input file into sub-ranges and use `pread` in worker threads to parallelize file reads (or parallel `clEnqueueWriteBuffer` uploads). Helpful when file read latency is bottleneck (fast NVMe, high read concurrency).
+- Controlled by:
+  - `LZO_MT_IO=1` — enable multi-threaded I/O
+  - `LZO_MT_IO_THREADS=N` — number of worker threads (1..32). Defaults to 4 when `LZO_MT_IO` is enabled.
+- Notes:
+  - Threads with zero-length subranges are skipped — no useless threads are spawned.
+  - If thread creation fails, code gracefully falls back to single-threaded `fread`.
+
+## Key environment variables (summary)
+Grouped and explained concisely.
+
+I/O mode
+- `LZO_STANDARD_COPY=0|1` — 0 = zero-copy (map & read), 1 = standard copy (read into host -> upload). Default: 0.
+- `LZO_FORCE_MAP=0|1` — force map/zero-copy regardless of `LZO_STANDARD_COPY`; daemon also accepts a per-request `force_map`.
+
+MT I/O
+- `LZO_MT_IO=0|1` — enable multi-threaded pread / parallel upload.
+- `LZO_MT_IO_THREADS=N` — 1..32 (default 4 when mt_io enabled).
+
+Block sizing and adaptive tuning
+- `LZO_FIXED_BLOCK_SIZE=N` — fix the per-block size in KB (overrides adaptive algorithm)
+- `LZO_FORCE_NBLK=N` — (advanced) force target number of blocks (affects the blocking algorithm)
+
+OpenCL & misc
+- `LZO_OPENCL_DEVICE=CPU|GPU` — device preference (may be ignored by daemon)
+- `LZO_DECOMP_VEC=0|1` — prefer vectorized decompressor (default 1) or force scalar
+- `LZO_DEBUG=1` — enable debug prints/timings
+
+### Full environment variable table (name / allowed values / default / supported)
+
+| Name | Values | Default | Supported by | Notes |
+|-----:|:-------|:--------|:-------------|:------|
+| LZO_STANDARD_COPY | 0 / 1 | 0 | standalone, client->daemon request | 0 = zero-copy (map & fread), 1 = standard (host->device upload). Daemon honors per-request option but may be configured to ignore. |
+| LZO_FORCE_MAP | 0 / 1 | 0 | standalone, client->daemon request | Forces zero-copy mapping even when LZO_STANDARD_COPY=1. Overrides LZO_STANDARD_COPY for safety tests.
+| LZO_MT_IO | 0 / 1 | 0 | standalone, client->daemon request | Enables multi-threaded pread + parallel uploads. Worker thread fallback to single-threaded fread on error. |
+| LZO_MT_IO_THREADS | integer (1-32) | 4 when LZO_MT_IO=1; otherwise N/A | standalone, client->daemon request | Number of I/O worker threads. Ignored unless LZO_MT_IO=1. |
+| LZO_FIXED_BLOCK_SIZE | positive integer (KB) | 0 (adaptive) | standalone, client->daemon request | When set (>0), forces block size in KB. Use 0 to enable adaptive behavior. |
+| LZO_FORCE_NBLK | integer | (none) | standalone, client->daemon request | Advanced tuning: force target number of blocks used for blocking algorithm. |
+| LZO_OPENCL_DEVICE | CPU / GPU | GPU | standalone, daemon | Device preference — daemon may ignore depending on its configuration and available devices. |
+| LZO_DECOMP_VEC | 0 / 1 | 1 | standalone, client->daemon request, daemon | Prefer vectorized decompressor (1) or scalar (0). Default is vectorized when available. |
+| LZO_DEBUG | 0 / 1 | 0 | standalone, daemon, client | Enable verbose debug output and timing traces. |
+
+### Environment defaults & dependency rules
+- Default device selection is GPU unless `LZO_OPENCL_DEVICE=CPU`.
+- `LZO_FORCE_MAP=1` always forces the zero-copy mapping path and overrides `LZO_STANDARD_COPY=1`.
+- `LZO_MT_IO_THREADS` is meaningful only when `LZO_MT_IO=1`; default 4 threads in that case (bounded to 1..32).
+- `LZO_FIXED_BLOCK_SIZE` overrides adaptive block sizing — use the KB value (e.g., 64 for 64KB).
+
+
+## Client -> Daemon behavior
+- `lzo_gpu_client` reads the above environment variables and sends them as per-request options to the daemon.
+- The daemon may accept or ignore specific request flags (device choice, etc.) depending on its configuration.
+
+## Example usage
+- Standalone zero-copy (default):
+
+  LZO_MT_IO=1 LZO_MT_IO_THREADS=8 ./lzo_gpu input.bin -o out.lzo
+
+- Standalone standard-copy + MT uploads:
+
+  LZO_STANDARD_COPY=1 LZO_MT_IO=1 LZO_MT_IO_THREADS=8 ./lzo_gpu input.bin -o out.lzo
+
+- Client -> daemon (request-level options):
+
+  export LZO_STANDARD_COPY=1
+  export LZO_MT_IO=1
+  export LZO_MT_IO_THREADS=8
+  ./lzo_gpu_client input.bin out.lzo
+
+## Safety & fallback behavior
+- If multi-threaded reads or thread-creation fail, the implementation falls back to single-threaded `fread` to ensure correctness.
+- All MT I/O worker threads check for EINTR and short-read conditions and report errors properly.
+
+## Notes for maintainers
+- The standalone and daemon implementations share the same design: use pinned host buffers when possible, allow zero-copy for iGPUs, allow standard-copy uploads for dGPUs, and optionally parallelize file I/O.
+- Check `lzo_host.c` and `daemon_compress.c` for the latest implementation details and test coverage.
+
+---
+If you'd like, I can add a short `tools/benchmark_mt_io.sh` script next that re-runs the `/tmp/sample_*` benchmarks across the four key modes and prints a concise comparison table.
+
+## More detailed examples & recommended settings
+
+These examples show concrete `env` + command-line combinations and what they are intended to exercise. Use them as a starting point for tuning in your environment.
+
+
+### 1) iGPU (integrated — zero-copy preferred)
+Best for Intel/AMD APUs or integrated NV hardware where host mapped pages are directly accessible by the device.
+
+```bash
+# Prefer the default zero-copy + multi-threaded file reads to minimize explicit upload cost
+export LZO_STANDARD_COPY=0
+export LZO_MT_IO=1
+export LZO_MT_IO_THREADS=4
+./lzo_gpu input.bin -o out.lzo
+```
+
+Why: zero-copy avoids DMA stage and multi-threaded pread reduces read latency on NVMe.
+
+
+### 2) Discrete GPU (dGPU) — standard-copy often safer
+Some drivers and PCIe stacks perform better with explicit host→device copies.
+
+```bash
+export LZO_STANDARD_COPY=1
+export LZO_MT_IO=1
+export LZO_MT_IO_THREADS=8
+./lzo_gpu input.bin -o out.lzo
+```
+
+Why: explicit copy + parallel uploads often yields more predictable throughput on PCIe dGPUs.
+
+
+### 3) Very small files (desktop / script friendly)
+For many small files, multi-threaded I/O is overhead; use default zero-copy without MT_IO.
+
+```bash
+unset LZO_MT_IO
+./lzo_gpu smallfile.bin -o smallfile.lzo
+```
+
+
+### 4) Client → daemon example (per-request control)
+Send per-request options from client using environment variables. The daemon receives these per-request and will apply them where it can.
+
+```bash
+export LZO_STANDARD_COPY=1
+export LZO_MT_IO=1
+export LZO_MT_IO_THREADS=8
+./lzo_gpu_client large.dat out.lzo
+```
+
+
+### 5) For testing block-size choices or reproducing behavior
+Force a fixed block size to reproduce or explore block-splitting impacts (KB):
+
+```bash
+export LZO_FIXED_BLOCK_SIZE=64   # 64KB blocks
+./lzo_gpu input.bin -o out.lzo
+```
+
+## Tuning advice / troubleshooting
+
+- Start with the following baseline to evaluate your system using a large file (>= 100MB):
+
+  - iGPU baseline: LZO_MT_IO=1 LZO_MT_IO_THREADS=4 (zero-copy default)
+  - dGPU baseline: LZO_STANDARD_COPY=1 LZO_MT_IO=1 LZO_MT_IO_THREADS=8
+
+- If you see low upload times but high kernel times, try changing the kernel variant (-L flag) — smaller block sizes (1k/1l) often improve throughput.
+- If disk read time dominates and you're on NVMe, increase LZO_MT_IO_THREADS (8–16) to reduce read bottleneck. Avoid excessive threads (>32) as it causes high context switching.
+- If you observe poor correctness or failed uploads on some drivers, try forcing `LZO_FORCE_MAP=1` to exercise the zero-copy mapping path instead of standard-copy.
+
+### Common diagnostics
+
+- Enable debug traces to inspect timings: `export LZO_DEBUG=1` — this prints time breakdowns for each stage.
+- Use `LZO_DECOMP_VEC=0` to force scalar decompression if vectorized decompression (decomp_vec) fails in your environment.
+- If daemon is not applying preferences, confirm `lzo_gpu_client` is sending options (check client help) and daemon's logs for accepted/ignored options.
+
+## Next steps / further optimizations (ideas)
+
+1. Add `tools/benchmark_mt_io.sh` to automatically run the four modes (zero, zero+mt, std, std+mt) across sample files and produce a comparison CSV.
+2. Add CI job to run the benchmark on representative hardware or a mocked I/O environment to prevent regressions.
+3. Add small runtime self-test (client mode) that verifies a round-trip for small files exercising each combination of flags.
+
+Would you like me to add the `tools/benchmark_mt_io.sh` script and a small validation harness next? I can implement the script and a README section describing how to run it.

@@ -12,6 +12,41 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <errno.h>
+
+/* Helper for multi-threaded pread into a destination buffer.
+ * Each thread handles a subrange (off,len) of the destination.
+ */
+typedef struct {
+    int fd;
+    void *dest; /* base pointer */
+    off_t off;  /* offset into dest */
+    size_t len; /* length to read */
+    int err;    /* errno on failure, 0 on success */
+} mt_io_arg_t;
+
+static void* mt_pread_worker(void *v) {
+    mt_io_arg_t *a = (mt_io_arg_t*)v;
+    /* validate args first */
+    if (!a || a->len == 0) { if (a) a->err = 0; return NULL; }
+    if ((uint64_t)a->off + (uint64_t)a->len < (uint64_t)a->off) { /* overflow */
+        a->err = EINVAL; return NULL;
+    }
+    size_t left = a->len;
+    off_t pos = a->off;
+    char *p = (char*)a->dest + pos;
+    while (left > 0) {
+        ssize_t r;
+        do {
+            r = pread(a->fd, p, left, pos);
+        } while (r < 0 && errno == EINTR);
+        if (r < 0) { a->err = errno; return NULL; }
+        if (r == 0) { /* short read */ a->err = EIO; return NULL; }
+        left -= r; p += r; pos += r;
+    }
+    a->err = 0;
+    return NULL;
+}
 
 /*
 * 压缩文件格式：
@@ -690,7 +725,7 @@ int main(int argc, char** argv)
         fprintf(stderr, "  %s [--debug|-v] [--verify|-c] [-L level] [-o out.lzo] input_file\n", argv[0]);
         fprintf(stderr, "     - compress input_file. If -o is omitted, writes to input_file.lzo\n");
         fprintf(stderr, "     - --verify/-c (compress mode): do in-memory roundtrip check (no arg).\n");
-        fprintf(stderr, "     - -L|--level LEVEL : compression level to select kernel variant (default: 1)\n");
+        fprintf(stderr, "     - -L|-l|--level LEVEL : compression level to select kernel variant (default: 1)\n");
         fprintf(stderr, "         supported LEVEL values:\n");
         fprintf(stderr, "            1   : original LZO1X-1 compressor (kernel: lzo1x_1)\n");
         fprintf(stderr, "            1k  : LZO1X-1K variant (kernel: lzo1x_1k) - optimized for kernel K behavior\n");
@@ -705,6 +740,27 @@ int main(int argc, char** argv)
         fprintf(stderr, "  Decompress and verify:      %s -d --verify input.dat out.lzo -o out.dec\n", argv[0]);
         fprintf(stderr, "  Stream decompressed to stdout: %s -d out.lzo -o - | sha256sum\n", argv[0]);
         fprintf(stderr, "  %s -h|--help                                 # show this help\n", argv[0]);
+        fprintf(stderr, "\nEnvironment variables (grouped — standalone / client->daemon / advanced):\n");
+        fprintf(stderr, "  I/O mode:\n");
+        fprintf(stderr, "    LZO_STANDARD_COPY=0|1    0=zero-copy (map into pinned buffer), 1=standard host->device copy (explicit upload).\n");
+        fprintf(stderr, "    LZO_FORCE_MAP=0|1        Force use of mapped pinned buffer even if standard-copy requested (overrides LZO_STANDARD_COPY).\n");
+        fprintf(stderr, "\n  Multi-threaded I/O (reduce file-read latency / parallel uploads):\n");
+        fprintf(stderr, "    LZO_MT_IO=0|1            Enable multi-threaded pread reads / parallel uploads (standalone + daemon).\n");
+        fprintf(stderr, "    LZO_MT_IO_THREADS=N      Threads for MT I/O (1-32; common values: 4/8; default: 4 standalone, 4 daemon).\n");
+        fprintf(stderr, "\n  Block sizing / adaptive behavior:\n");
+        fprintf(stderr, "    LZO_FIXED_BLOCK_SIZE=N   Fix block size in KB (overrides adaptive selection). Use 0 to restore adaptive behavior.\n");
+        fprintf(stderr, "    LZO_FORCE_NBLK=N         (advanced) Force target block count for blocking algorithm (comma-free tuning).\n");
+        fprintf(stderr, "\n  OpenCL & correctness flags:\n");
+        fprintf(stderr, "    LZO_OPENCL_DEVICE=CPU|GPU Prefer device selection for standalone/daemon. Daemons may ignore if configured otherwise.\n");
+        fprintf(stderr, "    LZO_DECOMP_VEC=0|1       Decompression: 1=prefer vectorized kernel (default), 0=force scalar decompressor.\n");
+        fprintf(stderr, "    LZO_DEBUG=1              Enable debug prints and timing traces.\n");
+        fprintf(stderr, "\n  Notes / dependency rules:\n");
+        fprintf(stderr, "    - Force/override rules: LZO_FORCE_MAP overrides LZO_STANDARD_COPY.\n");
+        fprintf(stderr, "    - MT I/O affects both file read and upload; enabling LZO_MT_IO without sufficient threads (LZO_MT_IO_THREADS) gives limited benefit.\n");
+        fprintf(stderr, "    - Client->daemon: client sends its environment options per-request; the daemon may accept or ignore some settings depending on its configuration.\n");
+        fprintf(stderr, "\n  Which binary honors which option:\n");
+        fprintf(stderr, "    - standalone (./lzo_gpu) supports all above flags and exposes low-level control (best for local testing).\n");
+        fprintf(stderr, "    - daemon (./lzo_gpu_daemon) accepts per-request options sent by clients (see lzo_gpu_client help). Some global daemon-config flags may still be ignored.\n");
         return 0;
     }
 
@@ -744,7 +800,7 @@ int main(int argc, char** argv)
             continue;
         }
         /* --strategy option removed: strategy dimension is no longer supported */
-        if (strcmp(arg, "-L") == 0 || strcmp(arg, "--level") == 0) {
+        if (strcmp(arg, "-L") == 0 || strcmp(arg, "-l") == 0 || strcmp(arg, "--level") == 0) {
             if (i + 1 >= argc) { fprintf(stderr, "missing argument for %s\n", arg); return 1; }
             comp_level = argv[++i];
             continue;
@@ -792,6 +848,27 @@ int main(int argc, char** argv)
         printf("  Decompress and verify:      %s -d --verify input.dat out.lzo -o out.dec\n", argv[0]);
         printf("  Stream decompressed to stdout: %s -d out.lzo -o - | sha256sum\n", argv[0]);
         printf("  %s -h|--help                                 # show this help\n", argv[0]);
+        printf("\nEnvironment variables (grouped — standalone / client->daemon / advanced):\n");
+        printf("  I/O mode:\n");
+        printf("    LZO_STANDARD_COPY=0|1    0=zero-copy (map into pinned buffer), 1=standard host->device copy (explicit upload).\n");
+        printf("    LZO_FORCE_MAP=0|1        Force use of mapped pinned buffer even if standard-copy requested (overrides LZO_STANDARD_COPY).\n");
+        printf("\n  Multi-threaded I/O (reduce file-read latency / parallel uploads):\n");
+        printf("    LZO_MT_IO=0|1            Enable multi-threaded pread reads / parallel uploads (standalone + daemon).\n");
+        printf("    LZO_MT_IO_THREADS=N      Threads for MT I/O (1-32; common values: 4/8; default: 4 standalone, 4 daemon).\n");
+        printf("\n  Block sizing / adaptive behavior:\n");
+        printf("    LZO_FIXED_BLOCK_SIZE=N   Fix block size in KB (overrides adaptive selection). Use 0 to restore adaptive behavior.\n");
+        printf("    LZO_FORCE_NBLK=N         (advanced) Force target block count for blocking algorithm (comma-free tuning).\n");
+        printf("\n  OpenCL & correctness flags:\n");
+        printf("    LZO_OPENCL_DEVICE=CPU|GPU Prefer device selection for standalone/daemon. Daemons may ignore if configured otherwise.\n");
+        printf("    LZO_DECOMP_VEC=0|1       Decompression: 1=prefer vectorized kernel (default), 0=force scalar decompressor.\n");
+        printf("    LZO_DEBUG=1              Enable debug prints and timing traces.\n");
+        printf("\n  Notes / dependency rules:\n");
+        printf("    - Force/override rules: LZO_FORCE_MAP overrides LZO_STANDARD_COPY.\n");
+        printf("    - MT I/O affects both file read and upload; enabling LZO_MT_IO without sufficient threads (LZO_MT_IO_THREADS) gives limited benefit.\n");
+        printf("    - Client->daemon: client sends its environment options per-request; the daemon may accept or ignore some settings depending on its configuration.\n");
+        printf("\n  Which binary honors which option:\n");
+        printf("    - standalone (./lzo_gpu) supports all above flags and exposes low-level control (best for local testing).\n");
+        printf("    - daemon (./lzo_gpu_daemon) accepts per-request options sent by clients (see lzo_gpu_client help). Some global daemon-config flags may still be ignored.\n");
         return 0;
     }
 
@@ -1255,6 +1332,24 @@ int main(int argc, char** argv)
     int standard_copy = 0;
     const char* std_s = getenv("LZO_STANDARD_COPY");
     if (std_s && atoi(std_s) == 1) standard_copy = 1;
+    /* Allow forcing map (zero-copy) regardless of standard_copy via LZO_FORCE_MAP=1 */
+    const char* force_map_env = getenv("LZO_FORCE_MAP");
+    if (force_map_env && atoi(force_map_env) == 1) {
+        if (standard_copy && debug) fprintf(stderr, "DBG: LZO_FORCE_MAP=1 overriding LZO_STANDARD_COPY -> forcing zero-copy\n");
+        standard_copy = 0;
+    }
+
+    /* multi-threaded I/O control */
+    int mt_io = 0;
+    int mt_threads = 0;
+    const char* mt_s = getenv("LZO_MT_IO");
+    if (mt_s && atoi(mt_s) == 1) {
+        mt_io = 1;
+        const char* mt_threads_s = getenv("LZO_MT_IO_THREADS");
+        mt_threads = mt_threads_s ? atoi(mt_threads_s) : 4;
+        if (mt_threads < 1) mt_threads = 1;
+        if (mt_threads > 32) mt_threads = 32;
+    }
 
     uint64_t t_io_read_start = now_ns();
     cl_mem d_in = NULL;
@@ -1271,12 +1366,52 @@ int main(int argc, char** argv)
         uint64_t t_file_read_start = now_ns();
         /* reuse outer host_in variable (do not shadow) */
         host_in = NULL;
-        if (posix_memalign((void**)&host_in, 4096, in_sz) != 0) {
+        /* Align host buffer for DMA/pinned-friendly boundaries */
+        if (posix_memalign((void**)&host_in, ALIGN_BYTES, in_sz) != 0) {
             host_in = malloc(in_sz);
             if (!host_in) { perror("malloc"); fclose(f_in); return 1; }
         }
-        if (fread(host_in, 1, in_sz, f_in) != in_sz) {
-            perror("fread"); free(host_in); fclose(f_in); return 1;
+        /* multi-threaded read into host_in (pread) if enabled */
+        if (mt_io && mt_threads > 1) {
+            int fd = fileno(f_in);
+            /* only spawn as many workers as needed (skip zero-length tasks) */
+            pthread_t *tids = calloc(mt_threads, sizeof(pthread_t));
+            mt_io_arg_t *args = calloc(mt_threads, sizeof(mt_io_arg_t));
+            size_t base = in_sz / mt_threads;
+            size_t rem = in_sz % mt_threads;
+            size_t cur = 0;
+            int failed = 0;
+            int created_count = 0;
+            for (int i = 0; i < mt_threads; ++i) {
+                size_t len = base + (i == mt_threads-1 ? rem : 0);
+                /* skip creating a thread with no work */
+                if (len == 0) { args[i].len = 0; args[i].err = 0; continue; }
+                args[i].fd = fd;
+                args[i].dest = host_in;
+                args[i].off = cur;
+                args[i].len = len;
+                args[i].err = 0;
+                    int rc = pthread_create(&tids[i], NULL, mt_pread_worker, &args[i]);
+                    if (rc != 0) {
+                        /* failed to create thread — mark error and break to fallback */
+                        args[i].err = rc;
+                        failed = 1; break;
+                    }
+                    created_count++;
+                cur += len;
+            }
+            for (int i = 0; i < mt_threads; ++i) {
+                if (args[i].len == 0) continue; /* no thread created for this slot */
+                pthread_join(tids[i], NULL);
+                if (args[i].err) failed = 1;
+            }
+            free(tids); free(args);
+            if (failed) {
+                if (fseek(f_in, 0, SEEK_SET) != 0) { perror("fseek"); free(host_in); fclose(f_in); return 1; }
+                if (fread(host_in, 1, in_sz, f_in) != in_sz) { perror("fread"); free(host_in); fclose(f_in); return 1; }
+            }
+        } else {
+            if (fread(host_in, 1, in_sz, f_in) != in_sz) { perror("fread"); free(host_in); fclose(f_in); return 1; }
         }
         fclose(f_in);
         uint64_t t_file_read_end = now_ns();
@@ -1296,11 +1431,51 @@ int main(int argc, char** argv)
                              0, NULL, NULL, &err);
         CHECK(err);
 
-        if (fread(mapped_in, 1, in_sz, f_in) != in_sz) {
-            perror("fread");
-            clEnqueueUnmapMemObject(q, d_in, mapped_in, 0, NULL, NULL);
-            fclose(f_in);
-            return 1;
+        /* Support multi-threaded pread into mapped device-accessible memory */
+        if (mt_io && mt_threads > 1) {
+            int fd = fileno(f_in);
+            pthread_t *tids = calloc(mt_threads, sizeof(pthread_t));
+            mt_io_arg_t *args = calloc(mt_threads, sizeof(mt_io_arg_t));
+            size_t base = in_sz / mt_threads;
+            size_t rem = in_sz % mt_threads;
+            size_t cur = 0;
+            int failed = 0;
+            int created_count2 = 0;
+            for (int i = 0; i < mt_threads; ++i) {
+                size_t len = base + (i == mt_threads-1 ? rem : 0);
+                /* skip zero-length chunks to avoid creating useless threads */
+                if (len == 0) { args[i].len = 0; args[i].err = 0; continue; }
+                args[i].fd = fd;
+                args[i].dest = mapped_in;
+                args[i].off = cur;
+                args[i].len = len;
+                args[i].err = 0;
+                int rc = pthread_create(&tids[i], NULL, mt_pread_worker, &args[i]);
+                if (rc != 0) {
+                    args[i].err = rc; /* mark failure for fallback */
+                    failed = 1;
+                    break;
+                }
+                created_count2++;
+                cur += len;
+            }
+            for (int i = 0; i < mt_threads; ++i) {
+                if (args[i].len == 0) continue;
+                pthread_join(tids[i], NULL);
+                if (args[i].err) failed = 1;
+            }
+            free(tids); free(args);
+            if (failed) {
+                if (fseek(f_in, 0, SEEK_SET) != 0) { perror("fseek"); clEnqueueUnmapMemObject(q, d_in, mapped_in, 0, NULL, NULL); fclose(f_in); return 1; }
+                if (fread(mapped_in, 1, in_sz, f_in) != in_sz) { perror("fread"); clEnqueueUnmapMemObject(q, d_in, mapped_in, 0, NULL, NULL); fclose(f_in); return 1; }
+            }
+        } else {
+            if (fread(mapped_in, 1, in_sz, f_in) != in_sz) {
+                perror("fread");
+                clEnqueueUnmapMemObject(q, d_in, mapped_in, 0, NULL, NULL);
+                fclose(f_in);
+                return 1;
+            }
         }
         fclose(f_in);  /* 文件读取完成，关闭 */
         uint64_t t_map_fread_end = now_ns();
@@ -1358,10 +1533,29 @@ int main(int argc, char** argv)
                                     in_sz, CL_MEM_READ_ONLY);
         t_buffer_alloc_end = now_ns();
 
-        t_upload_start = now_ns();
-        err = clEnqueueWriteBuffer(q, d_in, CL_TRUE, 0, in_sz, host_in, 0, NULL, NULL);
-        CHECK(err);
-        t_upload_end = now_ns();
+        if (mt_io && mt_threads > 1) {
+            /* parallel non-blocking writes + wait */
+            cl_event *events = calloc(mt_threads, sizeof(cl_event));
+            size_t base = in_sz / mt_threads;
+            size_t rem = in_sz % mt_threads;
+            size_t off = 0;
+            t_upload_start = now_ns();
+            for (int i = 0; i < mt_threads; ++i) {
+                size_t len = base + (i == mt_threads-1 ? rem : 0);
+                err = clEnqueueWriteBuffer(q, d_in, CL_FALSE, off, len, (char*)host_in + off, 0, NULL, &events[i]);
+                CHECK(err);
+                off += len;
+            }
+            CHECK(clWaitForEvents(mt_threads, events));
+            t_upload_end = now_ns();
+            for (int i = 0; i < mt_threads; ++i) clReleaseEvent(events[i]);
+            free(events);
+        } else {
+            t_upload_start = now_ns();
+            err = clEnqueueWriteBuffer(q, d_in, CL_TRUE, 0, in_sz, host_in, 0, NULL, NULL);
+            CHECK(err);
+            t_upload_end = now_ns();
+        }
 
         /* host_in no longer needed */
         free(host_in); host_in = NULL;
