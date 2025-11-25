@@ -1246,33 +1246,89 @@ int main(int argc, char** argv)
     }
     uint64_t t_kernel_load_end = now_ns();
 
-    /* Phase 8.3: File Read 包括 buffer 分配、映射和实际读取（对齐 Daemon 划分）*/
+    /* Phase 8.3: File Read — 支持两种复制模式 (zero-copy / standard-copy)
+     * 默认: zero-copy (map + fread -> device-accessible pinned memory)
+     * 若环境变量 LZO_STANDARD_COPY=1 则使用 standard copy:
+     *   fread -> host buffer (posix_memalign) ; clEnqueueWriteBuffer -> device
+     * 这可帮助在不同平台（iGPU vs dGPU）对比两种传输路径的性能。
+     */
+    int standard_copy = 0;
+    const char* std_s = getenv("LZO_STANDARD_COPY");
+    if (std_s && atoi(std_s) == 1) standard_copy = 1;
+
     uint64_t t_io_read_start = now_ns();
-    if (debug) fprintf(stderr, "DBG: getting cached d_in size=%zu (pinned)\n", in_sz);
-    cl_mem d_in = get_or_create_buffer(&buffer_cache.d_in, &buffer_cache.in_size,
-                                       in_sz, CL_MEM_READ_ONLY);
+    cl_mem d_in = NULL;
+    unsigned long upload_us = 0;
+    unsigned long buffer_in_us = 0;
+    uint64_t t_io_read_done = 0;
+    void* mapped_in = NULL;
+    unsigned char* host_in = NULL; /* used only in standard-copy */
+    const unsigned char* data_for_blocking = NULL;
 
-    /* Map 到 Pinned Memory */
-    void* mapped_in = clEnqueueMapBuffer(q, d_in, CL_TRUE, CL_MAP_WRITE, 0, in_sz,
-                                         0, NULL, NULL, &err);
-    CHECK(err);
-
-    /* 直接读取文件到 Pinned Memory（零拷贝）*/
-    if (fread(mapped_in, 1, in_sz, f_in) != in_sz) {
-        perror("fread");
-        clEnqueueUnmapMemObject(q, d_in, mapped_in, 0, NULL, NULL);
+    if (standard_copy) {
+        if (debug) fprintf(stderr, "DBG: using STANDARD copy path (LZO_STANDARD_COPY=1)\n");
+        /* read into host buffer first */
+        uint64_t t_file_read_start = now_ns();
+        /* reuse outer host_in variable (do not shadow) */
+        host_in = NULL;
+        if (posix_memalign((void**)&host_in, 4096, in_sz) != 0) {
+            host_in = malloc(in_sz);
+            if (!host_in) { perror("malloc"); fclose(f_in); return 1; }
+        }
+        if (fread(host_in, 1, in_sz, f_in) != in_sz) {
+            perror("fread"); free(host_in); fclose(f_in); return 1;
+        }
         fclose(f_in);
-        return 1;
+        uint64_t t_file_read_end = now_ns();
+        t_io_read_done = t_file_read_end;
+        /* keep host_in for blocking calc and upload later */
+        data_for_blocking = (const unsigned char*)host_in;
+    } else {
+        if (debug) fprintf(stderr, "DBG: using ZERO-COPY path (default)\n");
+        /* zero-copy: create pinned device buffer then map and fread into it */
+        if (debug) fprintf(stderr, "DBG: getting cached d_in size=%zu (pinned)\n", in_sz);
+        uint64_t t_buf_in_start = now_ns();
+        d_in = get_or_create_buffer(&buffer_cache.d_in, &buffer_cache.in_size,
+                                    in_sz, CL_MEM_READ_ONLY);
+        uint64_t t_buf_in_end = now_ns();
+        /* mapping counted as part of File Read in zero-copy path */
+        mapped_in = clEnqueueMapBuffer(q, d_in, CL_TRUE, CL_MAP_WRITE, 0, in_sz,
+                             0, NULL, NULL, &err);
+        CHECK(err);
+
+        if (fread(mapped_in, 1, in_sz, f_in) != in_sz) {
+            perror("fread");
+            clEnqueueUnmapMemObject(q, d_in, mapped_in, 0, NULL, NULL);
+            fclose(f_in);
+            return 1;
+        }
+        fclose(f_in);  /* 文件读取完成，关闭 */
+        uint64_t t_map_fread_end = now_ns();
+        /* in zero-copy, buffer alloc was effectively part of file read */
+        t_io_read_done = t_map_fread_end;
+        buffer_in_us = (t_buf_in_end - t_buf_in_start) / 1000; /* small */
+        data_for_blocking = (const unsigned char*)mapped_in;
+        upload_us = 0;
+
+        /* leave mapped_in accessible for later use (we will unmap after blocking calc) */
+        /* store mapped_in to a temporary symbol name used below */
+        /* make sure mapped_in is available in the following block; reuse variable name */
+        /* We'll keep mapped_in but no-op in other path */
+        /* map pointer is kept in the local scope below where used for blocking */
     }
-    fclose(f_in);  /* 文件读取完成，关闭 */
-    uint64_t t_io_read_done = now_ns();
 
     /* Phase 7.2: 使用自适应块大小 (基于数据熵)
      * 此时数据已在mapped_in中，可用于熵计算
      */
     uint64_t t_blocking_start = now_ns();
+    /* timestamps for allocation/upload phases — declared early so the
+     * standard-copy branch can write into them; defaults assigned below
+     * after blocking is recorded.
+     */
+    uint64_t t_buffer_alloc_start = 0, t_buffer_alloc_end = 0;
+    uint64_t t_upload_start = 0, t_upload_end = 0;
     size_t blk = 0, nblk = 0;
-    choose_blocking_adaptive((const unsigned char*)mapped_in, in_sz, dev, &blk, &nblk, debug);
+    choose_blocking_adaptive(data_for_blocking, in_sz, dev, &blk, &nblk, debug);
     size_t worst_blk = lzo_worst(blk);
     size_t out_cap = nblk * worst_blk;
 
@@ -1281,17 +1337,51 @@ int main(int argc, char** argv)
                 in_sz, blk, nblk, worst_blk, out_cap);
     }
 
-    /* Unmap输入缓冲区 (数据已就绪且熵计算完成) */
-    CHECK(clEnqueueUnmapMemObject(q, d_in, mapped_in, 0, NULL, NULL));
+    /* Blocking calc finished: record end now so we don't include subsequent
+     * buffer allocation or upload timings in the "Blocking Calc" measurement.
+     */
     uint64_t t_blocking_end = now_ns();
 
-    /* Data Upload = 0（零拷贝，数据已在 File Read 阶段读入 GPU 可访问内存）*/
-    uint64_t t_upload_start = t_blocking_end;
-    uint64_t t_upload_end = t_blocking_end;
+    /* Unmap输入缓冲区 (数据已就绪且熵计算完成) */
+    if (!standard_copy) {
+        CHECK(clEnqueueUnmapMemObject(q, d_in, mapped_in, 0, NULL, NULL));
+    }
+    else {
 
-    /* Buffer Alloc (in) = 0（已包含在 File Read 中）*/
-    uint64_t t_buffer_alloc_start = t_io_read_start;
-    uint64_t t_buffer_alloc_end = t_io_read_start;
+        /* Standard copy: now upload host_in into d_in (device buffer)
+         * Record allocations and upload using the outer timestamps so the
+         * final printed breakdown includes these times separately from
+         * the blocking calculation.
+         */
+        t_buffer_alloc_start = now_ns();
+        d_in = get_or_create_buffer(&buffer_cache.d_in, &buffer_cache.in_size,
+                                    in_sz, CL_MEM_READ_ONLY);
+        t_buffer_alloc_end = now_ns();
+
+        t_upload_start = now_ns();
+        err = clEnqueueWriteBuffer(q, d_in, CL_TRUE, 0, in_sz, host_in, 0, NULL, NULL);
+        CHECK(err);
+        t_upload_end = now_ns();
+
+        /* host_in no longer needed */
+        free(host_in); host_in = NULL;
+    }
+    /* NOTE: t_blocking_end already recorded above; any upload / buffer alloc
+     * timings are measured separately below and will not be attributed to
+     * the blocking calculation.
+     */
+
+    /* Data Upload / Buffer alloc timestamps: default to zero-size intervals
+     * for zero-copy path (overwrite if standard-copy branch set them).
+     */
+    if (t_upload_start == 0) t_upload_start = t_blocking_end;
+    if (t_upload_end == 0) t_upload_end = t_blocking_end;
+
+    /* Buffer Alloc (in) default to zero (already included in File Read for
+     * zero-copy), will be overwritten by standard-copy branch above.
+     */
+    if (t_buffer_alloc_start == 0) t_buffer_alloc_start = t_io_read_start;
+    if (t_buffer_alloc_end == 0) t_buffer_alloc_end = t_io_read_start;
 
     /* 创建输出缓冲区 (Pinned Memory) */
     uint64_t t_out_buffer_start = now_ns();

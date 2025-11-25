@@ -955,6 +955,86 @@ clEnqueueUnmapMemObject(q, d_in, mapped_in, ...);
 - fread 直接写入 Pinned Memory，利用文件系统 Page Cache
 - 测量时间接近计时器精度极限 (~0.01ms)
 
+## 独立运行（standalone）新增：standard-copy 支持与测量对比
+
+为便于对比平台差异（集成显卡 vs 独立显卡/PCIe）与两种 I/O 路径的开销，我们在 standalone 前端新增了显式主机->设备拷贝的“standard-copy”模式（通过环境变量 `LZO_STANDARD_COPY=1` 打开）。实现要点与发现：
+
+
+### 变更内容
+
+ - standalone (`lzo_gpu/lzo_host.c`) 新增 `LZO_STANDARD_COPY` 模式（env: `LZO_STANDARD_COPY=1`）——读入对齐的 host buffer（posix_memalign），通过 `clEnqueueWriteBuffer` 上传到 device。
+ - 修复导致 standard-copy 失败的 bug（局部变量遮蔽 `host_in`），并把“Blocking Calc”（自适应分块/熵计算）和后续的 buffer 分配 / 上传计时分离，避免统计值相互污染。
+
+### 代表性对比（样本：300MB 输入，kernel=lzo1x_1l）
+
+ - Zero-copy (默认)：
+   - 总耗时 ≈ 311 ms
+   - Blocking ≈ 0.04 ms, Data upload ≈ 0 ms （直接读入映射内存）
+
+ - Standard-copy (`LZO_STANDARD_COPY=1`)：
+   - 总耗时 ≈ 351 ms
+   - Blocking ≈ 0.05 ms
+   - Buffer Alloc (in) ≈ 36.28 ms, Data Upload ≈ 30.55 ms
+
+说明：在该平台上 standard-copy 增加了整体延迟（≈ 10% 以上），主要来自显式的内存分配与主机→设备拷贝（CL transfer）。在 iGPU/共享内存场景 zero-copy 更有优势；在 dGPU/PCIe 场景可考虑异步流水线或合并小批次上传以改善标准拷贝的效率。
+
+### 守护进程 (daemon) 处理
+
+ - Daemon 已使用预分配（缓存）的大缓冲区 `d_in`, `d_out`, `d_len`，并在多次请求间复用这些缓冲区（参见 `daemon_compress.c` 的 buffer cache）。因此 daemon 已能避免在每次请求中做昂贵的分配和上传；给 daemon 增加 standard-copy 路径收益有限，当前决定先保留 daemon 的预分配/zero-copy 策略。
+
+#### 示例：daemon 的缓冲区预分配代码（摘录）
+
+下面是守护进程内用于缓冲区预分配 / 缓存的关键实现片段，便于理解它为什么能避免每次请求都做昂贵的分配：
+
+```c
+/* 全局 buffer cache */
+static struct {
+  cl_mem d_in;
+  cl_mem d_out;
+  cl_mem d_len;
+  size_t in_size;
+  size_t out_size;
+  size_t len_size;
+} buffer_cache = {0};
+
+/* 如果现有缓冲区不足则新建并使用 CL_MEM_ALLOC_HOST_PTR（Pinned） */
+static cl_mem get_or_create_buffer(cl_context ctx, cl_mem* cached_buf, size_t* cached_size,
+                  size_t required_size, cl_mem_flags flags, cl_int* err_out) {
+  if (*cached_size < required_size) {
+    if (*cached_buf) {
+      clReleaseMemObject(*cached_buf);
+      *cached_buf = NULL;
+      *cached_size = 0;
+    }
+    *cached_buf = clCreateBuffer(ctx, flags | CL_MEM_ALLOC_HOST_PTR,
+                   required_size, NULL, err_out);
+    if (*err_out == CL_SUCCESS) *cached_size = required_size;
+  } else {
+    *err_out = CL_SUCCESS;
+  }
+  return *cached_buf;
+}
+
+/* 守护进程压缩入口使用示例：提前请求或复用 d_in/d_out/d_len */
+cl_mem d_in = get_or_create_buffer(ctx, &buffer_cache.d_in, &buffer_cache.in_size,
+                   in_sz, CL_MEM_READ_ONLY, &err);
+/* map -> fread directly into mapped d_in (zero-copy) */
+void* mapped_in = clEnqueueMapBuffer(queue, d_in, CL_TRUE, CL_MAP_WRITE, 0, in_sz, 0, NULL, NULL, &err);
+
+/* 当守护进程结束或需要释放资源时清理缓存 */
+void cleanup_compress_buffer_cache(void) {
+  if (buffer_cache.d_in) clReleaseMemObject(buffer_cache.d_in);
+  if (buffer_cache.d_out) clReleaseMemObject(buffer_cache.d_out);
+  if (buffer_cache.d_len) clReleaseMemObject(buffer_cache.d_len);
+  buffer_cache.d_in = buffer_cache.d_out = buffer_cache.d_len = NULL;
+  buffer_cache.in_size = buffer_cache.out_size = buffer_cache.len_size = 0;
+}
+```
+
+这段代码展示了：守护进程通过持久化的 `buffer_cache` 在首次需要时创建带 CL_MEM_ALLOC_HOST_PTR 的 pinned buffer，并在随后的请求中重用这些缓冲区，从而显著降低重复分配与 host<->device 传输开销。
+
+---
+
 ### Phase 8 完整对比
 
 **Standalone 优化前 vs 优化后** (300MB 真实文本):
