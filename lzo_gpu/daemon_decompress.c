@@ -5,6 +5,8 @@
  */
 
 #include <CL/cl.h>
+#include "timing.h"
+#include "lzo_defaults.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,9 +46,10 @@ static cl_mem get_or_create_buffer(cl_context ctx, cl_mem* cached_buf, size_t* c
             *cached_buf = NULL;
             *cached_size = 0;
         }
-        /* Phase 6.1: 使用Pinned Memory */
-        *cached_buf = clCreateBuffer(ctx, flags | CL_MEM_ALLOC_HOST_PTR,
-                                     required_size, NULL, err_out);
+           /* Always use pinned host mapping for buffers to restore HEAD behaviour */
+           cl_mem_flags create_flags = flags | CL_MEM_ALLOC_HOST_PTR;
+        *cached_buf = clCreateBuffer(ctx, create_flags,
+                 required_size, NULL, err_out);
         if (*err_out == CL_SUCCESS) {
             *cached_size = required_size;
         }
@@ -105,7 +108,9 @@ int daemon_decompress(
     const char* output_path,
     /* 输出统计 */
     unsigned long* time_us_out,
-    size_t* output_size_out
+    size_t* output_size_out,
+    /* optional detailed timings (microseconds) in a compact struct */
+    timing_t* t_out
 ) {
     cl_int err;
     uint64_t t_start = now_ns();
@@ -385,21 +390,47 @@ int daemon_decompress(
     fprintf(stderr, "TOTAL                : %8.3f ms\n", *time_us_out / 1000.0);
     fprintf(stderr, "\n");
 
-    /* 计算占比（与standalone格式一致）*/
-    fprintf(stderr, "=== Percentage Breakdown ===\n");
-    fprintf(stderr, "Kernel Exec     : %6.2f%%\n", 100.0 * exec_host_us / *time_us_out);
-    fprintf(stderr, "Data Transfer   : %6.2f%% (upload=%.2f%% + download=%.2f%%)\n",
-           100.0 * (upload_us + download_us) / *time_us_out,
-           100.0 * upload_us / *time_us_out,
-           100.0 * download_us / *time_us_out);
-    fprintf(stderr, "File I/O        : %6.2f%% (write=%.2f%%)\n",
-           100.0 * write_us / *time_us_out,
-           100.0 * write_us / *time_us_out);
-    fprintf(stderr, "Buffer Alloc    : %6.2f%%\n",
-           100.0 * buf_us / *time_us_out);
-    fprintf(stderr, "Setup Args      : %6.2f%%\n",
-           100.0 * setup_us / *time_us_out);
+        /* 计算占比（与standalone格式一致），保护除以零 */
+        double denom = (*time_us_out > 0) ? (double)*time_us_out : 1.0;
+        int zero_total = (*time_us_out == 0);
+        fprintf(stderr, "=== Percentage Breakdown ===\n");
+        fprintf(stderr, "Kernel Exec     : %6.2f%%\n", zero_total ? 0.0 : 100.0 * exec_host_us / denom);
+        fprintf(stderr, "Data Transfer   : %6.2f%% (upload=%.2f%% + download=%.2f%%)\n",
+            zero_total ? 0.0 : 100.0 * (upload_us + download_us) / denom,
+            zero_total ? 0.0 : 100.0 * upload_us / denom,
+            zero_total ? 0.0 : 100.0 * download_us / denom);
+        fprintf(stderr, "File I/O        : %6.2f%% (write=%.2f%%)\n",
+            zero_total ? 0.0 : 100.0 * write_us / denom,
+            zero_total ? 0.0 : 100.0 * write_us / denom);
+        fprintf(stderr, "Buffer Alloc    : %6.2f%%\n",
+            zero_total ? 0.0 : 100.0 * buf_us / denom);
+        fprintf(stderr, "Setup Args      : %6.2f%%\n",
+            zero_total ? 0.0 : 100.0 * setup_us / denom);
     fprintf(stderr, "\n");
+
+    /* Prefer event-based execution time if available, otherwise use host wall-clock kernel time */
+    unsigned long kernel_us = exec_us_ev ? exec_us_ev : exec_host_us;
+
+    /* map computed timing pieces into the compact timing_t (if requested) */
+    if (t_out) {
+        t_out->file_read_us = (t_buf_start - t_start) / 1000; /* time spent before buffer alloc */
+        t_out->ocl_init_us = 0; /* daemon typically has OCL init at startup */
+        t_out->kernel_load_us = 0; /* kernel load usually cached at daemon startup */
+        t_out->buffer_alloc_in_us = buf_us;
+        t_out->data_upload_us = upload_us;
+        t_out->setup_args_us = setup_us;
+        t_out->kernel_exec_us = kernel_us;
+        t_out->download_total_us = download_us;
+        t_out->file_write_us = write_us;
+        /* fields not applicable for decompression - set to 0 to maintain deterministic layout */
+        t_out->blocking_calc_us = 0;
+        t_out->buffer_alloc_out_us = 0;
+        t_out->buffer_alloc_len_us = 0;
+        t_out->kernel_setup_us = 0;
+        t_out->download_len_us = 0;
+        t_out->download_bulk_us = 0;
+        t_out->cleanup_us = 0;
+    }
 
     return 0;
 }

@@ -602,8 +602,15 @@ int compress_data(const char* in_path, const char* out_path, int compression_lev
     size_t worst_blk = lzo_worst(blk);
     size_t out_cap = nblk * worst_blk;      /* 保证总容量充足 */
 
-    cl_mem c_in = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-        in_sz, in_buf, &err); CHECK(err);
+    cl_mem c_in;
+    c_in = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        in_sz, in_buf, &err);
+    if (err == CL_INVALID_HOST_PTR) {
+        c_in = clCreateBuffer(ctx, CL_MEM_READ_ONLY, in_sz, NULL, &err); CHECK(err);
+        CHECK(clEnqueueWriteBuffer(q, c_in, CL_TRUE, 0, in_sz, in_buf, 0, NULL, NULL));
+    } else {
+        CHECK(err);
+    }
     cl_mem c_out = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, out_cap, NULL, &err); CHECK(err);
     cl_mem c_len = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,
         nblk * sizeof(cl_uint), NULL, &err); CHECK(err);
@@ -759,10 +766,24 @@ int decompress_data(const char* in_path, const char* out_path, int is_stdin, int
 
     /* 3. 创建OpenCL缓冲区+设置kernel参数 */
     uint64_t tC0 = now_ns();
-    cl_mem d_in = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-        comp_sz, (void*)p, &err); CHECK(err);
-    cl_mem d_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-        (nblk + 1) * 4, block_offset, &err); CHECK(err);
+    cl_mem d_in;
+    d_in = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        comp_sz, (void*)p, &err);
+    if (err == CL_INVALID_HOST_PTR) {
+        d_in = clCreateBuffer(ctx, CL_MEM_READ_ONLY, comp_sz, NULL, &err); CHECK(err);
+        CHECK(clEnqueueWriteBuffer(q, d_in, CL_TRUE, 0, comp_sz, (void*)p, 0, NULL, NULL));
+    } else {
+        CHECK(err);
+    }
+    cl_mem d_off;
+    d_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        (nblk + 1) * 4, block_offset, &err);
+    if (err == CL_INVALID_HOST_PTR) {
+        d_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY, (nblk + 1) * 4, NULL, &err); CHECK(err);
+        CHECK(clEnqueueWriteBuffer(q, d_off, CL_TRUE, 0, (nblk + 1) * 4, block_offset, 0, NULL, NULL));
+    } else {
+        CHECK(err);
+    }
     cl_mem d_out = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,
         orig_sz, NULL, &err); CHECK(err);
     cl_mem d_olen = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,

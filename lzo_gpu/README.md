@@ -55,7 +55,6 @@ Grouped and explained concisely.
 
 I/O mode
 - `LZO_STANDARD_COPY=0|1` — 0 = zero-copy (map & read), 1 = standard copy (read into host -> upload). Default: 0.
-- `LZO_FORCE_MAP=0|1` — force map/zero-copy regardless of `LZO_STANDARD_COPY`; daemon also accepts a per-request `force_map`.
 
 MT I/O
 - `LZO_MT_IO=0|1` — enable multi-threaded pread / parallel upload.
@@ -63,7 +62,6 @@ MT I/O
 
 Block sizing and adaptive tuning
 - `LZO_FIXED_BLOCK_SIZE=N` — fix the per-block size in KB (overrides adaptive algorithm)
-- `LZO_FORCE_NBLK=N` — (advanced) force target number of blocks (affects the blocking algorithm)
 
 OpenCL & misc
 - `LZO_OPENCL_DEVICE=CPU|GPU` — device preference (may be ignored by daemon)
@@ -75,18 +73,22 @@ OpenCL & misc
 | Name | Values | Default | Supported by | Notes |
 |-----:|:-------|:--------|:-------------|:------|
 | LZO_STANDARD_COPY | 0 / 1 | 0 | standalone, client->daemon request | 0 = zero-copy (map & fread), 1 = standard (host->device upload). Daemon honors per-request option but may be configured to ignore. |
-| LZO_FORCE_MAP | 0 / 1 | 0 | standalone, client->daemon request | Forces zero-copy mapping even when LZO_STANDARD_COPY=1. Overrides LZO_STANDARD_COPY for safety tests.
 | LZO_MT_IO | 0 / 1 | 0 | standalone, client->daemon request | Enables multi-threaded pread + parallel uploads. Worker thread fallback to single-threaded fread on error. |
 | LZO_MT_IO_THREADS | integer (1-32) | 4 when LZO_MT_IO=1; otherwise N/A | standalone, client->daemon request | Number of I/O worker threads. Ignored unless LZO_MT_IO=1. |
 | LZO_FIXED_BLOCK_SIZE | positive integer (KB) | 0 (adaptive) | standalone, client->daemon request | When set (>0), forces block size in KB. Use 0 to enable adaptive behavior. |
-| LZO_FORCE_NBLK | integer | (none) | standalone, client->daemon request | Advanced tuning: force target number of blocks used for blocking algorithm. |
 | LZO_OPENCL_DEVICE | CPU / GPU | GPU | standalone, daemon | Device preference — daemon may ignore depending on its configuration and available devices. |
 | LZO_DECOMP_VEC | 0 / 1 | 1 | standalone, client->daemon request, daemon | Prefer vectorized decompressor (1) or scalar (0). Default is vectorized when available. |
 | LZO_DEBUG | 0 / 1 | 0 | standalone, daemon, client | Enable verbose debug output and timing traces. |
 
+### Asynchronous uploads (LZO_ASYNC_UPLOAD)
+
+For implementation details, measurement results, tuning advice and reproduction steps see `PERFORMANCE_SUMMARY.md` (search for “异步流水线 / async uploads”).
+
+
+
+
 ### Environment defaults & dependency rules
 - Default device selection is GPU unless `LZO_OPENCL_DEVICE=CPU`.
-- `LZO_FORCE_MAP=1` always forces the zero-copy mapping path and overrides `LZO_STANDARD_COPY=1`.
 - `LZO_MT_IO_THREADS` is meaningful only when `LZO_MT_IO=1`; default 4 threads in that case (bounded to 1..32).
 - `LZO_FIXED_BLOCK_SIZE` overrides adaptive block sizing — use the KB value (e.g., 64 for 64KB).
 
@@ -120,7 +122,7 @@ OpenCL & misc
 - Check `lzo_host.c` and `daemon_compress.c` for the latest implementation details and test coverage.
 
 ---
-If you'd like, I can add a short `tools/benchmark_mt_io.sh` script next that re-runs the `/tmp/sample_*` benchmarks across the four key modes and prints a concise comparison table.
+The repository includes a consolidated Python runner `tools/bench.py` which re-runs the `/tmp/sample_*` benchmarks across the standard modes and prints a concise comparison table. Run it from the project root:
 
 ## More detailed examples & recommended settings
 
@@ -191,7 +193,6 @@ export LZO_FIXED_BLOCK_SIZE=64   # 64KB blocks
 
 - If you see low upload times but high kernel times, try changing the kernel variant (-L flag) — smaller block sizes (1k/1l) often improve throughput.
 - If disk read time dominates and you're on NVMe, increase LZO_MT_IO_THREADS (8–16) to reduce read bottleneck. Avoid excessive threads (>32) as it causes high context switching.
-- If you observe poor correctness or failed uploads on some drivers, try forcing `LZO_FORCE_MAP=1` to exercise the zero-copy mapping path instead of standard-copy.
 
 ### Common diagnostics
 
@@ -201,8 +202,26 @@ export LZO_FIXED_BLOCK_SIZE=64   # 64KB blocks
 
 ## Next steps / further optimizations (ideas)
 
-1. Add `tools/benchmark_mt_io.sh` to automatically run the four modes (zero, zero+mt, std, std+mt) across sample files and produce a comparison CSV.
+1. The `python3 tools/bench.py run` command automatically runs the common modes (zero, zero+mt, std, std+mt) across sample files and produces a comparison CSV (`lzo_gpu/benchmark_mt_io_results.csv`).
 2. Add CI job to run the benchmark on representative hardware or a mocked I/O environment to prevent regressions.
 3. Add small runtime self-test (client mode) that verifies a round-trip for small files exercising each combination of flags.
 
-Would you like me to add the `tools/benchmark_mt_io.sh` script and a small validation harness next? I can implement the script and a README section describing how to run it.
+The `tools/bench.py` runner and `tools/analysis.py` post-processing utilities are available — see `python3 tools/bench.py run --help` and `python3 tools/analysis.py --help` for usage and examples.
+
+## Test data generator (for benchmarks)
+
+The repository includes a small helper script to generate test data used by benchmarks and experiments:
+
+  python3 ../tools/generate-test-data.py SIZE [--pattern zero|random|repeat|structured|mixed] [--output PATH]
+
+  Or from repo root:
+
+  python3 tools/generate-test-data.py SIZE [--pattern zero|random|repeat|structured|mixed] [--output PATH]
+
+Defaults and useful options:
+- `--pattern-size N` — controls the repeating pattern size (default 1 for repeat pattern)
+- `--density` — portion of file which is structured/repeat (defaults depend on pattern)
+- `--symbols` — number of unique symbols used for `repeat` patterns (default 1)
+- `--noise` — relative noise injected into `repeat` patterns (default 0.0001)
+
+This tool uses streaming writers to avoid excessive memory use and prints a sample-based Shannon entropy for the resulting file.

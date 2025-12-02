@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <errno.h>
+#include "lzo_defaults.h"
 
 /* Helper for multi-threaded pread into a destination buffer.
  * Each thread handles a subrange (off,len) of the destination.
@@ -25,13 +26,46 @@ typedef struct {
     int err;    /* errno on failure, 0 on success */
 } mt_io_arg_t;
 
+/* forward declaration of now_ns used below by the reaper */
+static inline uint64_t now_ns(void);
+
+/* Async upload context: holds the write events, host pointer and a
+ * timestamp pointer. The reaper thread waits for the write events to
+ * complete and frees the host pointer; the main thread remains
+ * responsible for releasing events and freeing the ctx after joining
+ * the reaper (avoids races on ctx memory). */
+typedef struct async_upload_ctx {
+    cl_event *events;
+    int n;
+    void *host_ptr; /* pointer to host buffer that must be freed after upload */
+    uint64_t *t_upload_end_ptr; /* write completion timestamp (ns) */
+} async_upload_ctx_t;
+
+static void *async_upload_reaper(void *v)
+{
+    async_upload_ctx_t *ctx = (async_upload_ctx_t*)v;
+    if (!ctx) return NULL;
+    /* wait for uploads to finish */
+    if (ctx->n > 0 && ctx->events) {
+        clWaitForEvents(ctx->n, ctx->events);
+    }
+    if (ctx->t_upload_end_ptr) *ctx->t_upload_end_ptr = now_ns();
+
+    /* free host buffer now that upload completed */
+    if (ctx->host_ptr) {
+        free(ctx->host_ptr);
+        ctx->host_ptr = NULL;
+    }
+
+    return NULL;
+}
+
 static void* mt_pread_worker(void *v) {
     mt_io_arg_t *a = (mt_io_arg_t*)v;
     /* validate args first */
     if (!a || a->len == 0) { if (a) a->err = 0; return NULL; }
     if ((uint64_t)a->off + (uint64_t)a->len < (uint64_t)a->off) { /* overflow */
-        a->err = EINVAL; return NULL;
-    }
+        a->err = EINVAL; return NULL; }
     size_t left = a->len;
     off_t pos = a->off;
     char *p = (char*)a->dest + pos;
@@ -67,11 +101,6 @@ uint32  len[nblk]               // 每块压缩长度
 
 /* 压缩率跟踪 */
 #define ENABLE_COMPRESSION_RATIO_TRACKING 1
-
-/* Phase 8.1: 多线程I/O优化开关 */
-#define ENABLE_MMAP_IO         0  /* Phase 8.3: mmap在测试中未显示优势，保留fread */
-#define ENABLE_PINNED_MEMORY   1  /* 使用OpenCL Pinned Memory */
-#define ENABLE_ASYNC_WRITE     0  /* 异步文件写入（实验性）*/
 
 /* Phase 7.2: 自适应块大小算法声明 */
 #define SAMPLE_SIZE (64 * 1024)
@@ -161,14 +190,6 @@ static void choose_blocking(size_t in_sz, cl_device_id dev,
 
     /* 2. ⽬标块数：CU × OCC_FACTOR，但不能多于字节数 */
     size_t tgt_blk = (size_t)cu * OCC_FACTOR;
-    /* Allow forcing a smaller target block count for testing via
-     * LZO_FORCE_NBLK environment variable (helps run CPU-style kernel
-     * on GPUs by reducing concurrent work-items). */
-    const char* env_nblk = getenv("LZO_FORCE_NBLK");
-    if (env_nblk) {
-        int v = atoi(env_nblk);
-        if (v > 0) tgt_blk = (size_t)v;
-    }
     if (tgt_blk > in_sz) tgt_blk = in_sz;        /* 每块≥1 B */
 
     /* 3. 初步块⼤⼩ = ceil(in_sz / tgt_blk) */
@@ -395,59 +416,6 @@ static inline size_t lzo_worst(size_t n) {
 }
 
 /* read mem-images/kernel-source */
-#if ENABLE_MMAP_IO
-/* Phase 8.1: mmap版本 - 零拷贝，利用页缓存预读 */
-static char* read_file(const char* path, size_t* sz_out)
-{
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        perror(path); exit(1);
-    }
-
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        perror("fstat"); close(fd); exit(1);
-    }
-
-    size_t sz = st.st_size;
-    if (sz == 0) {
-        fprintf(stderr, "Error: %s is empty\n", path);
-        close(fd); exit(1);
-    }
-
-    /* mmap文件到内存 */
-    void* mapped = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (mapped == MAP_FAILED) {
-        perror("mmap"); close(fd); exit(1);
-    }
-
-    /* 建议内核顺序预读（提升大文件性能）*/
-    madvise(mapped, sz, MADV_SEQUENTIAL | MADV_WILLNEED);
-
-    /* Phase 8.3: mmap + memcpy 方案
-     * 虽然有一次 memcpy，但仍比 fread 快：
-     * - fread: Page Cache → 内核缓冲区 → 用户空间 (2次拷贝)
-     * - mmap: Page Cache → 用户空间 (1次拷贝，memcpy可能被优化)
-     * 且 mmap 利用页表映射，大文件预读效率更高
-     */
-    char* buf = malloc(sz + 1);
-    if (!buf) {
-        munmap(mapped, sz); close(fd);
-        fprintf(stderr, "malloc failed for %zu bytes\n", sz);
-        exit(1);
-    }
-    memcpy(buf, mapped, sz);
-    buf[sz] = '\0';
-
-    /* 清理映射 */
-    munmap(mapped, sz);
-    close(fd);
-
-    if (sz_out)
-        *sz_out = sz;
-    return buf;
-}
-#else
 /* 原有fread版本 */
 static char* read_file(const char* path, size_t* sz_out)
 {
@@ -468,7 +436,6 @@ static char* read_file(const char* path, size_t* sz_out)
     buf[sz] = '\0';
     return buf;
 }
-#endif
 
 static cl_context  ctx;
 static cl_command_queue q;
@@ -495,60 +462,19 @@ static struct {
     size_t len_size;
 } buffer_cache = {0};
 
-/* 优化: 内核参数缓存以避免重复设置 */
-static struct {
-    cl_kernel kernel;
-    cl_mem d_in;
-    cl_mem d_out;
-    cl_mem d_len;
-    cl_uint in_sz;
-    cl_uint blk;
-    cl_uint worst_blk;
-} kernel_args_cache = {0};
-
-static void set_kernel_args_cached(cl_kernel krn, cl_mem d_in, cl_mem d_out,
-                                   cl_mem d_len, cl_uint in_sz, cl_uint blk,
-                                   cl_uint worst_blk) {
-    /* 仅在参数变化时才设置 */
-    if (kernel_args_cache.kernel != krn ||
-        kernel_args_cache.d_in != d_in ||
-        kernel_args_cache.d_out != d_out ||
-        kernel_args_cache.d_len != d_len ||
-        kernel_args_cache.in_sz != in_sz ||
-        kernel_args_cache.blk != blk ||
-        kernel_args_cache.worst_blk != worst_blk) {
-
-        if (debug) fprintf(stderr, "DBG: Setting kernel args (cache miss)\n");
-
-        CHECK(clSetKernelArg(krn, 0, sizeof(cl_mem), &d_in));
-        CHECK(clSetKernelArg(krn, 1, sizeof(cl_mem), &d_out));
-        CHECK(clSetKernelArg(krn, 2, sizeof(cl_mem), &d_len));
-        CHECK(clSetKernelArg(krn, 3, sizeof(cl_uint), &in_sz));
-        CHECK(clSetKernelArg(krn, 4, sizeof(cl_uint), &blk));
-        CHECK(clSetKernelArg(krn, 5, sizeof(cl_uint), &worst_blk));
-
-        /* 更新缓存 */
-        kernel_args_cache.kernel = krn;
-        kernel_args_cache.d_in = d_in;
-        kernel_args_cache.d_out = d_out;
-        kernel_args_cache.d_len = d_len;
-        kernel_args_cache.in_sz = in_sz;
-        kernel_args_cache.blk = blk;
-        kernel_args_cache.worst_blk = worst_blk;
-    } else {
-        if (debug) fprintf(stderr, "DBG: Kernel args cached (skip setting)\n");
-    }
-}
-
 static cl_mem get_or_create_buffer(cl_mem* cached_buf, size_t* cached_size,
                                     size_t required_size, cl_mem_flags flags) {
     if (*cached_size < required_size) {
         if (*cached_buf) clReleaseMemObject(*cached_buf);
         cl_int err;
-        /* Phase 6.1: 添加 CL_MEM_ALLOC_HOST_PTR 启用 Pinned Memory
-         * 这使得主机端内存页锁定，DMA传输效率提升20-30%
+        /* Use Pinned Host mapping (CL_MEM_ALLOC_HOST_PTR) unconditionally; this
+         * restores the original zero-copy semantics which improve upload/download
+         * throughput and stability for many workloads. Keeping this flag ensures
+         * the mapped pointer returned by clEnqueueMapBuffer is a host-accessible
+         * pinned buffer optimized for DMA interactions with the device.
          */
-        *cached_buf = clCreateBuffer(ctx, flags | CL_MEM_ALLOC_HOST_PTR, required_size, NULL, &err);
+        cl_mem_flags create_flags = flags | CL_MEM_ALLOC_HOST_PTR;
+        *cached_buf = clCreateBuffer(ctx, create_flags, required_size, NULL, &err);
         CHECK(err);
         *cached_size = required_size;
     }
@@ -743,19 +669,17 @@ int main(int argc, char** argv)
         fprintf(stderr, "\nEnvironment variables (grouped — standalone / client->daemon / advanced):\n");
         fprintf(stderr, "  I/O mode:\n");
         fprintf(stderr, "    LZO_STANDARD_COPY=0|1    0=zero-copy (map into pinned buffer), 1=standard host->device copy (explicit upload).\n");
-        fprintf(stderr, "    LZO_FORCE_MAP=0|1        Force use of mapped pinned buffer even if standard-copy requested (overrides LZO_STANDARD_COPY).\n");
         fprintf(stderr, "\n  Multi-threaded I/O (reduce file-read latency / parallel uploads):\n");
         fprintf(stderr, "    LZO_MT_IO=0|1            Enable multi-threaded pread reads / parallel uploads (standalone + daemon).\n");
-        fprintf(stderr, "    LZO_MT_IO_THREADS=N      Threads for MT I/O (1-32; common values: 4/8; default: 4 standalone, 4 daemon).\n");
+        fprintf(stderr, "    LZO_MT_IO_THREADS=N      Threads for MT I/O (1-32; common values: 4/8; default: %d standalone, %d daemon).\n", LZO_DEFAULT_MT_IO_THREADS, LZO_DEFAULT_MT_IO_THREADS);
         fprintf(stderr, "\n  Block sizing / adaptive behavior:\n");
         fprintf(stderr, "    LZO_FIXED_BLOCK_SIZE=N   Fix block size in KB (overrides adaptive selection). Use 0 to restore adaptive behavior.\n");
-        fprintf(stderr, "    LZO_FORCE_NBLK=N         (advanced) Force target block count for blocking algorithm (comma-free tuning).\n");
         fprintf(stderr, "\n  OpenCL & correctness flags:\n");
         fprintf(stderr, "    LZO_OPENCL_DEVICE=CPU|GPU Prefer device selection for standalone/daemon. Daemons may ignore if configured otherwise.\n");
         fprintf(stderr, "    LZO_DECOMP_VEC=0|1       Decompression: 1=prefer vectorized kernel (default), 0=force scalar decompressor.\n");
         fprintf(stderr, "    LZO_DEBUG=1              Enable debug prints and timing traces.\n");
         fprintf(stderr, "\n  Notes / dependency rules:\n");
-        fprintf(stderr, "    - Force/override rules: LZO_FORCE_MAP overrides LZO_STANDARD_COPY.\n");
+        fprintf(stderr, "    - Force/override rules: mapping is determined by LZO_STANDARD_COPY (no separate override).\n");
         fprintf(stderr, "    - MT I/O affects both file read and upload; enabling LZO_MT_IO without sufficient threads (LZO_MT_IO_THREADS) gives limited benefit.\n");
         fprintf(stderr, "    - Client->daemon: client sends its environment options per-request; the daemon may accept or ignore some settings depending on its configuration.\n");
         fprintf(stderr, "\n  Which binary honors which option:\n");
@@ -775,6 +699,7 @@ int main(int argc, char** argv)
     int output_explicit = 0; /* whether -o/--output was explicitly provided */
     int suppress_non_data = 0; /* when writing to stdout (-), suppress non-data prints */
     int show_help = 0;
+    /* Standalone behavior overrides controlled by environment variables only. */
     const char *comp_level = "1l"; /* default: "1l" (GPU optimized, D_BITS=12, ~2500MB/s and best compression)
                                       * "1"  (CPU standard, D_BITS=14)
                                       * "1k" (low mem, D_BITS=11)
@@ -799,7 +724,6 @@ int main(int argc, char** argv)
             if (strcmp(output_path, "-") == 0) suppress_non_data = 1;
             continue;
         }
-        /* --strategy option removed: strategy dimension is no longer supported */
         if (strcmp(arg, "-L") == 0 || strcmp(arg, "-l") == 0 || strcmp(arg, "--level") == 0) {
             if (i + 1 >= argc) { fprintf(stderr, "missing argument for %s\n", arg); return 1; }
             comp_level = argv[++i];
@@ -824,6 +748,30 @@ int main(int argc, char** argv)
                 if (!in_path) { in_path = arg; continue; }
             }
         }
+    }
+
+    /* After parsing CLI, establish effective values for overridden options:
+     * Precedence: CLI option (opt_*) -> environment variable -> defaults from lzo_defaults.h
+     */
+    const char* sopt = NULL;
+    size_t stdio_buf_mb_local = (size_t)LZO_DEFAULT_STDIO_BUF_MB;
+    if ((sopt = getenv("LZO_STDIO_BUF_MB"))) {
+        int v = atoi(sopt); if (v > 0) stdio_buf_mb_local = (size_t)v;
+    }
+
+    int coalesce_local = LZO_DEFAULT_COALESCE_OUTPUT;
+    if ((sopt = getenv("LZO_COALESCE_OUTPUT"))) {
+        coalesce_local = atoi(sopt) ? 1 : 0;
+    }
+
+    size_t coalesce_max_mb_local = (size_t)LZO_DEFAULT_COALESCE_MAX_MB;
+    if ((sopt = getenv("LZO_COALESCE_MAX_MB"))) {
+        int v = atoi(sopt); if (v > 0) coalesce_max_mb_local = (size_t)v;
+    }
+
+    size_t coalesce_chunk_mb_local = (size_t)LZO_DEFAULT_COALESCE_CHUNK_MB;
+    if ((sopt = getenv("LZO_COALESCE_CHUNK_MB"))) {
+        int v = atoi(sopt); if (v > 0) coalesce_chunk_mb_local = (size_t)v;
     }
 
     if (show_help) {
@@ -851,19 +799,17 @@ int main(int argc, char** argv)
         printf("\nEnvironment variables (grouped — standalone / client->daemon / advanced):\n");
         printf("  I/O mode:\n");
         printf("    LZO_STANDARD_COPY=0|1    0=zero-copy (map into pinned buffer), 1=standard host->device copy (explicit upload).\n");
-        printf("    LZO_FORCE_MAP=0|1        Force use of mapped pinned buffer even if standard-copy requested (overrides LZO_STANDARD_COPY).\n");
         printf("\n  Multi-threaded I/O (reduce file-read latency / parallel uploads):\n");
         printf("    LZO_MT_IO=0|1            Enable multi-threaded pread reads / parallel uploads (standalone + daemon).\n");
-        printf("    LZO_MT_IO_THREADS=N      Threads for MT I/O (1-32; common values: 4/8; default: 4 standalone, 4 daemon).\n");
+        printf("    LZO_MT_IO_THREADS=N      Threads for MT I/O (1-32; common values: 4/8; default: %d standalone, %d daemon).\n", LZO_DEFAULT_MT_IO_THREADS, LZO_DEFAULT_MT_IO_THREADS);
         printf("\n  Block sizing / adaptive behavior:\n");
         printf("    LZO_FIXED_BLOCK_SIZE=N   Fix block size in KB (overrides adaptive selection). Use 0 to restore adaptive behavior.\n");
-        printf("    LZO_FORCE_NBLK=N         (advanced) Force target block count for blocking algorithm (comma-free tuning).\n");
         printf("\n  OpenCL & correctness flags:\n");
         printf("    LZO_OPENCL_DEVICE=CPU|GPU Prefer device selection for standalone/daemon. Daemons may ignore if configured otherwise.\n");
         printf("    LZO_DECOMP_VEC=0|1       Decompression: 1=prefer vectorized kernel (default), 0=force scalar decompressor.\n");
         printf("    LZO_DEBUG=1              Enable debug prints and timing traces.\n");
         printf("\n  Notes / dependency rules:\n");
-        printf("    - Force/override rules: LZO_FORCE_MAP overrides LZO_STANDARD_COPY.\n");
+        printf("    - Force/override rules: mapping is determined by LZO_STANDARD_COPY (no separate override).\n");
         printf("    - MT I/O affects both file read and upload; enabling LZO_MT_IO without sufficient threads (LZO_MT_IO_THREADS) gives limited benefit.\n");
         printf("    - Client->daemon: client sends its environment options per-request; the daemon may accept or ignore some settings depending on its configuration.\n");
         printf("\n  Which binary honors which option:\n");
@@ -894,6 +840,7 @@ int main(int argc, char** argv)
     uint64_t t_io_after = now_ns();
     ocl_init();
     uint64_t t_ocl_init = now_ns();
+    uint64_t t_kernel_load_start = 0, t_kernel_load_end = 0;
         /* 优先使用向量化解压器(性能提升199%)，失败时自动回退到标准版本
          * 可通过环境变量 LZO_DECOMP_VEC=0 强制使用标准解压器
          */
@@ -908,6 +855,7 @@ int main(int argc, char** argv)
         /* 优化: 检查缓存以避免重复编译和创建内核 */
         cl_program prog_d = NULL;
         cl_kernel krn_d = NULL;
+        t_kernel_load_start = now_ns();
         int cache_idx_d = find_cached_program(decomp_base);
 
         if (cache_idx_d >= 0) {
@@ -959,6 +907,7 @@ int main(int argc, char** argv)
             } else {
                 load_failed = 1;
             }
+        t_kernel_load_end = now_ns();
 
             /* 如果二进制加载失败，尝试从源码编译 */
             if (load_failed || !prog_d) {
@@ -1041,9 +990,11 @@ int main(int argc, char** argv)
 
         cl_int err;
 
-    /* 优化: 使用pinned memory创建所有缓冲区 */
-    uint64_t t_buffer_start = now_ns();
-    cl_mem d_comp = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, comp_sz, NULL, &err);
+        /* 优化: 使用 pinned memory (CL_MEM_ALLOC_HOST_PTR) 以支持零拷贝 */
+        uint64_t t_buffer_start = now_ns();
+        /* Restore pinned-memory usage for direct buffers too */
+        cl_mem_flags f_comp = CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR;
+        cl_mem d_comp = clCreateBuffer(ctx, f_comp, comp_sz, NULL, &err);
     CHECK(err);
     /* 使用map上传压缩数据 */
     void* mapped_comp = clEnqueueMapBuffer(q, d_comp, CL_TRUE, CL_MAP_WRITE, 0, comp_sz, 0, NULL, NULL, &err);
@@ -1051,17 +1002,19 @@ int main(int argc, char** argv)
     memcpy(mapped_comp, p, comp_sz);
     CHECK(clEnqueueUnmapMemObject(q, d_comp, mapped_comp, 0, NULL, NULL));
 
-    cl_mem d_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, (nblk + 1) * sizeof(cl_uint), NULL, &err);
+    cl_mem_flags f_off = CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR;
+    cl_mem d_off = clCreateBuffer(ctx, f_off, (nblk + 1) * sizeof(cl_uint), NULL, &err);
     CHECK(err);
     void* mapped_off = clEnqueueMapBuffer(q, d_off, CL_TRUE, CL_MAP_WRITE, 0, (nblk + 1) * sizeof(cl_uint), 0, NULL, NULL, &err);
     CHECK(err);
     memcpy(mapped_off, off_arr, (nblk + 1) * sizeof(cl_uint));
     CHECK(clEnqueueUnmapMemObject(q, d_off, mapped_off, 0, NULL, NULL));
 
-    cl_mem d_out2 = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR, orig_sz, NULL, &err);
+    cl_mem_flags f_out = CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR;
+    cl_mem d_out2 = clCreateBuffer(ctx, f_out, orig_sz, NULL, &err);
     CHECK(err);
     /* decompressor expects an out_lens buffer as arg 3 */
-    cl_mem d_out_lens = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR, nblk * sizeof(cl_uint), NULL, &err);
+    cl_mem d_out_lens = clCreateBuffer(ctx, f_out, nblk * sizeof(cl_uint), NULL, &err);
     CHECK(err);
     uint64_t t_buffer_end = now_ns();
 
@@ -1153,9 +1106,30 @@ int main(int argc, char** argv)
                     return 1;
                 }
                 FILE* fo = fopen(output_path, "wb");
+                /* 使用 stdio 缓冲来减少小块 fwrite 导致的写入方差。
+                 * 默认缓冲为 LZO_DEFAULT_STDIO_BUF_MB (4MB); 不再从环境变量读取
+                 * 若需要调优，可通过CLI或将来添加的配置文件覆盖。
+                 */
+                char *vbuf = NULL;
+                /* If a per-request stdio buffer size was provided as a CLI override (not yet added),
+                 * it should be used here. For standalone mode, we keep the default LZO_DEFAULT_STDIO_BUF_MB.
+                 */
+                size_t vsize = (size_t)LZO_DEFAULT_STDIO_BUF_MB * 1024 * 1024; /* 默认 4MB */
                 if (!fo) { perror(output_path); return 1; }
-                if (fwrite(out2, 1, orig_sz, fo) != orig_sz) { perror("fwrite"); fclose(fo); return 1; }
+                if (orig_sz > 0) {
+                    /* cap buffer to output size */
+                    if (vsize > orig_sz) vsize = orig_sz;
+                    vbuf = (char*)malloc(vsize);
+                    if (vbuf) {
+                        if (setvbuf(fo, vbuf, _IOFBF, (int)vsize) != 0) {
+                            /* setvbuf 失败则继续，尽量不fatal */
+                            free(vbuf); vbuf = NULL;
+                        }
+                    }
+                }
+                if (fwrite(out2, 1, orig_sz, fo) != orig_sz) { perror("fwrite"); if (vbuf) free(vbuf); fclose(fo); return 1; }
                 fclose(fo);
+                if (vbuf) { free(vbuf); vbuf = NULL; }
                 if (!suppress_non_data) printf("wrote %s\n", output_path);
             }
         }
@@ -1165,6 +1139,7 @@ int main(int argc, char** argv)
         uint64_t t_total_end = now_ns();
         double ms_file_read = (t_io_after - t_io_in)/1e6;
         double ms_ocl_init = (t_ocl_init - t_io_after)/1e6;
+        double ms_kernel_load = (t_kernel_load_end - t_kernel_load_start)/1e6;
         double ms_buffer = (t_buffer_end - t_buffer_start)/1e6;
         double ms_upload = (t_upload_end - t_upload_start)/1e6;
         double ms_kernel = (t_exec_end - t_exec_start)/1e6;
@@ -1196,7 +1171,7 @@ int main(int argc, char** argv)
         printf("\n=== Time Breakdown (Decompression) ===\n");
         print_ns("1. File Read", t_io_after - t_io_in);
         print_ns("2. OCL Init", t_ocl_init - t_io_after);
-        print_ns("3. Kernel Load", 0);  /* uses cached kernel in decompress */
+        print_ns("3. Kernel Load", t_kernel_load_end - t_kernel_load_start);
         print_ns("4. Buffer Alloc", t_buffer_end - t_buffer_start);
         print_ns("5. Data Upload", t_upload_end - t_upload_start);
         print_ns("6. Kernel Exec", t_exec_end - t_exec_start);
@@ -1205,21 +1180,24 @@ int main(int argc, char** argv)
         print_ns("TOTAL", t_total_end - t_start_total);
         printf("\n");
 
-        /* 计算占比 */
-        printf("=== Percentage Breakdown ===\n");
-        printf("Kernel Exec     : %6.2f%%\n", 100.0 * ms_kernel / ms_total);
-        printf("Data Transfer   : %6.2f%% (upload=%.2f%% + download=%.2f%%)\n",
-               100.0 * (ms_upload + ms_download) / ms_total,
-               100.0 * ms_upload / ms_total,
-               100.0 * ms_download / ms_total);
-        printf("File I/O        : %6.2f%% (read=%.2f%% + write=%.2f%%)\n",
-               100.0 * (ms_file_read + ms_write) / ms_total,
-               100.0 * ms_file_read / ms_total,
-               100.0 * ms_write / ms_total);
-        printf("Buffer Alloc    : %6.2f%%\n",
-               100.0 * ms_buffer / ms_total);
-        printf("OCL Setup       : %6.2f%%\n",
-               100.0 * ms_ocl_init / ms_total);
+         /* 计算占比 */
+         printf("=== Percentage Breakdown ===\n");
+         /* protect against zero total */
+         double denom = (ms_total > 0.0) ? ms_total : 1.0;
+         int zero_total = (ms_total <= 0.0);
+         printf("Kernel Exec     : %6.2f%%\n", zero_total ? 0.0 : 100.0 * ms_kernel / denom);
+         printf("Data Transfer   : %6.2f%% (upload=%.2f%% + download=%.2f%%)\n",
+             zero_total ? 0.0 : 100.0 * (ms_upload + ms_download) / denom,
+             zero_total ? 0.0 : 100.0 * ms_upload / denom,
+             zero_total ? 0.0 : 100.0 * ms_download / denom);
+         printf("File I/O        : %6.2f%% (read=%.2f%% + write=%.2f%%)\n",
+             zero_total ? 0.0 : 100.0 * (ms_file_read + ms_write) / denom,
+             zero_total ? 0.0 : 100.0 * ms_file_read / denom,
+             zero_total ? 0.0 : 100.0 * ms_write / denom);
+         printf("Buffer Alloc    : %6.2f%%\n",
+             zero_total ? 0.0 : 100.0 * ms_buffer / denom);
+           printf("OCL Setup       : %6.2f%%\n",
+               zero_total ? 0.0 : 100.0 * (ms_ocl_init + ms_kernel_load) / denom);
         printf("\n");
 
     clReleaseMemObject(d_comp); clReleaseMemObject(d_off); clReleaseMemObject(d_out2); clReleaseMemObject(d_out_lens);
@@ -1332,12 +1310,6 @@ int main(int argc, char** argv)
     int standard_copy = 0;
     const char* std_s = getenv("LZO_STANDARD_COPY");
     if (std_s && atoi(std_s) == 1) standard_copy = 1;
-    /* Allow forcing map (zero-copy) regardless of standard_copy via LZO_FORCE_MAP=1 */
-    const char* force_map_env = getenv("LZO_FORCE_MAP");
-    if (force_map_env && atoi(force_map_env) == 1) {
-        if (standard_copy && debug) fprintf(stderr, "DBG: LZO_FORCE_MAP=1 overriding LZO_STANDARD_COPY -> forcing zero-copy\n");
-        standard_copy = 0;
-    }
 
     /* multi-threaded I/O control */
     int mt_io = 0;
@@ -1502,6 +1474,11 @@ int main(int argc, char** argv)
      */
     uint64_t t_buffer_alloc_start = 0, t_buffer_alloc_end = 0;
     uint64_t t_upload_start = 0, t_upload_end = 0;
+    /* async upload support (prototype) */
+    int async_upload = 0;
+    pthread_t upload_reaper_tid = 0;
+    async_upload_ctx_t *upload_ctx = NULL;
+    uint64_t *t_upload_end_ptr = NULL; /* allocated when async enabled */
     size_t blk = 0, nblk = 0;
     choose_blocking_adaptive(data_for_blocking, in_sz, dev, &blk, &nblk, debug);
     size_t worst_blk = lzo_worst(blk);
@@ -1540,25 +1517,80 @@ int main(int argc, char** argv)
             size_t rem = in_sz % mt_threads;
             size_t off = 0;
             t_upload_start = now_ns();
+            /* Determine if async upload is requested */
+            const char *au = getenv("LZO_ASYNC_UPLOAD");
+            if (au && strcmp(au, "1") == 0) async_upload = 1;
+
             for (int i = 0; i < mt_threads; ++i) {
                 size_t len = base + (i == mt_threads-1 ? rem : 0);
                 err = clEnqueueWriteBuffer(q, d_in, CL_FALSE, off, len, (char*)host_in + off, 0, NULL, &events[i]);
                 CHECK(err);
                 off += len;
             }
-            CHECK(clWaitForEvents(mt_threads, events));
-            t_upload_end = now_ns();
-            for (int i = 0; i < mt_threads; ++i) clReleaseEvent(events[i]);
-            free(events);
+            if (async_upload) {
+                /* spawn a reaper thread that waits for uploads to finish and
+                 * frees host_in when safe. Keep the events alive until main
+                 * signals kernel enqueue so passing them as waitlist is safe. */
+                t_upload_end_ptr = malloc(sizeof(uint64_t)); *t_upload_end_ptr = 0;
+                upload_ctx = calloc(1, sizeof(async_upload_ctx_t));
+                upload_ctx->events = events;
+                upload_ctx->n = mt_threads;
+                upload_ctx->host_ptr = host_in; /* reaper will free */
+                upload_ctx->t_upload_end_ptr = t_upload_end_ptr;
+                /* no extra sync objects; main thread will join+cleanup ctx */
+                /* reaper thread waits for write events, frees host buffer,
+                 * then waits for main to signal that kernel enqueue occurred
+                 * before releasing events. */
+                if (pthread_create(&upload_reaper_tid, NULL, async_upload_reaper, upload_ctx) != 0) {
+                    /* fallback: wait here and free events/host */
+                    CHECK(clWaitForEvents(mt_threads, events));
+                    *t_upload_end_ptr = now_ns();
+                    for (int i = 0; i < mt_threads; ++i) clReleaseEvent(events[i]);
+                    free(events);
+                    free(t_upload_end_ptr); t_upload_end_ptr = NULL;
+                    free(upload_ctx); upload_ctx = NULL;
+                }
+                /* do NOT free host_in here - reaper will free it */
+            } else {
+                CHECK(clWaitForEvents(mt_threads, events));
+                t_upload_end = now_ns();
+                for (int i = 0; i < mt_threads; ++i) clReleaseEvent(events[i]);
+                free(events);
+                free(host_in); host_in = NULL;
+            }
         } else {
             t_upload_start = now_ns();
-            err = clEnqueueWriteBuffer(q, d_in, CL_TRUE, 0, in_sz, host_in, 0, NULL, NULL);
-            CHECK(err);
-            t_upload_end = now_ns();
+            const char *au = getenv("LZO_ASYNC_UPLOAD");
+            if (au && strcmp(au, "1") == 0) async_upload = 1;
+            if (async_upload) {
+                cl_event *events = calloc(1, sizeof(cl_event));
+                err = clEnqueueWriteBuffer(q, d_in, CL_FALSE, 0, in_sz, host_in, 0, NULL, &events[0]);
+                CHECK(err);
+                /* spawn a reaper thread that will wait and free host_in */
+                t_upload_end_ptr = malloc(sizeof(uint64_t)); *t_upload_end_ptr = 0;
+                upload_ctx = calloc(1, sizeof(async_upload_ctx_t));
+                upload_ctx->events = events;
+                upload_ctx->n = 1;
+                upload_ctx->host_ptr = host_in;
+                upload_ctx->t_upload_end_ptr = t_upload_end_ptr;
+                /* no extra sync objects; main thread will join+cleanup ctx */
+                if (pthread_create(&upload_reaper_tid, NULL, async_upload_reaper, upload_ctx) != 0) {
+                    /* fallback */
+                    CHECK(clWaitForEvents(1, events));
+                    *t_upload_end_ptr = now_ns();
+                    clReleaseEvent(events[0]); free(events);
+                    free(t_upload_end_ptr); t_upload_end_ptr = NULL;
+                    free(upload_ctx); upload_ctx = NULL;
+                    free(host_in); host_in = NULL;
+                }
+                /* host_in will be freed by reaper */
+            } else {
+                err = clEnqueueWriteBuffer(q, d_in, CL_TRUE, 0, in_sz, host_in, 0, NULL, NULL);
+                CHECK(err);
+                t_upload_end = now_ns();
+                free(host_in); host_in = NULL;
+            }
         }
-
-        /* host_in no longer needed */
-        free(host_in); host_in = NULL;
     }
     /* NOTE: t_blocking_end already recorded above; any upload / buffer alloc
      * timings are measured separately below and will not be attributed to
@@ -1584,28 +1616,6 @@ int main(int argc, char** argv)
                                         out_cap, CL_MEM_WRITE_ONLY);
     uint64_t t_out_buffer_end = now_ns();
 
-    /* map_mode: 0=default CL_MEM_WRITE_ONLY + clEnqueueReadBuffer
-     * 1=ALLOC_HOST_PTR + clEnqueueMapBuffer
-     * 2=USE_HOST_PTR with host pointer (posix_memalign)
-     */
-    int map_mode = 0;
-    /* Default to explicit reads (map_mode=0) for all kernels. Individual
-     * experiments can still force mapping via LZO_FORCE_MAP=1. */
-    /* Allow overriding map_mode via environment for testing/comparison.
-     * Set environment variable LZO_FORCE_MAP=0 or =1 to force explicit read
-     * or alloc-host+map respectively. Helpful to produce two test binaries
-     * that exercise map==0 vs map==1 deterministically. */
-    const char* force_map_s = getenv("LZO_FORCE_MAP");
-    if (force_map_s) {
-        int fm = atoi(force_map_s);
-        if (fm == 0 || fm == 1) {
-            if (debug) fprintf(stderr, "DBG: forcing map_mode from env LZO_FORCE_MAP=%d\n", fm);
-            map_mode = fm;
-        } else {
-            if (debug) fprintf(stderr, "DBG: LZO_FORCE_MAP='%s' ignored (not 0 or 1)\n", force_map_s);
-        }
-    }
-    /* The 'usehost' strategy has been removed; only map_mode 0/1 are used. */
 
     /* 优化: 使用缓冲区缓存 */
     uint64_t t_len_buffer_start = now_ns();
@@ -1615,9 +1625,14 @@ int main(int argc, char** argv)
                                         len_bytes, CL_MEM_READ_WRITE);  /* 优化:移除ALLOC_HOST_PTR */
     uint64_t t_len_buffer_end = now_ns();
 
-    /* 优化: 使用参数缓存避免重复设置 */
+    /* Set kernel args each run */
     uint64_t t_setup_args_start = now_ns();
-    set_kernel_args_cached(krn_c, d_in, d_out, d_len, in_sz, blk, worst_blk);
+    CHECK(clSetKernelArg(krn_c, 0, sizeof(cl_mem), &d_in));
+    CHECK(clSetKernelArg(krn_c, 1, sizeof(cl_mem), &d_out));
+    CHECK(clSetKernelArg(krn_c, 2, sizeof(cl_mem), &d_len));
+    CHECK(clSetKernelArg(krn_c, 3, sizeof(cl_uint), &in_sz));
+    CHECK(clSetKernelArg(krn_c, 4, sizeof(cl_uint), &blk));
+    CHECK(clSetKernelArg(krn_c, 5, sizeof(cl_uint), &worst_blk));
     uint64_t t_setup_args_end = now_ns();
 
     /* 压缩: 必须使用local_size=1 (每个work-item需2KB字典，local_size>1会内存溢出)
@@ -1632,7 +1647,16 @@ int main(int argc, char** argv)
     size_t gsz = ((nblk + lsz - 1) / lsz) * lsz;  /* round up to multiple of lsz */
     cl_event evt_compute;
     uint64_t t_exec_start = now_ns();
-    CHECK(clEnqueueNDRangeKernel(q, krn_c, 1, NULL, &gsz, &lsz, 0, NULL, &evt_compute));
+    /* If we started async uploads, make kernel wait on those upload events so
+     * upload+kernel execution can overlap with host-side setup work. */
+    if (upload_ctx && upload_ctx->n > 0 && upload_ctx->events) {
+        CHECK(clEnqueueNDRangeKernel(q, krn_c, 1, NULL, &gsz, &lsz,
+                                     upload_ctx->n, upload_ctx->events, &evt_compute));
+        /* reaper will not free events/ctx; main thread will join reaper and
+         * cleanup events after kernel completes (avoids races). */
+    } else {
+        CHECK(clEnqueueNDRangeKernel(q, krn_c, 1, NULL, &gsz, &lsz, 0, NULL, &evt_compute));
+    }
     clWaitForEvents(1, &evt_compute);
     uint64_t t_exec_end = now_ns();
 
@@ -1744,6 +1768,18 @@ int main(int argc, char** argv)
     /* write LZO container: magic, orig_size, blk_size, nblk, len[nblk], then data */
     FILE* fo = fopen(output_path, "wb");
     if (!fo) { perror(output_path); return 1; }
+    /* 使用 stdio 缓冲区减少频繁 fwrite 对写入时延造成的波动.
+     * 标准默认: stdio buffer 为 LZO_DEFAULT_STDIO_BUF_MB=4MB (配置可通过 CLI 覆盖),
+     * 请勿通过环境变量配置此值;如果仍希望微调,可通过命令行参数进行覆盖(高级特性)。 */
+    char *vbuf = NULL;
+    size_t vsize = (size_t)LZO_DEFAULT_STDIO_BUF_MB * 1024 * 1024;
+    if (vsize > out_sz && out_sz > 0) vsize = out_sz;
+    if (vsize > 0) {
+        vbuf = (char*)malloc(vsize);
+        if (vbuf) {
+            if (setvbuf(fo, vbuf, _IOFBF, (int)vsize) != 0) { free(vbuf); vbuf = NULL; }
+        }
+    }
     uint16_t magic = MAGIC;
     uint32_t orig_sz32 = (uint32_t)in_sz;
     uint32_t blk32 = (uint32_t)blk;
@@ -1753,25 +1789,204 @@ int main(int argc, char** argv)
     if (fwrite(&blk32, sizeof(blk32), 1, fo) != 1) { perror("fwrite"); fclose(fo); return 1; }
     if (fwrite(&nblk32, sizeof(nblk32), 1, fo) != 1) { perror("fwrite"); fclose(fo); return 1; }
     if (fwrite(len_arr, sizeof(uint32_t), nblk, fo) != nblk) { perror("fwrite"); fclose(fo); return 1; }
-    /* Phase 8.2: Zero-Copy 写入 - 直接从 mapped memory (dev_out) scatter-gather 到文件 */
-    for (size_t i = 0; i < nblk; ++i) {
-        if (len_arr[i] > 0) {
-            size_t dev_off = i * worst_blk;
-            if (fwrite(dev_out + dev_off, 1, len_arr[i], fo) != len_arr[i]) {
-                perror("fwrite block");
+    /* Phase 8.2: Zero-Copy 写入 - 直接从 mapped memory (dev_out) scatter-gather 到文件
+     * 优化: 当总压缩大小较小时，合并拷贝到单个连续缓冲区并一次性写入以减少syscall数量并降低写入时延方差。
+     * 控制:
+    *  - 合并写入（coalesced write）已默认启用以减少 syscall 并降低写入时延方差
+    *  - 为避免极大内存分配，自动在输出大小 > LZO_DEFAULT_COALESCE_MAX_MB 时禁用一次性合并写入
+    *  - Enable per-block and coalesce write timing when debug diagnostics are enabled (e.g., LZO_DEBUG=1)
+     */
+    /* Default: coalesce output is enabled; avoid attempting full coalesce if
+     * out_sz is larger than a default threshold LZO_DEFAULT_COALESCE_MAX_MB.
+     * The chunking size for a fallback is LZO_DEFAULT_COALESCE_CHUNK_MB.
+     * These are library/app defaults (for reduced env var list) and can be
+     * overridden by command-line flags for advanced runs.
+     */
+    int coalesce = LZO_DEFAULT_COALESCE_OUTPUT; /* placeholder: add CLI/env override support */
+    size_t coalesce_max_mb = (size_t)LZO_DEFAULT_COALESCE_MAX_MB; /* placeholder: add CLI/env override support */
+
+    int profile_writes = debug; /* profile write diagnostics gated by debug flag */
+
+    if (coalesce && out_sz > 0) {
+        /* attempt a single contiguous copy + single fwrite */
+        unsigned char *contig = (unsigned char*)malloc(out_sz);
+        if (contig) {
+            uint64_t t_copy_start = now_ns();
+            size_t dest = 0;
+            for (size_t i = 0; i < nblk; ++i) {
+                if (len_arr[i] > 0) {
+                    size_t dev_off = i * worst_blk;
+                    memcpy(contig + dest, dev_out + dev_off, len_arr[i]);
+                    dest += len_arr[i];
+                }
+            }
+            uint64_t t_copy_end = now_ns();
+
+            uint64_t t_write_blk_start = now_ns();
+            if (fwrite(contig, 1, out_sz, fo) != out_sz) {
+                perror("fwrite contiguous");
+                free(contig);
                 fclose(fo);
+                if (vbuf) { free(vbuf); vbuf = NULL; }
                 CHECK(clEnqueueUnmapMemObject(q, d_out, dev_out, 0, NULL, NULL));
                 free(len_arr);
                 return 1;
             }
+            uint64_t t_write_blk_end = now_ns();
+
+            if (profile_writes) {
+                printf("COALESCE_COPY: %.3f ms\n", (t_copy_end - t_copy_start)/1e6);
+                printf("COALESCE_WRITE: %.3f ms\n", (t_write_blk_end - t_write_blk_start)/1e6);
+            }
+
+            free(contig);
+        } else {
+            /* allocation failed - try chunked coalesce before falling back to per-block writes */
+            size_t chunk_mb = (size_t)LZO_DEFAULT_COALESCE_CHUNK_MB; /* placeholder: add CLI/env override support */
+            size_t chunk_size = chunk_mb * 1024 * 1024;
+            if (chunk_size == 0) chunk_size = 16 * 1024 * 1024;
+            unsigned char *chunk = (unsigned char*)malloc(chunk_size);
+            if (chunk) {
+                size_t used = 0;
+                for (size_t i = 0; i < nblk; ++i) {
+                    if (len_arr[i] == 0) continue;
+                    size_t dev_off = i * worst_blk;
+                    if (len_arr[i] > chunk_size && used == 0) {
+                        uint64_t t1 = now_ns();
+                        if (fwrite(dev_out + dev_off, 1, len_arr[i], fo) != len_arr[i]) {
+                            perror("fwrite block large");
+                            free(chunk);
+                            fclose(fo);
+                            if (vbuf) { free(vbuf); vbuf = NULL; }
+                            CHECK(clEnqueueUnmapMemObject(q, d_out, dev_out, 0, NULL, NULL));
+                            free(len_arr);
+                            return 1;
+                        }
+                        uint64_t t2 = now_ns();
+                        if (profile_writes) printf("BLOCK_WRITE %zu len=%u : %.3f ms\n", i, len_arr[i], (t2 - t1)/1e6);
+                        continue;
+                    }
+                    if (used + len_arr[i] > chunk_size) {
+                        uint64_t t_write_chunk_start = now_ns();
+                        if (fwrite(chunk, 1, used, fo) != used) {
+                            perror("fwrite chunk");
+                            free(chunk);
+                            fclose(fo);
+                            if (vbuf) { free(vbuf); vbuf = NULL; }
+                            CHECK(clEnqueueUnmapMemObject(q, d_out, dev_out, 0, NULL, NULL));
+                            free(len_arr);
+                            return 1;
+                        }
+                        uint64_t t_write_chunk_end = now_ns();
+                        if (profile_writes) printf("CHUNK_WRITE: %.3f ms (bytes=%zu)\n", (t_write_chunk_end - t_write_chunk_start)/1e6, used);
+                        used = 0;
+                    }
+                    memcpy(chunk + used, dev_out + dev_off, len_arr[i]);
+                    used += len_arr[i];
+                }
+                if (used > 0) {
+                    uint64_t t_write_chunk_start = now_ns();
+                    if (fwrite(chunk, 1, used, fo) != used) {
+                        perror("fwrite chunk final");
+                        free(chunk);
+                        fclose(fo);
+                        if (vbuf) { free(vbuf); vbuf = NULL; }
+                        CHECK(clEnqueueUnmapMemObject(q, d_out, dev_out, 0, NULL, NULL));
+                        free(len_arr);
+                        return 1;
+                    }
+                    uint64_t t_write_chunk_end = now_ns();
+                    if (profile_writes) printf("CHUNK_WRITE: %.3f ms (bytes=%zu)\n", (t_write_chunk_end - t_write_chunk_start)/1e6, used);
+                }
+                free(chunk);
+            } else {
+                fprintf(stderr, "warning: coalesce allocation and chunk alloc both failed (%zu bytes), falling back to per-block writes\n", out_sz);
+                for (size_t i = 0; i < nblk; ++i) {
+                    if (len_arr[i] > 0) {
+                        size_t dev_off = i * worst_blk;
+                        if (profile_writes) {
+                            uint64_t t1 = now_ns();
+                            if (fwrite(dev_out + dev_off, 1, len_arr[i], fo) != len_arr[i]) {
+                                perror("fwrite block");
+                                fclose(fo);
+                                if (vbuf) { free(vbuf); vbuf = NULL; }
+                                CHECK(clEnqueueUnmapMemObject(q, d_out, dev_out, 0, NULL, NULL));
+                                free(len_arr);
+                                return 1;
+                            }
+                            uint64_t t2 = now_ns();
+                            printf("BLOCK_WRITE %zu len=%u : %.3f ms\n", i, len_arr[i], (t2 - t1)/1e6);
+                        } else {
+                            if (fwrite(dev_out + dev_off, 1, len_arr[i], fo) != len_arr[i]) {
+                                perror("fwrite block");
+                                fclose(fo);
+                                if (vbuf) { free(vbuf); vbuf = NULL; }
+                                CHECK(clEnqueueUnmapMemObject(q, d_out, dev_out, 0, NULL, NULL));
+                                free(len_arr);
+                                return 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        /* scatter-gather write (original behavior), optionally profile per-block writes */
+        for (size_t i = 0; i < nblk; ++i) {
+            if (len_arr[i] > 0) {
+                size_t dev_off = i * worst_blk;
+                if (profile_writes) {
+                    uint64_t t1 = now_ns();
+                    if (fwrite(dev_out + dev_off, 1, len_arr[i], fo) != len_arr[i]) {
+                        perror("fwrite block");
+                        fclose(fo);
+                        if (vbuf) { free(vbuf); vbuf = NULL; }
+                        CHECK(clEnqueueUnmapMemObject(q, d_out, dev_out, 0, NULL, NULL));
+                        free(len_arr);
+                        return 1;
+                    }
+                    uint64_t t2 = now_ns();
+                    printf("BLOCK_WRITE %zu len=%u : %.3f ms\n", i, len_arr[i], (t2 - t1)/1e6);
+                } else {
+                    if (fwrite(dev_out + dev_off, 1, len_arr[i], fo) != len_arr[i]) {
+                        perror("fwrite block");
+                        fclose(fo);
+                        if (vbuf) { free(vbuf); vbuf = NULL; }
+                        CHECK(clEnqueueUnmapMemObject(q, d_out, dev_out, 0, NULL, NULL));
+                        free(len_arr);
+                        return 1;
+                    }
+                }
+            }
         }
     }
     fclose(fo);
+    if (vbuf) { free(vbuf); vbuf = NULL; }
     /* 写入完成后才 unmap */
     CHECK(clEnqueueUnmapMemObject(q, d_out, dev_out, 0, NULL, NULL));
     printf("wrote %s\n", output_path);
 
     uint64_t t_after_write = now_ns();
+
+    /* If we have an async upload reaper running, join it now so we have
+     * a proper timestamp for upload completion used in the final breakdown.
+     */
+    if (upload_reaper_tid) {
+        pthread_join(upload_reaper_tid, NULL);
+        upload_reaper_tid = 0;
+        if (t_upload_end_ptr) {
+            t_upload_end = *t_upload_end_ptr;
+            free(t_upload_end_ptr); t_upload_end_ptr = NULL;
+        }
+        /* release events and free upload_ctx (reaper didn't free them) */
+        if (upload_ctx) {
+            if (upload_ctx->events) {
+                for (int _i = 0; _i < upload_ctx->n; ++_i) if (upload_ctx->events[_i]) clReleaseEvent(upload_ctx->events[_i]);
+                free(upload_ctx->events); upload_ctx->events = NULL; upload_ctx->n = 0;
+            }
+            free(upload_ctx); upload_ctx = NULL;
+        }
+    }
 
     /* 计算各阶段耗时 */
     double ms_file_read = (t_io_read_done - t_io_read_start)/1e6;
@@ -1788,7 +2003,10 @@ int main(int argc, char** argv)
     double ms_bulk_read = (t_bulk_read_end - t_bulk_read_start)/1e6;
     double ms_download_total = (t_download_end - t_download_start)/1e6;
     double ms_file_write = (t_after_write - t_write_start)/1e6;
-    double ms_total = (t_after_write - t_io_read_start)/1e6;
+    /* Use compress start as the canonical total start so OCL init/kernel
+     * loads (performed before file read start) are included in TOTAL.
+     */
+    double ms_total = (t_after_write - t_compress_start)/1e6;
     double ms_buffer_alloc_total = ms_buffer_alloc_in + ms_buffer_alloc_out + ms_buffer_alloc_len;
 
     double ratio = out_sz > 0 ? (double)in_sz / (double)out_sz : 0.0;
@@ -1832,33 +2050,36 @@ int main(int argc, char** argv)
     print_ns("12. Download (bulk)", t_bulk_read_end - t_bulk_read_start);
     print_ns("13. Download Total", t_download_end - t_download_start);
     print_ns("14. File Write", t_after_write - t_write_start);
-    print_ns("TOTAL", t_after_write - t_io_read_start);
+    print_ns("TOTAL", t_after_write - t_compress_start);
     printf("\n");
 
-    /* 计算占比 */
-    printf("=== Percentage Breakdown ===\n");
-    printf("Kernel Exec     : %6.2f%%\n", 100.0 * ms_kernel / ms_total);
-    printf("Data Transfer   : %6.2f%% (upload=%.2f%% + download=%.2f%%)\n",
-           100.0 * (ms_upload + ms_download_total) / ms_total,
-           100.0 * ms_upload / ms_total,
-           100.0 * ms_download_total / ms_total);
-    printf("File I/O        : %6.2f%% (read=%.2f%% + write=%.2f%%)\n",
-           100.0 * (ms_file_read + ms_file_write) / ms_total,
-           100.0 * ms_file_read / ms_total,
-           100.0 * ms_file_write / ms_total);
-    printf("Buffer Alloc    : %6.2f%% (in=%.2f%% + out=%.2f%% + len=%.2f%%)\n",
-           100.0 * ms_buffer_alloc_total / ms_total,
-           100.0 * ms_buffer_alloc_in / ms_total,
-           100.0 * ms_buffer_alloc_out / ms_total,
-           100.0 * ms_buffer_alloc_len / ms_total);
-    printf("OCL Setup       : %6.2f%% (init=%.2f%% + kernel_load=%.2f%%)\n",
-           100.0 * (ms_ocl_init + ms_kernel_load) / ms_total,
-           100.0 * ms_ocl_init / ms_total,
-           100.0 * ms_kernel_load / ms_total);
-    printf("Kernel Args     : %6.2f%%\n",
-           100.0 * ms_setup_args / ms_total);
-    printf("Other           : %6.2f%%\n",
-           100.0 * ms_blocking / ms_total);
+        /* 计算占比 */
+        printf("=== Percentage Breakdown ===\n");
+        /* protect against zero total */
+        double denom2 = (ms_total > 0.0) ? ms_total : 1.0;
+        int zero_total2 = (ms_total <= 0.0);
+        printf("Kernel Exec     : %6.2f%%\n", zero_total2 ? 0.0 : 100.0 * ms_kernel / denom2);
+        printf("Data Transfer   : %6.2f%% (upload=%.2f%% + download=%.2f%%)\n",
+               zero_total2 ? 0.0 : 100.0 * (ms_upload + ms_download_total) / denom2,
+               zero_total2 ? 0.0 : 100.0 * ms_upload / denom2,
+               zero_total2 ? 0.0 : 100.0 * ms_download_total / denom2);
+        printf("File I/O        : %6.2f%% (read=%.2f%% + write=%.2f%%)\n",
+               zero_total2 ? 0.0 : 100.0 * (ms_file_read + ms_file_write) / denom2,
+               zero_total2 ? 0.0 : 100.0 * ms_file_read / denom2,
+               zero_total2 ? 0.0 : 100.0 * ms_file_write / denom2);
+        printf("Buffer Alloc    : %6.2f%% (in=%.2f%% + out=%.2f%% + len=%.2f%%)\n",
+               zero_total2 ? 0.0 : 100.0 * ms_buffer_alloc_total / denom2,
+               zero_total2 ? 0.0 : 100.0 * ms_buffer_alloc_in / denom2,
+               zero_total2 ? 0.0 : 100.0 * ms_buffer_alloc_out / denom2,
+               zero_total2 ? 0.0 : 100.0 * ms_buffer_alloc_len / denom2);
+        printf("OCL Setup       : %6.2f%% (init=%.2f%% + kernel_load=%.2f%%)\n",
+               zero_total2 ? 0.0 : 100.0 * (ms_ocl_init + ms_kernel_load) / denom2,
+               zero_total2 ? 0.0 : 100.0 * ms_ocl_init / denom2,
+               zero_total2 ? 0.0 : 100.0 * ms_kernel_load / denom2);
+        printf("Kernel Args     : %6.2f%%\n",
+               zero_total2 ? 0.0 : 100.0 * ms_setup_args / denom2);
+        printf("Other           : %6.2f%%\n",
+               zero_total2 ? 0.0 : 100.0 * ms_blocking / denom2);
     printf("\n");
 
     /* optional roundtrip verification only when --verify set */
@@ -1902,8 +2123,58 @@ int main(int argc, char** argv)
 
         cl_kernel krn_d = clCreateKernel(prog_d, "lzo1x_block_decompress", &err);
         CHECK(err);
-        cl_mem d_comp = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, out_sz, out_buf, &err); CHECK(err);
-        cl_mem d_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, (nblk + 1) * sizeof(cl_uint), off_arr, &err); CHECK(err);
+        /* Try to create device buffer using CL_MEM_COPY_HOST_PTR first; if driver rejects host pointer
+         * (returns CL_INVALID_HOST_PTR), fall back to explicit clEnqueueWriteBuffer to upload.
+         */
+        cl_mem d_comp;
+        unsigned char *packed = NULL;
+        /* If we removed the contiguous host compressed buffer earlier (zero-copy path),
+         * we must assemble a contiguous host buffer for verify: the device verify kernel
+         * expects contiguous compressed bytes with offsets matching `off_arr`.
+         */
+        if (out_buf == NULL && out_sz > 0 && dev_out != NULL) {
+            /* allocate and pack compressed blocks from the dev_out mapped buffer */
+            packed = malloc(out_sz);
+            if (!packed) {
+                fprintf(stderr, "error: unable to allocate %zu bytes for verify packed buffer\n", out_sz);
+                free(off_arr);
+                clReleaseKernel(krn_d); clReleaseProgram(prog_d);
+                return 1;
+            }
+            for (size_t bi = 0; bi < (size_t)nblk; ++bi) {
+                size_t src_off = (size_t)bi * worst_blk;
+                uint32_t l = len_arr[bi];
+                if (l > 0 && src_off + l <= out_cap) {
+                    memcpy(packed + off_arr[bi], dev_out + src_off, l);
+                } else if (l > 0) {
+                    fprintf(stderr, "error: dev_out bounds exceeded while packing for verify\n");
+                    free(packed);
+                    free(off_arr);
+                    clReleaseKernel(krn_d); clReleaseProgram(prog_d);
+                    return 1;
+                }
+            }
+            /* Leave original out_buf untouched; use packed for upload instead. */
+        }
+
+        d_comp = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, out_sz, (packed ? packed : out_buf), &err);
+        if (err == CL_INVALID_HOST_PTR) {
+            /* fallback: create buffer without host pointer and upload via enqueue write */
+            d_comp = clCreateBuffer(ctx, CL_MEM_READ_ONLY, out_sz, NULL, &err);
+            CHECK(err);
+            CHECK(clEnqueueWriteBuffer(q, d_comp, CL_TRUE, 0, out_sz, (packed ? packed : out_buf), 0, NULL, NULL));
+        } else {
+            CHECK(err);
+        }
+        cl_mem d_off;
+        d_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, (nblk + 1) * sizeof(cl_uint), off_arr, &err);
+        if (err == CL_INVALID_HOST_PTR) {
+            d_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY, (nblk + 1) * sizeof(cl_uint), NULL, &err);
+            CHECK(err);
+            CHECK(clEnqueueWriteBuffer(q, d_off, CL_TRUE, 0, (nblk + 1) * sizeof(cl_uint), off_arr, 0, NULL, NULL));
+        } else {
+            CHECK(err);
+        }
         cl_mem d_out2 = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, in_sz, NULL, &err); CHECK(err);
         cl_mem d_out_lens = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, nblk * sizeof(cl_uint), NULL, &err); CHECK(err);
 
@@ -1942,6 +2213,7 @@ int main(int argc, char** argv)
         clReleaseMemObject(d_comp); clReleaseMemObject(d_off); clReleaseMemObject(d_out2); clReleaseMemObject(d_out_lens);
         clReleaseKernel(krn_d); clReleaseProgram(prog_d);
         free(off_arr); free(out2);
+        if (packed) free(packed);
     }
 
     /* cleanup */

@@ -52,18 +52,59 @@ static inline void LZO_MEMOPS_COPY8(__generic void *dd, const __generic void *ss
     }
 }
 
+/* 16-byte wide copy for improved decompression throughput.
+ * Uses uchar16 vector operations when available for literal and match copies.
+ */
+static inline void LZO_MEMOPS_COPY16(__generic void *dd, const __generic void *ss)
+{
+    if (lzo_ptr_aligned(dd,16) && lzo_ptr_aligned(ss,16)) {
+        if (sizeof(unsigned long) >= 8) {
+            *((__generic ulong*)dd) = *((__generic const ulong*)ss);
+            *((__generic ulong*)((__generic uchar*)dd + 8)) = *((__generic const ulong*)((__generic const uchar*)ss + 8));
+        } else {
+            uchar8 a = vload8(0, (__generic const uchar*)ss);
+            uchar8 b = vload8(8, (__generic const uchar*)ss);
+            vstore8(a,0,(__generic uchar*)dd);
+            vstore8(b,8,(__generic uchar*)dd);
+        }
+    } else {
+        uchar16 v = vload16(0, (__generic const uchar*)ss);
+        vstore16(v,0,(__generic uchar*)dd);
+    }
+}
+
 static inline void LZO_MEMOPS_COPYN(__generic void *dd, const __generic void *ss, uint nn)
 {
     __generic uchar *d = (__generic uchar*)dd;
     __generic const uchar *s = (__generic const uchar*)ss;
 
-    while (nn >= 8 && lzo_ptr_aligned(d,8) && lzo_ptr_aligned(s,8))
-    {   LZO_MEMOPS_COPY8(d,s); d+=8; s+=8; nn-=8; }
+    if (nn == 0) return;
 
-    while (nn >= 4 && lzo_ptr_aligned(d,4) && lzo_ptr_aligned(s,4))
-    {   LZO_MEMOPS_COPY4(d,s); d+=4; s+=4; nn-=4; }
-
-    for (; nn; --nn) *d++ = *s++;
+    /* memmove semantics: handle overlapping regions safely.
+     * If source starts after dest and overlaps (s > d && s < d + nn),
+     * copy backward to avoid clobbering source data. Otherwise copy forward.
+     */
+    if (s > d && s < d + nn) {
+        __generic uchar *de = d + nn;
+        __generic const uchar *se = s + nn;
+        /* backward wide-byte copy: 16 -> 8 -> 4 -> 1 byte operations */
+        while (nn >= 16 && lzo_ptr_aligned((void*)(de - 16),16) && lzo_ptr_aligned((void*)(se - 16),16)) {
+            de -= 16; se -= 16; LZO_MEMOPS_COPY16(de, se); nn -= 16; }
+        while (nn >= 8 && lzo_ptr_aligned((void*)(de - 8),8) && lzo_ptr_aligned((void*)(se - 8),8)) {
+            de -= 8; se -= 8; LZO_MEMOPS_COPY8(de, se); nn -= 8; }
+        while (nn >= 4 && lzo_ptr_aligned((void*)(de - 4),4) && lzo_ptr_aligned((void*)(se - 4),4)) {
+            de -= 4; se -= 4; LZO_MEMOPS_COPY4(de, se); nn -= 4; }
+        while (nn) { de--; se--; *de = *se; nn--; }
+    } else {
+        /* forward wide-byte copy: 16 -> 8 -> 4 -> 1 byte operations */
+        while (nn >= 16 && lzo_ptr_aligned(d,16) && lzo_ptr_aligned(s,16))
+        {   LZO_MEMOPS_COPY16(d,s); d+=16; s+=16; nn-=16; }
+        while (nn >= 8 && lzo_ptr_aligned(d,8) && lzo_ptr_aligned(s,8))
+        {   LZO_MEMOPS_COPY8(d,s); d+=8; s+=8; nn-=8; }
+        while (nn >= 4 && lzo_ptr_aligned(d,4) && lzo_ptr_aligned(s,4))
+        {   LZO_MEMOPS_COPY4(d,s); d+=4; s+=4; nn-=4; }
+        for (; nn; --nn) *d++ = *s++;
+    }
 }
 
 static inline uint lzo_memops_get_le32(const __generic void *pp)
@@ -88,6 +129,197 @@ static inline uint lzo_memops_get_le32(const __generic void *pp)
 #define UA_COPY8            LZO_MEMOPS_COPY8
 #define UA_COPYN            LZO_MEMOPS_COPYN
 #define UA_GET_LE32         LZO_MEMOPS_GET_LE32
+
+/* Optimized match copy with fast paths for short offsets (RLE, patterns)
+ * This function handles overlapping copies safely and uses vector operations
+ * for better throughput when offset allows.
+ */
+static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos, uint len)
+{
+    uint offset = op - m_pos;
+    __generic const uchar *end_src = m_pos + len;
+    int overlap = (m_pos < op && end_src > op);
+
+    /* Handle overlap first to preserve memmove semantics. */
+    if (overlap) {
+        /* If we have small repeating patterns we can safely expand from a
+         * precomputed vector; otherwise fall back to UA_COPYN which is memmove-safe.
+         */
+        if (offset == 1) {
+            uchar c = *m_pos;
+            uchar16 fill16 = (uchar16)(c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c);
+            uchar8 fill8 = (uchar8)(c,c,c,c,c,c,c,c);
+            while (len >= 16) {
+                vstore16(fill16, 0, op); op += 16; len -= 16;
+            }
+            while (len >= 8) { vstore8(fill8, 0, op); op += 8; len -= 8; }
+            while (len--) *op++ = c;
+            return;
+        }
+        else if (offset == 2 && len >= 8) {
+            uchar p0 = m_pos[0], p1 = m_pos[1];
+            uchar8 pat8 = (uchar8)(p0, p1, p0, p1, p0, p1, p0, p1);
+            while (len >= 8) { vstore8(pat8, 0, op); op += 8; len -= 8; }
+            while (len >= 2) { *op++ = p0; *op++ = p1; len -= 2; }
+            if (len) *op++ = p0;
+            return;
+        }
+        else if (offset == 3 && len >= 3) {
+            /* Safe memmove-like loop for a 3-byte repeating pattern in overlap case.
+             * Use scalar reads/writes while incrementing m_pos per memmove semantics.
+             */
+            while (len >= 3) {
+                *op++ = *m_pos++;
+                *op++ = *m_pos++;
+                *op++ = *m_pos++;
+                len -= 3;
+            }
+            if (len == 2) {
+                *op++ = *m_pos++;
+                *op++ = *m_pos++;
+            } else if (len == 1) {
+                *op++ = *m_pos++;
+            }
+            return;
+        }
+        else if (offset == 4 && len >= 8) {
+            uchar p0 = m_pos[0], p1 = m_pos[1], p2 = m_pos[2], p3 = m_pos[3];
+            uchar8 pat8 = (uchar8)(p0,p1,p2,p3,p0,p1,p2,p3);
+            while (len >= 8) { vstore8(pat8, 0, op); op += 8; len -= 8; }
+            while (len >= 4) { *(__generic uint*)op = *(__generic const uint*)m_pos; op += 4; len -= 4; }
+            while (len--) *op++ = *m_pos++;
+            return;
+        }
+        else if (offset == 6 && len >= 8) {
+            /* For overlapping offset==6, vload8/vstore8 is not memmove-safe because
+             * 8 is not a multiple of 6; fall back to memmove-safe copy.
+             */
+            UA_COPYN(op, m_pos, len);
+            return;
+        }
+        else if (offset == 8 && len >= 8) {
+            /* offset==8 is safe to copy in 8-byte chunks even in overlapping case: forward
+             * writes will read previously written chunks which match the original source and
+             * preserve the repeating pattern.
+             */
+            while (len >= 8) {
+                uchar8 v = vload8(0, m_pos);
+                vstore8(v, 0, op);
+                op += 8; m_pos += 8; len -= 8;
+            }
+            while (len--) *op++ = *m_pos++;
+            return;
+        }
+        else if (offset == 16 && len >= 16) {
+            /* offset==16 safe to copy in 16-byte chunks */
+            while (len >= 16) {
+                uchar16 v = vload16(0, m_pos);
+                vstore16(v, 0, op);
+                op += 16; m_pos += 16; len -= 16;
+            }
+            if (len >= 8) { uchar8 v = vload8(0, m_pos); vstore8(v, 0, op); op += 8; m_pos += 8; len -= 8; }
+            if (len >= 4) { uchar4 v = vload4(0, m_pos); vstore4(v, 0, op); op += 4; m_pos += 4; len -= 4; }
+            while (len--) *op++ = *m_pos++;
+            return;
+        }
+        /* Non-safe fast-path: fallback to memmove semantics */
+        UA_COPYN(op, m_pos, len);
+        return;
+    }
+
+    /* Long-distance match: safe to use vector copies */
+    if (offset >= 16) {
+        /* 16-byte vector copy */
+        while (len >= 16) {
+            uchar16 v = vload16(0, m_pos);
+            vstore16(v, 0, op);
+            op += 16; m_pos += 16; len -= 16;
+        }
+        /* 8-byte vector copy */
+        if (len >= 8) {
+            uchar8 v = vload8(0, m_pos);
+            vstore8(v, 0, op);
+            op += 8; m_pos += 8; len -= 8;
+        }
+        /* 4-byte vector copy */
+        if (len >= 4) {
+            uchar4 v = vload4(0, m_pos);
+            vstore4(v, 0, op);
+            op += 4; m_pos += 4; len -= 4;
+        }
+    }
+    /* Medium-distance match: can use 8-byte vector */
+    else if (offset >= 8) {
+        while (len >= 8) {
+            uchar8 v = vload8(0, m_pos);
+            vstore8(v, 0, op);
+            op += 8; m_pos += 8; len -= 8;
+        }
+        if (len >= 4) {
+            uchar4 v = vload4(0, m_pos);
+            vstore4(v, 0, op);
+            op += 4; m_pos += 4; len -= 4;
+        }
+    }
+    /* Short-distance match: (no overlap) may still benefit from special handling */
+    else if (offset > 0) {
+        /* RLE mode: offset=1 is byte repetition */
+        if (offset == 1) {
+            uchar c = *m_pos;
+            uchar16 fill16 = (uchar16)(c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c);
+            uchar8 fill8 = (uchar8)(c,c,c,c,c,c,c,c);
+            while (len >= 16) {
+                vstore16(fill16, 0, op);
+                op += 16; len -= 16;
+            }
+            while (len >= 8) {
+                vstore8(fill8, 0, op);
+                op += 8; len -= 8;
+            }
+            while (len--) *op++ = c;
+            return;
+        }
+        /* offset=2: repeat 2-byte pattern */
+        if (offset == 2 && len >= 8) {
+            uchar p0 = m_pos[0]; uchar p1 = m_pos[1];
+            uchar8 pat8 = (uchar8)(p0, p1, p0, p1, p0, p1, p0, p1);
+            while (len >= 8) {
+                vstore8(pat8, 0, op);
+                op += 8; m_pos += 8; len -= 8;
+            }
+        }
+        /* offset=3: repeat 3-byte pattern */
+        else if (offset == 3 && len >= 6) {
+            uchar c0 = m_pos[0], c1 = m_pos[1], c2 = m_pos[2];
+            while (len >= 3) {
+                op[0] = c0; op[1] = c1; op[2] = c2;
+                op += 3; len -= 3;
+            }
+        }
+        /* offset=4: repeat 4-byte pattern */
+        else if (offset == 4 && len >= 8) {
+            uchar p0 = m_pos[0], p1 = m_pos[1], p2 = m_pos[2], p3 = m_pos[3];
+            uchar8 pat8 = (uchar8)(p0, p1, p2, p3, p0, p1, p2, p3);
+            while (len >= 8) {
+                vstore8(pat8, 0, op);
+                op += 8; m_pos += 8; len -= 8;
+            }
+        }
+        /* offset=5: cannot safely use vload8, fallthrough to scalar copy */
+        /* offset=6: fast path using 8-byte pat8 constructed from m_pos */
+        else if (offset == 6 && len >= 8) {
+            uchar p0 = m_pos[0], p1 = m_pos[1], p2 = m_pos[2], p3 = m_pos[3], p4 = m_pos[4], p5 = m_pos[5];
+            uchar8 pat8 = (uchar8)(p0, p1, p2, p3, p4, p5, p0, p1);
+            while (len >= 8) {
+                vstore8(pat8, 0, op);
+                op += 8; m_pos += 8; len -= 8;
+            }
+        }
+    }
+
+    /* Tail byte-by-byte copy */
+    while (len--) *op++ = *m_pos++;
+}
 
 /* common helper macros used by decompressor */
 #define pd(a,b)             ((lzo_uint) ((a)-(b)))
@@ -120,7 +352,8 @@ lzo1x_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint  in_len,
         t = *ip++ - 17;
         if (t < 4)
             goto match_next;
-        do *op++ = *ip++; while (--t > 0);
+        UA_COPYN(op, ip, (uint)t);
+        op += t; ip += t;
         goto first_literal_run;
     }
 
@@ -138,8 +371,12 @@ lzo1x_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint  in_len,
             }
             t += 15 + *ip++;
         }
-        *op++ = *ip++; *op++ = *ip++; *op++ = *ip++;
-        do *op++ = *ip++; while (--t > 0);
+        /* copy 3 initial bytes + t more bytes (total 3 + t) */
+        {
+            uint copy_len = (uint)(3 + t);
+            UA_COPYN(op, ip, copy_len);
+            op += copy_len; ip += copy_len;
+        }
     first_literal_run:
         t = *ip++;
         if (t >= 16)
@@ -209,8 +446,11 @@ lzo1x_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint  in_len,
                 goto match_done;
             }
         copy_match:
-            *op++ = *m_pos++; *op++ = *m_pos++;
-            do *op++ = *m_pos++; while (--t > 0);
+            {
+                uint copy_len = (uint)(2 + t);
+                COPY_MATCH(op, m_pos, copy_len);
+                op += copy_len; m_pos += copy_len;
+            }
 
         match_done:
             t = ip[-2] & 3;

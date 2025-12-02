@@ -66,7 +66,7 @@ help:
 	@echo "  make precompile KERNEL=<name> -> precompile one kernel (basename, no .cl)";
 	@echo "  make precompile-all -> precompile all kernel sources into .bin files";
 	@echo "  make check-opencl -> quick compile/link check for OpenCL headers and library";
-	@echo "  make testdata [OUTDIR=../samples] -> generate test data suite (calls generate-test-data.py --suite)";
+	@echo "  make testdata [OUTDIR=../samples] -> generate test data suite (calls ../tools/generate-test-data.py --suite)";
 
 
 check-opencl:
@@ -100,7 +100,7 @@ check-opencl:
 # generate test data suite. Default OUTDIR=../samples so generated data lives at repo root samples/
 testdata:
 	@OUTDIR=$${OUTDIR:-../samples}; \
-	python3 generate-test-data.py --suite --out-dir "$$OUTDIR" || (echo "failed to generate test data"; exit 1)
+	python3 ../tools/generate-test-data.py --suite --out-dir "$$OUTDIR" || (echo "failed to generate test data"; exit 1)
 
 clean:
 	rm -f build_kernel lzo_gpu lzo_gpu_daemon lzo_gpu_client *.bin

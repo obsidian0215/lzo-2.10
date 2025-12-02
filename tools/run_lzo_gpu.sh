@@ -287,7 +287,7 @@ EOF
   analyze)
     echo "Aggregating param-scan results into $LZO_GPU_LOGS/summary.csv"
     mkdir -p "$LZO_GPU_LOGS/param_scans"
-    python3 "$TOOLS/analyze.py" -i "$LZO_GPU_LOGS/param_scans" -o "$LZO_GPU_LOGS/summary.csv"
+    python3 "$TOOLS/analysis.py" analyze -i "$LZO_GPU_LOGS/param_scans" -o "$LZO_GPU_LOGS/summary.csv"
     echo "Analysis complete; outputs under $LZO_GPU_LOGS"
     ;;
 

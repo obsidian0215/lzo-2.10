@@ -10,6 +10,8 @@
  */
 
 #include <CL/cl.h>
+#include "timing.h"
+#include "lzo_defaults.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +53,36 @@ typedef struct {
     size_t len; /* length to read */
     int err;    /* errno on failure, 0 on success */
 } mt_io_arg_t;
+
+/* Async upload context for daemon: same idea as standalone — hold events,
+ * host buffer pointer and a completion timestamp pointer, and a reaper
+ * thread will wait for write events, free host buffer, then wait for a
+ * kernel-enqueue signal before releasing events.
+ */
+typedef struct async_upload_ctx {
+    cl_event *events;
+    int n;
+    void *host_ptr; /* pointer to host buffer to free when upload finished */
+    uint64_t *t_upload_end_ptr;
+} async_upload_ctx_t;
+
+static void* async_upload_reaper(void *v) {
+    async_upload_ctx_t *ctx = (async_upload_ctx_t*)v;
+    if (!ctx) return NULL;
+    /* Lightweight debug log to help trace async upload lifecycle */
+    fprintf(stderr, "[DAEMON] async_upload_reaper: events=%p n=%d host_ptr=%p t_ptr=%p\n",
+            (void*)ctx->events, ctx->n, ctx->host_ptr, (void*)ctx->t_upload_end_ptr);
+    if (ctx->n > 0 && ctx->events) {
+        if (getenv("LZO_DEBUG")) fprintf(stderr, "[DAEMON][REAPER] waiting for %d events at %p\n", ctx->n, (void*)ctx->events);
+        clWaitForEvents(ctx->n, ctx->events);
+        if (getenv("LZO_DEBUG")) fprintf(stderr, "[DAEMON][REAPER] wait complete for events %p\n", (void*)ctx->events);
+    }
+    if (ctx->t_upload_end_ptr) *ctx->t_upload_end_ptr = now_ns();
+    if (ctx->host_ptr) {
+        fprintf(stderr, "[DAEMON][REAPER] freeing host_ptr=%p\n", ctx->host_ptr);
+        free(ctx->host_ptr); ctx->host_ptr = NULL; }
+    return NULL;
+}
 
 static void* mt_pread_worker(void *v) {
     mt_io_arg_t *a = (mt_io_arg_t*)v;
@@ -172,11 +204,35 @@ static void* read_file_data(const char* path, size_t* size_out) {
 static int write_compressed_file(const char* path,
                                  size_t orig_size, size_t blk_size,
                                  size_t nblk, const unsigned int* lens,
-                                 const void* sparse_data, size_t worst_blk) {
+                                 const void* sparse_data, size_t worst_blk,
+                                 int coalesce, size_t coalesce_chunk_mb, size_t coalesce_max_mb,
+                                 size_t stdio_buf_mb) {
     FILE* f = fopen(path, "wb");
     if (!f) {
         perror("fopen");
         return -1;
+    }
+
+    /* 配置 stdio 缓冲区大小，降低 fwrite 小块写入带来的 syscalls 波动。
+     * 默认 LZO_DEFAULT_STDIO_BUF_MB=4MB。不要从环境中读值以减少 env 变量。
+     */
+    int debug = getenv("LZO_DEBUG") != NULL;
+    size_t comp_total = 0;
+    for (size_t i = 0; i < nblk; i++) comp_total += lens[i];
+    size_t buf_mb = stdio_buf_mb;
+    size_t vsize = buf_mb * 1024 * 1024;
+    if (vsize == 0) vsize = 4 * 1024 * 1024;
+    if (vsize > comp_total && comp_total > 0) vsize = comp_total;
+    char *vbuf = NULL;
+    if (vsize > 0) {
+        vbuf = (char*)malloc(vsize);
+        if (vbuf) {
+            /* best-effort: if setvbuf fails just continue with defaults */
+            if (setvbuf(f, vbuf, _IOFBF, (int)vsize) != 0) {
+                free(vbuf);
+                vbuf = NULL;
+            }
+        }
     }
 
     // 写入头部
@@ -196,18 +252,170 @@ static int write_compressed_file(const char* path,
 
     // 写入压缩数据 (Scatter-Gather from sparse buffer)
     const unsigned char* dev_out = (const unsigned char*)sparse_data;
-    for (size_t i = 0; i < nblk; i++) {
-        if (lens[i] > 0) {
-            size_t dev_off = i * worst_blk;
-            if (fwrite(dev_out + dev_off, 1, lens[i], f) != lens[i]) {
-                perror("fwrite block");
+
+    /* Default: enable coalescing; avoid attempting full coalesces for outputs
+     * larger than LZO_DEFAULT_COALESCE_MAX_MB to avoid OOM or excessively large
+     * allocations. Chunk size is LZO_DEFAULT_COALESCE_CHUNK_MB for fallback.
+     */
+    /* coalesce/coalesce_max/coalesce_chunk_mb/stdio_buf_mb are passed as parameters */
+    /* coalesce variable is already the value of the parameter */
+    int profile_writes = debug; /* profile write diagnostics gated by debug flag */
+
+    if (coalesce && comp_total > 0) {
+        /* If total compressed size is larger than the permitted single-coalesce threshold,
+         * avoid attempting a single large allocation and go straight to chunked coalesce.
+         */
+        size_t threshold_bytes = coalesce_max_mb * 1024 * 1024;
+        unsigned char* contig = NULL;
+        int attempted_full_coalesce = 0;
+        if (threshold_bytes == 0 || comp_total <= threshold_bytes) {
+            attempted_full_coalesce = 1;
+            contig = (unsigned char*)malloc(comp_total);
+        }
+            if (contig) {
+                if (debug) fprintf(stderr, "[DAEMON] COALESCE: full contiguous allocation success size=%zu bytes\n", comp_total);
+            uint64_t t_copy_start = now_ns();
+            size_t pos = 0;
+            for (size_t i = 0; i < nblk; ++i) {
+                if (lens[i] > 0) {
+                    size_t dev_off = i * worst_blk;
+                    memcpy(contig + pos, dev_out + dev_off, lens[i]);
+                    pos += lens[i];
+                }
+            }
+            uint64_t t_copy_end = now_ns();
+            uint64_t t_write_start_blk = now_ns();
+            if (fwrite(contig, 1, comp_total, f) != comp_total) {
+                perror("fwrite contiguous");
+                free(contig);
                 fclose(f);
+                if (vbuf) { free(vbuf); vbuf = NULL; }
                 return -1;
+            }
+            uint64_t t_write_end_blk = now_ns();
+            if (profile_writes) {
+                fprintf(stderr, "COALESCE_COPY: %.3f ms\n", (t_copy_end - t_copy_start)/1e6);
+                fprintf(stderr, "COALESCE_WRITE: %.3f ms\n", (t_write_end_blk - t_write_start_blk)/1e6);
+            }
+            free(contig);
+        } else {
+            if (debug) fprintf(stderr, "[DAEMON] COALESCE: full contiguous allocation failed, attempting chunked coalesce\n");
+            /* allocation failed - try a chunked coalesce approach to avoid many small fwrite syscalls
+             * This attempts to allocate a modest chunk buffer and stream groups of blocks into it,
+             * falling back to per-block writes only if that also fails.
+             */
+            size_t chunk_mb = coalesce_chunk_mb; /* default chunk size 16MB or override */
+            size_t chunk_size = chunk_mb * 1024 * 1024;
+            if (chunk_size == 0) chunk_size = 16 * 1024 * 1024;
+            unsigned char* chunk = (unsigned char*)malloc(chunk_size);
+            if (chunk) {
+                if (debug) fprintf(stderr, "[DAEMON] COALESCE: chunk buffer allocation success chunk_mb=%zu chunk_size=%zu bytes\n", chunk_mb, chunk_size);
+                size_t used = 0;
+                uint64_t t_copy_total_start = now_ns();
+                for (size_t i = 0; i < nblk; ++i) {
+                    if (lens[i] == 0) continue;
+                    size_t dev_off = i * worst_blk;
+                    /* if single block larger than chunk and chunk empty, write it directly */
+                    if (lens[i] > chunk_size && used == 0) {
+                        uint64_t t1 = now_ns();
+                        if (fwrite(dev_out + dev_off, 1, lens[i], f) != lens[i]) {
+                            perror("fwrite block large");
+                            free(chunk);
+                            fclose(f);
+                            if (vbuf) { free(vbuf); vbuf = NULL; }
+                            return -1;
+                        }
+                        uint64_t t2 = now_ns();
+                        if (profile_writes) fprintf(stderr, "BLOCK_WRITE %zu len=%u : %.3f ms\n", i, lens[i], (t2 - t1)/1e6);
+                        continue;
+                    }
+                    /* if not enough room, flush current chunk */
+                    if (used + lens[i] > chunk_size) {
+                        uint64_t t_write_chunk_start = now_ns();
+                        if (fwrite(chunk, 1, used, f) != used) {
+                            perror("fwrite chunk");
+                            free(chunk);
+                            fclose(f);
+                            if (vbuf) { free(vbuf); vbuf = NULL; }
+                            return -1;
+                        }
+                        uint64_t t_write_chunk_end = now_ns();
+                        if (profile_writes) fprintf(stderr, "CHUNK_WRITE: %.3f ms (bytes=%zu)\n", (t_write_chunk_end - t_write_chunk_start)/1e6, used);
+                        used = 0;
+                    }
+                    memcpy(chunk + used, dev_out + dev_off, lens[i]);
+                    used += lens[i];
+                }
+                /* flush remainder */
+                if (used > 0) {
+                    uint64_t t_write_chunk_start = now_ns();
+                    if (fwrite(chunk, 1, used, f) != used) {
+                        perror("fwrite chunk final");
+                        free(chunk);
+                        fclose(f);
+                        if (vbuf) { free(vbuf); vbuf = NULL; }
+                        return -1;
+                    }
+                    uint64_t t_write_chunk_end = now_ns();
+                    if (profile_writes) fprintf(stderr, "CHUNK_WRITE: %.3f ms (bytes=%zu)\n", (t_write_chunk_end - t_write_chunk_start)/1e6, used);
+                }
+                free(chunk);
+            } else {
+                if (debug) fprintf(stderr, "[DAEMON] COALESCE: chunk allocation failed, falling back to per-block writes\n");
+                /* fallback to scatter writes */
+                fprintf(stderr, "[DAEMON] warning: coalesce allocation and chunk alloc both failed (%zu bytes), falling back to per-block writes\n", comp_total);
+                for (size_t i = 0; i < nblk; i++) {
+                    if (lens[i] > 0) {
+                        size_t dev_off = i * worst_blk;
+                        if (profile_writes) {
+                            uint64_t t1 = now_ns();
+                            if (fwrite(dev_out + dev_off, 1, lens[i], f) != lens[i]) {
+                                perror("fwrite block");
+                                fclose(f);
+                                return -1;
+                            }
+                            uint64_t t2 = now_ns();
+                            fprintf(stderr, "BLOCK_WRITE %zu len=%u : %.3f ms\n", i, lens[i], (t2 - t1)/1e6);
+                        } else {
+                            if (fwrite(dev_out + dev_off, 1, lens[i], f) != lens[i]) {
+                                perror("fwrite block");
+                                fclose(f);
+                                return -1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        for (size_t i = 0; i < nblk; i++) {
+            if (lens[i] > 0) {
+                size_t dev_off = i * worst_blk;
+                if (profile_writes) {
+                    uint64_t t1 = now_ns();
+                    if (fwrite(dev_out + dev_off, 1, lens[i], f) != lens[i]) {
+                        perror("fwrite block");
+                        fclose(f);
+                        return -1;
+                    }
+                    uint64_t t2 = now_ns();
+                    fprintf(stderr, "BLOCK_WRITE %zu len=%u : %.3f ms\n", i, lens[i], (t2 - t1)/1e6);
+                } else {
+                    if (fwrite(dev_out + dev_off, 1, lens[i], f) != lens[i]) {
+                        perror("fwrite block");
+                        fclose(f);
+                        return -1;
+                    }
+                }
             }
         }
     }
 
     fclose(f);
+    if (vbuf) {
+        free(vbuf);
+        vbuf = NULL;
+    }
     return 0;
 }
 
@@ -229,9 +437,10 @@ static cl_mem get_or_create_buffer(cl_context ctx, cl_mem* cached_buf, size_t* c
             *cached_buf = NULL;
             *cached_size = 0;
         }
-        /* Phase 6.1: 使用Pinned Memory */
-        *cached_buf = clCreateBuffer(ctx, flags | CL_MEM_ALLOC_HOST_PTR,
-                                     required_size, NULL, err_out);
+        /* Always use pinned host mapping for buffers to preserve zero-copy path */
+        cl_mem_flags create_flags = flags | CL_MEM_ALLOC_HOST_PTR;
+        *cached_buf = clCreateBuffer(ctx, create_flags,
+                 required_size, NULL, err_out);
         if (*err_out == CL_SUCCESS) {
             *cached_size = required_size;
         }
@@ -346,24 +555,47 @@ int daemon_compress(
     const char* output_path,
     int level,                // 压缩级别 1-9
     /* options */
-    int standard_copy, int mt_io, int mt_threads, int fixed_block_kb, int force_map,
+    int standard_copy, int mt_io, int mt_threads, int fixed_block_kb, int async_upload,
+    /* per-request overrides */
+    int coalesce_output, int coalesce_chunk_mb, int coalesce_max_mb, int stdio_buf_mb,
     /* 输出统计 */
     unsigned long* time_us_out,  // 总时间(微秒)
     size_t* output_size_out,
-    /* 详细时间输出(微秒) */
-    unsigned long* read_us_out,
-    unsigned long* buffer_us_out,
-    unsigned long* upload_us_out,
-    unsigned long* kernel_us_out,
-    unsigned long* download_us_out,
-    unsigned long* write_us_out,
-    unsigned long* cleanup_us_out
+    /* 详细时间输出(微秒) - per-stage fields bundle */
+    timing_t* t_out
 ) {
     cl_int err;
     uint64_t t_total_start = now_ns();
 
     /* Debug开关 */
     int debug = getenv("LZO_DEBUG") != NULL;
+
+    /* Apply per-request overrides for coalescing and stdio buffer.
+     * Pass-through semantics: -1 means unspecified (use daemon-level env override -> compile-time defaults)
+     * To allow administrators to alter daemon-default behavior without patching, we honor these
+     * environment variables (if present): LZO_COALESCE_OUTPUT, LZO_COALESCE_MAX_MB,
+     * LZO_COALESCE_CHUNK_MB, LZO_STDIO_BUF_MB. If not present, fall back to compiled-in defaults.
+     */
+    const char* sopt = NULL;
+    int default_coalesce = LZO_DEFAULT_COALESCE_OUTPUT;
+    if ((sopt = getenv("LZO_COALESCE_OUTPUT"))) default_coalesce = (atoi(sopt) != 0) ? 1 : 0;
+    size_t default_coalesce_max_mb = (size_t)LZO_DEFAULT_COALESCE_MAX_MB;
+    if ((sopt = getenv("LZO_COALESCE_MAX_MB"))) {
+        int v = atoi(sopt); if (v > 0) default_coalesce_max_mb = (size_t)v;
+    }
+    size_t default_coalesce_chunk_mb = (size_t)LZO_DEFAULT_COALESCE_CHUNK_MB;
+    if ((sopt = getenv("LZO_COALESCE_CHUNK_MB"))) {
+        int v = atoi(sopt); if (v > 0) default_coalesce_chunk_mb = (size_t)v;
+    }
+    size_t default_stdio_buf_mb = (size_t)LZO_DEFAULT_STDIO_BUF_MB;
+    if ((sopt = getenv("LZO_STDIO_BUF_MB"))) {
+        int v = atoi(sopt); if (v > 0) default_stdio_buf_mb = (size_t)v;
+    }
+
+    int coalesce = (coalesce_output == -1) ? default_coalesce : coalesce_output;
+    size_t coalesce_max_mb_local = (coalesce_max_mb == -1) ? default_coalesce_max_mb : (size_t)coalesce_max_mb;
+    size_t coalesce_chunk_mb_local = (coalesce_chunk_mb == -1) ? default_coalesce_chunk_mb : (size_t)coalesce_chunk_mb;
+    size_t stdio_buf_mb_local = (stdio_buf_mb == -1) ? default_stdio_buf_mb : (size_t)stdio_buf_mb;
 
     // 1. 获取文件大小
     uint64_t t_read_start = now_ns();
@@ -390,9 +622,9 @@ int daemon_compress(
     }
 
     /* Decide whether to use standard copy or zero-copy (mapping).
-     * client can request standard_copy; force_map overrides
+     * client requests standard_copy (explicit uploads) when set; default is zero-copy (mapping).
      */
-    int use_standard_copy = standard_copy && !force_map ? 1 : 0;
+    int use_standard_copy = standard_copy ? 1 : 0;
 
     void* mapped_in = NULL;
     if (!use_standard_copy) {
@@ -413,6 +645,12 @@ int daemon_compress(
     unsigned long read_us = 0;
     unsigned long upload_us = 0;
     void* host_in = NULL;
+    /* async upload bookkeeping (visible across scopes) */
+    uint64_t t_upload_start2 = 0;
+    int reaper_started = 0;
+    pthread_t upload_reaper_tid = 0;
+    async_upload_ctx_t *upload_ctx = NULL;
+    uint64_t *t_upload_end_ptr = NULL;
 
     if (!use_standard_copy) {
         /* Zero-copy path: read directly into mapped_in. Support mt_io (pread workers) */
@@ -500,8 +738,7 @@ after_zero_read:
 
     } else {
         /* Standard-copy path: read into host buffer then upload via clEnqueueWriteBuffer */
-        /* allocate aligned host buffer */
-        void* host_in = NULL;
+        /* allocate aligned host buffer into the outer-scoped `host_in` */
         int rc_mem = posix_memalign(&host_in, ALIGN_BYTES, in_sz);
         if (rc_mem != 0 || host_in == NULL) {
             /* fallback to malloc */
@@ -584,6 +821,7 @@ after_std_read:
          * Upload will be performed after choose_blocking_adaptive so that the
          * blocking decision uses the raw host data.
          */
+        /* host_in now points to the allocated buffer (no shadowing) */
     }
 
     // 4. Phase 7.2: 自适应分块策略
@@ -620,39 +858,112 @@ after_std_read:
         /* upload_us remains 0 for zero-copy */
     } else {
         /* perform upload of host_in -> d_in now (measuring time) */
-        uint64_t t_upload_start2 = now_ns();
+        t_upload_start2 = now_ns();
+        /* async upload bookkeeping: reuse outer-scope variables declared above */
         if (mt_io && mt_threads > 1) {
             int nthreads = mt_threads;
             if (nthreads < 1) nthreads = 1;
             if (nthreads > 32) nthreads = 32;
             cl_event *evts = malloc(sizeof(cl_event) * nthreads);
+            int ev_count = 0;
             size_t piece = (in_sz + nthreads - 1) / nthreads;
             for (int i = 0; i < nthreads; ++i) {
                 size_t off = (size_t)i * piece;
                 size_t len = (off + piece > in_sz) ? (in_sz - off) : piece;
-                if (len == 0) { evts[i] = NULL; continue; }
-                err = clEnqueueWriteBuffer(queue, d_in, CL_FALSE, off, len, (char*)host_in + off, 0, NULL, &evts[i]);
+                if (len == 0) { continue; }
+                err = clEnqueueWriteBuffer(queue, d_in, CL_FALSE, off, len, (char*)host_in + off, 0, NULL, &evts[ev_count]);
+                if (err == CL_SUCCESS) {
+                    if (debug) fprintf(stderr, "[DAEMON] enqueued write evt[%d] off=%zu len=%zu\n", ev_count, off, len);
+                    ev_count++;
+                } else {
+                    fprintf(stderr, "[DAEMON] clEnqueueWriteBuffer failed (segment) : %d\n", err);
+                    /* immediate cleanup on failure */
+                    for (int j = 0; j < ev_count; ++j) if (evts[j]) clReleaseEvent(evts[j]);
+                    free(evts);
+                    free(host_in);
+                    return -1;
+                }
+            }
+                if (async_upload) {
+                    if (ev_count == 0) {
+                        /* Nothing was enqueued (all zero-length); treat as completed */
+                        if (debug) fprintf(stderr, "[DAEMON] async_upload requested but ev_count==0, skipping reaper\n");
+                        upload_us = 0;
+                        free(evts);
+                        free(host_in);
+                        host_in = NULL;
+                        goto after_std_read_upload_done;
+                    }
+                /* spawn a reaper thread to wait for enqueued writes and free host buffer */
+                t_upload_end_ptr = malloc(sizeof(uint64_t)); *t_upload_end_ptr = 0;
+                upload_ctx = calloc(1, sizeof(async_upload_ctx_t));
+                /* only pass the real number of events (non-zero partitions) */
+                upload_ctx->events = evts;
+                upload_ctx->n = ev_count;
+                upload_ctx->host_ptr = host_in; /* will be freed by reaper */
+                upload_ctx->t_upload_end_ptr = t_upload_end_ptr;
+                /* main thread will join/cleanup ctx and events */
+                if (pthread_create(&upload_reaper_tid, NULL, async_upload_reaper, upload_ctx) != 0) {
+                    /* fallback to blocking behavior */
+                    clWaitForEvents(ev_count, evts);
+                    *t_upload_end_ptr = now_ns();
+                    for (int i = 0; i < ev_count; ++i) if (evts[i]) clReleaseEvent(evts[i]);
+                    free(evts);
+                    free(t_upload_end_ptr); t_upload_end_ptr = NULL;
+                    free(upload_ctx); upload_ctx = NULL;
+                } else {
+                    reaper_started = 1; /* reaper handles host_in free */
+                }
+            } else {
+                clWaitForEvents(ev_count, evts);
+                for (int i = 0; i < ev_count; ++i) if (evts[i]) clReleaseEvent(evts[i]);
+                free(evts);
+                free(host_in); host_in = NULL;
+            }
+        } else {
+            if (async_upload) {
+                cl_event *evts = malloc(sizeof(cl_event));
+                err = clEnqueueWriteBuffer(queue, d_in, CL_FALSE, 0, in_sz, host_in, 0, NULL, &evts[0]);
                 if (err != CL_SUCCESS) {
                     fprintf(stderr, "[DAEMON] clEnqueueWriteBuffer failed: %d\n", err);
                     free(evts); free(host_in);
                     return -1;
                 }
-            }
-            clWaitForEvents(nthreads, evts);
-            for (int i = 0; i < nthreads; ++i) if (evts[i]) clReleaseEvent(evts[i]);
-            free(evts);
-        } else {
-            err = clEnqueueWriteBuffer(queue, d_in, CL_TRUE, 0, in_sz, host_in, 0, NULL, NULL);
-            if (err != CL_SUCCESS) {
-                fprintf(stderr, "[DAEMON] clEnqueueWriteBuffer failed: %d\n", err);
-                free(host_in);
-                return -1;
+                t_upload_end_ptr = malloc(sizeof(uint64_t)); *t_upload_end_ptr = 0;
+                upload_ctx = calloc(1, sizeof(async_upload_ctx_t));
+                upload_ctx->events = evts;
+                upload_ctx->n = 1;
+                upload_ctx->host_ptr = host_in; /* reaper will free */
+                upload_ctx->t_upload_end_ptr = t_upload_end_ptr;
+                /* main thread will join/cleanup ctx and events */
+                if (pthread_create(&upload_reaper_tid, NULL, async_upload_reaper, upload_ctx) != 0) {
+                    /* fallback to blocking */
+                    clWaitForEvents(1, evts);
+                    *t_upload_end_ptr = now_ns();
+                    clReleaseEvent(evts[0]); free(evts);
+                    free(t_upload_end_ptr); t_upload_end_ptr = NULL;
+                    free(upload_ctx); upload_ctx = NULL;
+                    free(host_in); host_in = NULL;
+                } else {
+                    reaper_started = 1;
+                }
+            } else {
+                err = clEnqueueWriteBuffer(queue, d_in, CL_TRUE, 0, in_sz, host_in, 0, NULL, NULL);
+                if (err != CL_SUCCESS) {
+                    fprintf(stderr, "[DAEMON] clEnqueueWriteBuffer failed: %d\n", err);
+                    free(host_in);
+                    return -1;
+                }
             }
         }
+    after_std_read_upload_done:
         uint64_t t_upload_end2 = now_ns();
         upload_us = (t_upload_end2 - t_upload_start2) / 1000;
-        /* free host buffer */
-        free(host_in);
+        /* free host buffer only when a reaper did not take ownership */
+        if (!reaper_started && host_in) {
+            free(host_in);
+            host_in = NULL;
+        }
     }
 
     size_t worst_blk = lzo_worst(blk);
@@ -721,8 +1032,14 @@ after_std_read:
     */
 
     cl_event evt;
-    err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &gsz, &lsz,
-                                 0, NULL, &evt);
+    if (upload_ctx && upload_ctx->n > 0 && upload_ctx->events) {
+        err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &gsz, &lsz,
+                                     upload_ctx->n, upload_ctx->events, &evt);
+        /* reaper will not free events/ctx; main will cleanup after join */
+    } else {
+        err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &gsz, &lsz,
+                                     0, NULL, &evt);
+    }
     CHECK(err);
     // fprintf(stderr, "[DEBUG-KERNEL] clEnqueueNDRangeKernel返回: %d\n", err);
 
@@ -793,13 +1110,34 @@ after_std_read:
     uint64_t t_write_start = now_ns();
     int write_ret = write_compressed_file(output_path,
                                          in_sz, blk, nblk, len_arr,
-                                         mapped_out, worst_blk);
+                                         mapped_out, worst_blk,
+                                         coalesce, coalesce_chunk_mb_local, coalesce_max_mb_local,
+                                         stdio_buf_mb_local);
 
     /* Unmap after writing */
     CHECK(clEnqueueUnmapMemObject(queue, d_out, mapped_out, 0, NULL, NULL));
 
     uint64_t t_write_end = now_ns();
     unsigned long write_us = (t_write_end - t_write_start) / 1000;
+
+    // 如果我们启动了异步上传 reaper，先 join 它以获取上传完成时间
+    if (reaper_started && upload_reaper_tid) {
+        pthread_join(upload_reaper_tid, NULL);
+        upload_reaper_tid = 0;
+        if (t_upload_end_ptr) {
+            uint64_t t_upload_end = *t_upload_end_ptr;
+            upload_us = (t_upload_end - t_upload_start2) / 1000;
+            free(t_upload_end_ptr); t_upload_end_ptr = NULL;
+        }
+        /* release events & free ctx (reaper freed host buffer) */
+        if (upload_ctx) {
+            if (upload_ctx->events) {
+                for (int _i = 0; _i < upload_ctx->n; ++_i) if (upload_ctx->events[_i]) clReleaseEvent(upload_ctx->events[_i]);
+                free(upload_ctx->events); upload_ctx->events = NULL; upload_ctx->n = 0;
+            }
+            free(upload_ctx); upload_ctx = NULL;
+        }
+    }
 
     // 11. 清理临时内存
     uint64_t t_cleanup_start = now_ns();
@@ -841,13 +1179,26 @@ after_std_read:
 
     *time_us_out = total_us;
     *output_size_out = comp_total;
-    *read_us_out = read_us;
-    *buffer_us_out = buffer_us;
-    *upload_us_out = upload_us;  // 实际为0（直接 fread 到 Pinned Memory）
-    *kernel_us_out = kernel_setup_us + kernel_exec_us;
-    *download_us_out = download_us;
-    *write_us_out = write_us;
-    *cleanup_us_out = cleanup_us;
+    if (t_out) {
+        t_out->file_read_us = read_us;
+        /* daemon preinitializes OpenCL at startup - do not count OCL init per-request */
+        t_out->ocl_init_us = 0;
+        /* kernel programs are pre-loaded during daemon startup */
+        t_out->kernel_load_us = 0;
+        t_out->blocking_calc_us = blocking_us;
+        t_out->buffer_alloc_in_us = buffer_in_us;
+        t_out->data_upload_us = upload_us;
+        t_out->buffer_alloc_out_us = buffer_out_us;
+        t_out->buffer_alloc_len_us = buffer_len_us;
+        t_out->setup_args_us = kernel_setup_us;
+        t_out->kernel_setup_us = kernel_setup_us;
+        t_out->kernel_exec_us = kernel_exec_us;
+        t_out->download_len_us = download_len_us;
+        t_out->download_bulk_us = download_bulk_us;
+        t_out->download_total_us = download_us;
+        t_out->file_write_us = write_us;
+        t_out->cleanup_us = cleanup_us;
+    }
 
     /* 输出统计信息 (always print for consistency) */
     double ratio = comp_total > 0 ? (double)in_sz / (double)comp_total : 0.0;
@@ -898,24 +1249,26 @@ after_std_read:
     fprintf(stderr, "TOTAL                  : %8.3f ms\n", total_us / 1000.0);
     fprintf(stderr, "\n");
 
-    /* 计算占比（对齐 standalone 格式）*/
-    fprintf(stderr, "=== Percentage Breakdown ===\n");
-    fprintf(stderr, "Kernel Exec     : %6.2f%%\n", 100.0 * kernel_exec_us / total_us);
-    fprintf(stderr, "Data Transfer   : %6.2f%% (upload=%.2f%% + download=%.2f%%)\n",
-           100.0 * (upload_us + download_us) / total_us,
-           100.0 * upload_us / total_us,
-           100.0 * download_us / total_us);
-    fprintf(stderr, "File I/O        : %6.2f%% (read=%.2f%% + write=%.2f%%)\n",
-           100.0 * (read_us + write_us) / total_us,
-           100.0 * read_us / total_us,
-           100.0 * write_us / total_us);
-    fprintf(stderr, "Buffer Alloc    : %6.2f%% (in=%.2f%% + out=%.2f%% + len=%.2f%%)\n",
-           100.0 * buffer_us / total_us,
-           100.0 * buffer_in_us / total_us,
-           100.0 * buffer_out_us / total_us,
-           100.0 * buffer_len_us / total_us);
-    fprintf(stderr, "Setup Args      : %6.2f%%\n", 100.0 * kernel_setup_us / total_us);
-    fprintf(stderr, "Blocking Calc   : %6.2f%%\n", 100.0 * blocking_us / total_us);
+        /* 计算占比（对齐 standalone 格式） - 保护除以零 */
+        double denom = (total_us > 0) ? (double)total_us : 1.0;
+        int zero_total = (total_us == 0);
+        fprintf(stderr, "=== Percentage Breakdown ===\n");
+        fprintf(stderr, "Kernel Exec     : %6.2f%%\n", zero_total ? 0.0 : 100.0 * kernel_exec_us / denom);
+        fprintf(stderr, "Data Transfer   : %6.2f%% (upload=%.2f%% + download=%.2f%%)\n",
+            zero_total ? 0.0 : 100.0 * (upload_us + download_us) / denom,
+            zero_total ? 0.0 : 100.0 * upload_us / denom,
+            zero_total ? 0.0 : 100.0 * download_us / denom);
+        fprintf(stderr, "File I/O        : %6.2f%% (read=%.2f%% + write=%.2f%%)\n",
+            zero_total ? 0.0 : 100.0 * (read_us + write_us) / denom,
+            zero_total ? 0.0 : 100.0 * read_us / denom,
+            zero_total ? 0.0 : 100.0 * write_us / denom);
+        fprintf(stderr, "Buffer Alloc    : %6.2f%% (in=%.2f%% + out=%.2f%% + len=%.2f%%)\n",
+            zero_total ? 0.0 : 100.0 * buffer_us / denom,
+            zero_total ? 0.0 : 100.0 * buffer_in_us / denom,
+            zero_total ? 0.0 : 100.0 * buffer_out_us / denom,
+            zero_total ? 0.0 : 100.0 * buffer_len_us / denom);
+        fprintf(stderr, "Setup Args      : %6.2f%%\n", zero_total ? 0.0 : 100.0 * kernel_setup_us / denom);
+        fprintf(stderr, "Blocking Calc   : %6.2f%%\n", zero_total ? 0.0 : 100.0 * blocking_us / denom);
     fprintf(stderr, "\n");
 
     return write_ret;

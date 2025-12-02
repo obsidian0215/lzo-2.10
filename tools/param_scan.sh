@@ -73,23 +73,67 @@ else
   WG_SIZES=(32 64 128 256)
 fi
 
-
-# Map modes: do not include MAP_MODE by default. Only include MAP_MODE when
-# the environment variable LZO_MAP_MODES is set (comma-separated list of 0/1).
-# To force the map behavior at runtime you can still set LZO_FORCE_MAP in the
-# environment when invoking the runner (this affects the host binary).
-if [ -n "${LZO_MAP_MODES:-}" ]; then
-  read -r -a MAP_MODES <<< "$(echo "$LZO_MAP_MODES" | tr ',' ' ')"
-  # Validate allowed values: only 0 or 1 are permitted
-  for mm in "${MAP_MODES[@]}"; do
-    if [ "$mm" != "0" ] && [ "$mm" != "1" ]; then
-      echo "Invalid MAP_MODE value: $mm. Allowed values are 0 or 1." >&2
-      exit 2
-    fi
-  done
+# Block sizes (KB) to sweep; default to the adaptive-friendly range
+if [ -n "${LZO_FIXED_BLOCK_SIZES:-}" ]; then
+  read -r -a BLOCK_SIZES <<< "$(echo "$LZO_FIXED_BLOCK_SIZES" | tr ',' ' ')"
 else
-  # If not explicitly configured, do not include a MAP_MODE dimension.
-  MAP_MODES=()
+  BLOCK_SIZES=(64 128 256 512)
+fi
+
+# Multi-thread IO modes to consider (0: no mt, 1: mt)
+if [ -n "${LZO_MT_IO_MODES:-}" ]; then
+  read -r -a MT_IO_MODES <<< "$(echo "$LZO_MT_IO_MODES" | tr ',' ' ')"
+else
+  MT_IO_MODES=(0 1)
+fi
+
+# Runners: standalone,daemon - can be overridden by env LZO_RUNNERS="standalone,daemon"
+if [ -n "${LZO_RUNNERS:-}" ]; then
+  read -r -a RUNNERS <<< "$(echo "$LZO_RUNNERS" | tr ',' ' ')"
+else
+  RUNNERS=(standalone daemon)
+fi
+
+# Optional: LZO_ASYNC_UPLOAD and LZO_MT_IO_THREADS can be set to include these envs in the invocation.
+LZO_ASYNC_UPLOAD=${LZO_ASYNC_UPLOAD:-}
+LZO_MT_IO_THREADS=${LZO_MT_IO_THREADS:-2}
+
+# Decompression vector modes: if LZO_DECOMP_VEC_MODES supplied, iterate them.
+# If not supplied, use empty string in DECOMP_VEC_MODES meaning "do not set LZO_DECOMP_VEC, use binary default".
+if [ -n "${LZO_DECOMP_VEC_MODES:-}" ]; then
+  read -r -a DECOMP_VEC_MODES <<< "$(echo "$LZO_DECOMP_VEC_MODES" | tr ',' ' ')"
+else
+  DECOMP_VEC_MODES=("")
+fi
+
+
+
+# Mapping mode: do not include a mapping dimension by default. To explicitly
+# include mapping choices in the scan, set LZO_STANDARD_COPY_MODES to a
+# comma-separated list of 0/1 (0=zero-copy, 1=standard-copy). For backward
+# compatibility, LZO_MAP_MODES is accepted as an alias.
+if [ -n "${LZO_STANDARD_COPY_MODES:-}" ]; then
+  read -r -a STD_COPY_MODES <<< "$(echo "$LZO_STANDARD_COPY_MODES" | tr ',' ' ')"
+elif [ -n "${LZO_MAP_MODES:-}" ]; then
+  # Deprecated alias: translate into new variable name
+  read -r -a STD_COPY_MODES <<< "$(echo "$LZO_MAP_MODES" | tr ',' ' ')"
+  echo "Warning: LZO_MAP_MODES is deprecated; use LZO_STANDARD_COPY_MODES instead" >&2
+else
+  STD_COPY_MODES=()
+fi
+# Validate allowed values: only 0 or 1 are permitted
+for mm in "${STD_COPY_MODES[@]}"; do
+  if [ "$mm" != "0" ] && [ "$mm" != "1" ]; then
+    echo "Invalid STD_COPY_MODE value: $mm. Allowed values are 0 or 1." >&2
+    exit 2
+  fi
+done
+
+# normalize STD_COPY_MODES for iteration (empty means no stdcopy dimension)
+if [ ${#STD_COPY_MODES[@]} -eq 0 ]; then
+  STD_COPY_LOOP=("")
+else
+  STD_COPY_LOOP=("${STD_COPY_MODES[@]}")
 fi
 
 # gather samples
@@ -116,29 +160,34 @@ if [ "${LZO_DEBUG:-0}" = "1" ]; then
 fi
 
 for comp_level in "${COMP_LEVELS[@]}"; do
+  for runner in "${RUNNERS[@]}"; do
   for wg in "${WG_SIZES[@]}"; do
-    for sample in "${SAMPLES[@]}"; do
+    for block_kb in "${BLOCK_SIZES[@]}"; do
+      for mt_io in "${MT_IO_MODES[@]}"; do
+          for stdcopy in "${STD_COPY_LOOP[@]}"; do
+          for sample in "${SAMPLES[@]}"; do
         relpath="${sample#${SAMPLES_DIR}/}"
         if [ "$relpath" = "$sample" ]; then relpath="$(basename "$sample")"; fi
         rel_sanitized=$(printf "%s" "$relpath" | sed 's/[^A-Za-z0-9._-]/_/g')
         sample_hash=$(printf "%s" "$sample" | sha1sum 2>/dev/null | awk '{print $1}' | cut -c1-8 || echo unknown)
         sname="${rel_sanitized}_${sample_hash}"
 
-        for r in $(seq 1 "$REPEATS"); do
-            # default: no MAP_MODE unless user explicitly configured LZO_MAP_MODES
-            mapm=""
-            if [ ${#MAP_MODES[@]} -gt 0 ]; then
-              # choose the first (and typically only) configured map mode
-              mapm="${MAP_MODES[0]}"
+        for devec in "${DECOMP_VEC_MODES[@]}"; do
+          for r in $(seq 1 "$REPEATS"); do
+            # default: no explicit LZO_STANDARD_COPY mode unless user configured it
+            stdcopy=""
+            if [ ${#STD_COPY_MODES[@]} -gt 0 ]; then
+              # choose the first (and typically only) configured standard-copy mode
+              stdcopy="${STD_COPY_MODES[0]}"
             fi
             # No decomp-mode dimension (always base); drop the extra directory level
-            devec_val=0
+            devec_val="$devec"
             total_runs=$((total_runs+1))
 
-            if [ -n "$mapm" ]; then
-              cfg_dir_mode="$OUT_DIR/comp_${comp_level}/map_${mapm}/wg_${wg}"
+            if [ -n "$stdcopy" ]; then
+              cfg_dir_mode="$OUT_DIR/comp_${comp_level}/stdcopy_${stdcopy}/wg_${wg}/block_${block_kb}kb/mt_${mt_io}"
             else
-              cfg_dir_mode="$OUT_DIR/comp_${comp_level}/wg_${wg}"
+              cfg_dir_mode="$OUT_DIR/runner_${runner}/comp_${comp_level}/wg_${wg}/block_${block_kb}kb/mt_${mt_io}"
             fi
             mkdir -p "$cfg_dir_mode"
 
@@ -151,22 +200,70 @@ for comp_level in "${COMP_LEVELS[@]}"; do
               out_lzo="$tmp_run_dir/lzo_out_${sname}_run${r}.lzo"
               logf="$cfg_dir_mode/${sname}_run${r}.log"
 
-              # Make log header explicit: include map-mode (decomp-mode always base, omit)
-              if [ -n "$mapm" ]; then
-                echo "[Run $total_runs] COMP=$comp_level MAP_MODE=$mapm WG=$wg SAMPLE=$sname R=$r -> $logf"
-                echo "# COMP=$comp_level MAP_MODE=$mapm WG=$wg SAMPLE=$sname R=$r" > "$logf"
+              # Make log header explicit: include standard-copy mode, block size and mt io if configured
+              BLK_SZ=${block_kb}
+              MT_IO=${mt_io}
+              if [ -n "$stdcopy" ]; then
+                echo "[Run $total_runs] COMP=$comp_level STD_COPY=$stdcopy WG=$wg BLOCK=${BLK_SZ}KB MT=${MT_IO} SAMPLE=$sname R=$r -> $logf"
+                echo "# COMP=$comp_level STD_COPY=$stdcopy WG=$wg BLOCK=${BLK_SZ}KB MT=${MT_IO} SAMPLE=$sname R=$r" > "$logf"
               else
-                echo "[Run $total_runs] COMP=$comp_level WG=$wg SAMPLE=$sname R=$r -> $logf"
-                echo "# COMP=$comp_level WG=$wg SAMPLE=$sname R=$r" > "$logf"
+                echo "[Run $total_runs] COMP=$comp_level WG=$wg BLOCK=${BLK_SZ}KB MT=${MT_IO} SAMPLE=$sname R=$r -> $logf"
+                echo "# COMP=$comp_level WG=$wg BLOCK=${BLK_SZ}KB MT=${MT_IO} SAMPLE=$sname R=$r" > "$logf"
               fi
               echo "Compressing: $sample -> $out_lzo" >> "$logf"
               # no strategy argument (strategy dimension removed)
               strategy_arg=()
-              # Do not set LZO_FORCE_MAP here; leave mapping behavior to the
-              # host (or to explicit LZO_FORCE_MAP if you configured it).
+              # Construct env vars for invocation; include optional STD_COPY if configured.
+              # Build COMP_ENV with optional entries
+              COMP_ENV=()
+              # Only set LZO_DECOMP_VEC if explicit value provided (empty string means use binary default)
+              if [ -n "$devec_val" ]; then
+                COMP_ENV+=(LZO_DECOMP_VEC=$devec_val)
+              fi
+              if [ "$wg" != "auto" ]; then
+                COMP_ENV+=(LZO_WG_SIZE=$wg)
+              fi
+              COMP_ENV+=(LZO_FIXED_BLOCK_SIZE=${BLK_SZ:-0})
+              COMP_ENV+=(LZO_MT_IO=${MT_IO:-0})
+              # Pass LZO_MT_IO_THREADS if set
+              if [ -n "${LZO_MT_IO_THREADS:-}" ]; then
+                COMP_ENV+=(LZO_MT_IO_THREADS=${LZO_MT_IO_THREADS})
+              fi
+              # If standard copy mode is set, include it
+              if [ -n "$stdcopy" ]; then
+                COMP_ENV+=(LZO_STANDARD_COPY=${stdcopy})
+              fi
+              # Pass async upload if configured in environment
+              if [ -n "${LZO_ASYNC_UPLOAD:-}" ]; then
+                COMP_ENV+=(LZO_ASYNC_UPLOAD=${LZO_ASYNC_UPLOAD})
+              fi
+              if [ -n "$stdcopy" ]; then
+                COMP_ENV+=(LZO_STANDARD_COPY=$stdcopy)
+              fi
               # LZO_VLEN is metadata only (host does not use it), so do not export it to the child process
-              COMP_CMD=(env LZO_DECOMP_VEC=$devec_val LZO_WG_SIZE=$wg "$LZO_BIN" $LZO_DEBUG_FLAG -L "$comp_level" "${strategy_arg[@]}" "$sample" -o "$out_lzo")
-              DECMD=(env LZO_DECOMP_VEC=$devec_val "$LZO_BIN" -d --verify "$sample" "$out_lzo")
+              # Choose binary based on runner
+              if [ "$runner" = "daemon" ]; then
+                LZO_BIN_RUN="$WRAPDIR/lzo_gpu_client"
+                # Attempt to start daemon if not running
+                if ! pgrep -f lzo_gpu_daemon >/dev/null 2>&1; then
+                  echo "Starting lzo_gpu_daemon for runner=daemon"
+                  (cd "$WRAPDIR" && nohup ./lzo_gpu_daemon > /tmp/lzo_gpu_daemon.stdout.log 2>&1 &) || true
+                  sleep 0.5
+                fi
+              else
+                LZO_BIN_RUN="$WRAPDIR/lzo_gpu"
+              fi
+              COMP_CMD=(env "${COMP_ENV[@]}" "$LZO_BIN_RUN" $LZO_DEBUG_FLAG -L "$comp_level" "${strategy_arg[@]}" "$sample" -o "$out_lzo")
+              # DECMD: ensure decompress/verify uses same envs as COMP
+              DEC_ENV=()
+              if [ -n "$devec_val" ]; then DEC_ENV+=(LZO_DECOMP_VEC=$devec_val); fi
+              if [ "$wg" != "auto" ]; then DEC_ENV+=(LZO_WG_SIZE=$wg); fi
+              DEC_ENV+=(LZO_FIXED_BLOCK_SIZE=${BLK_SZ:-0})
+              DEC_ENV+=(LZO_MT_IO=${MT_IO:-0})
+              if [ -n "${LZO_MT_IO_THREADS:-}" ]; then DEC_ENV+=(LZO_MT_IO_THREADS=${LZO_MT_IO_THREADS}); fi
+              if [ -n "$stdcopy" ]; then DEC_ENV+=(LZO_STANDARD_COPY=${stdcopy}); fi
+              if [ -n "${LZO_ASYNC_UPLOAD:-}" ]; then DEC_ENV+=(LZO_ASYNC_UPLOAD=${LZO_ASYNC_UPLOAD}); fi
+              DECMD=(env "${DEC_ENV[@]}" "$LZO_BIN_RUN" -d --verify "$sample" "$out_lzo")
 
               if [ "$DRY_RUN" = "1" ]; then
                 printf "# DRY-RUN CMD: (cd \"%s\" && %s)\n" "$WRAPDIR" "${COMP_CMD[*]}" | tee -a "$logf"
@@ -223,9 +320,14 @@ for comp_level in "${COMP_LEVELS[@]}"; do
               fi
 
               rm -rf "$tmp_run_dir" 2>/dev/null || true
+                done
+              done
             done
           done
         done
       done
+    done
+  done
+done
 
 echo "Full param scan finished. Total runs: $total_runs. Logs under $OUT_DIR"

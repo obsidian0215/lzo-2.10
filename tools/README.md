@@ -16,7 +16,7 @@ tools/
 │   └── gpu_control.sh                 # GPU频率控制
 │
 ├── 数据分析脚本 (Analysis)
-│   ├── analyze.py                     # GPU结果分析 (主要)
+│   ├── analysis.py (subcmd `analyze`) # GPU结果分析 (主要)
 │   ├── aggregate_results.py           # CPU跨配置聚合
 │   └── parse_profile_logs.py          # GPU profiling分析
 │
@@ -39,7 +39,7 @@ tools/
 ./param_scan.sh
 
 # 2. 分析结果
-./analyze.py
+./analysis.py analyze
 
 # 3. 生成图表和报告
 ./plot_gpu_analysis.py
@@ -131,7 +131,7 @@ Hybrid模式(CPU+GPU)基准测试。
 
 ### 2. 数据分析脚本
 
-#### `analyze.py` ⭐ (GPU主力分析工具)
+#### `analysis.py analyze` ⭐ (GPU主力分析工具)
 GPU实验结果综合分析工具。
 
 **功能：**
@@ -144,10 +144,10 @@ GPU实验结果综合分析工具。
 **用法：**
 ```bash
 # 使用默认路径
-./analyze.py
+./analysis.py analyze
 
 # 自定义输入/输出
-./analyze.py -i logs/param_scans -o results/summary.csv
+./analysis.py analyze -i logs/param_scans -o results/summary.csv
 ```
 
 **输出：**
@@ -311,7 +311,7 @@ cd tools
 ./param_scan.sh
 
 # 2. 分析结果
-./analyze.py
+./analysis.py analyze
 # 输出: exp_results/lzo_gpu/logs/analysis_summary.csv
 
 # 3. 生成可视化
@@ -383,7 +383,7 @@ exp_results/
 
 **GPU分析：**
 ```
-param_scan.sh → analyze.py → plot_gpu_analysis.py
+param_scan.sh → analysis.py analyze → plot_gpu_analysis.py
 ```
 
 **CPU分析：**
@@ -409,7 +409,7 @@ exp_results/**/*.log
 
 ## 🐛 故障排查
 
-### 问题1: analyze.py找不到日志
+### 问题1: analysis.py analyze 找不到日志
 
 **症状：**
 ```
@@ -442,7 +442,7 @@ pip3 install matplotlib numpy
 
 **症状：**
 ```
-Permission denied: ./analyze.py
+Permission denied: ./analysis.py analyze
 ```
 
 **解决：**
@@ -462,22 +462,15 @@ chmod +x tools/*.py tools/*.sh
 
 ## 🔧 维护说明
 
-### 已整理的脚本
-
-- ✅ 删除 `summarize_throughput.py` (功能被analyze.py覆盖)
-- ✅ 合并 `generate_plots.py` + `generate_throughput_plots.py` → `plot_gpu_analysis.py`
-- ✅ 保留专业化脚本 (CPU热力图、频率曲线等)
-
-### 脚本清单
-
+- ✅ 删除 `summarize_throughput.py` (功能被 `analysis.py analyze` 覆盖)
 | 脚本 | 状态 | 说明 |
 |------|------|------|
-| analyze.py | ✅ 活跃 | GPU主力分析工具 |
+| analysis.py (analyze) | ✅ 活跃 | GPU主力分析工具 |
 | plot_gpu_analysis.py | ✅ 活跃 | GPU统一绘图工具 (新) |
 | aggregate_results.py | ✅ 活跃 | CPU聚合工具 |
 | run_lzo_cpu.sh | ✅ 活跃 | CPU基准测试 |
 | param_scan.sh | ✅ 活跃 | GPU参数扫描 |
-| summarize_throughput.py | ❌ 已删除 | 被analyze.py替代 |
+| summarize_throughput.py | ❌ 已删除 | 被 `analysis.py analyze` 替代 |
 | generate_plots.py | ❌ 已删除 | 合并到plot_gpu_analysis.py |
 | generate_throughput_plots.py | ❌ 已删除 | 合并到plot_gpu_analysis.py |
 

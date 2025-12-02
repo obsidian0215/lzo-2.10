@@ -21,16 +21,21 @@
 #include <sys/un.h>
 #include <signal.h>
 #include <errno.h>
+#include <sys/file.h> /* for flock */
 #include <CL/cl.h>
+#include "timing.h"
+#include <dirent.h>
+#include "lzo_defaults.h"
 
 /* 声明daemon_decompress.c中的函数 */
 extern int daemon_decompress(
     cl_context ctx, cl_command_queue queue, cl_device_id device,
     cl_kernel kernel, int prefer_vec, const char* input_path, const char* output_path,
-    unsigned long* time_us_out, size_t* output_size_out
+    unsigned long* time_us_out, size_t* output_size_out, timing_t* t_out
 );
 
 #define SOCKET_PATH "/tmp/lzo_gpu_daemon.sock"
+#define PID_FILE "/tmp/lzo_gpu_daemon.pid"
 #define MAX_CLIENTS 5
 #define MAX_BUFFER_SIZE (128 * 1024 * 1024)  // 128MB - 足够处理大部分文件
 
@@ -64,10 +69,25 @@ typedef struct {
     /* 服务器socket */
     int server_sock;
     volatile int running;
+    int pid_fd; /* file descriptor for pidfile lock (if any) */
+    FILE* logf; /* optional logfile (duplicate of stdout/stderr) */
 } daemon_state_t;
 
 static daemon_state_t g_state = {0};
 
+/* 外部压缩函数声明 */
+extern int daemon_compress(
+    cl_context ctx, cl_command_queue queue, cl_device_id device,
+    cl_kernel kernel,
+    const char* input_path, const char* output_path,
+    int level,
+    /* options (from client request) */
+    int standard_copy, int mt_io, int mt_threads, int fixed_block_kb, int async_upload,
+    /* per-request coalesce/stdio overrides */
+    int coalesce_output, int coalesce_chunk_mb, int coalesce_max_mb, int stdio_buf_mb,
+    unsigned long* time_us, size_t* output_size,
+    timing_t* t_out
+);
 /* 请求协议 */
 typedef struct {
     char operation;      // 'C'=compress, 'D'=decompress
@@ -80,23 +100,25 @@ typedef struct {
     int mt_io;        /* 0/1 */
     int mt_threads;   /* number of IO threads */
     int fixed_block_kb; /* 0=no fixed size, else KB */
-    int force_map;    /* 0/1 */
+    /* force_map deprecated: mapping behavior now controlled by standard_copy */
+    int async_upload; /* 0/1 */
     int prefer_cpu;   /* 0=gpu, 1=cpu */
     int decomp_vec;   /* 0=scalar decomp, 1=vector (default) */
+    /* Per-request overrides for coalescing and stdio buffer - -1 = unspecified */
+    int coalesce_output;  /* -1 unspecified; 0=off; 1=on */
+    int coalesce_chunk_mb;/* -1 unspecified; positive = chunk size in MB */
+    int coalesce_max_mb;  /* -1 unspecified; positive = max MB threshold for single coalesce */
+    int stdio_buf_mb;     /* -1 unspecified; positive = MB for stdio buffer */
 } request_t;
 
 typedef struct {
     int status;          // 0=success, -1=error
     size_t output_size;
-    unsigned long time_us;  // 总时间(微秒)
-    // 详细时间分解 (微秒)
-    unsigned long read_us;
-    unsigned long buffer_us;
-    unsigned long upload_us;
-    unsigned long kernel_us;
-    unsigned long download_us;
-    unsigned long write_us;
-    unsigned long cleanup_us;
+    unsigned long time_us;  // 总时间 (微秒)
+
+    /* compact timing structure */
+    timing_t timing;
+
     char message[128];
 } response_t;
 
@@ -415,11 +437,12 @@ extern int daemon_compress(
     const char* input_path, const char* output_path,
     int level,
     /* options (from client request) */
-    int standard_copy, int mt_io, int mt_threads, int fixed_block_kb, int force_map,
+    int standard_copy, int mt_io, int mt_threads, int fixed_block_kb, int async_upload,
+    /* per-request coalesce/stdio overrides */
+    int coalesce_output, int coalesce_chunk_mb, int coalesce_max_mb, int stdio_buf_mb,
     unsigned long* time_us, size_t* output_size,
-    unsigned long* read_us, unsigned long* buffer_us, unsigned long* upload_us,
-    unsigned long* kernel_us, unsigned long* download_us, unsigned long* write_us,
-    unsigned long* cleanup_us
+    /* compact per-stage timing structure */
+    timing_t* t_out
 );
 
 /* 根据压缩级别选择kernel */
@@ -468,8 +491,7 @@ int handle_compress_request(request_t* req, response_t* resp)
 
     unsigned long time_us = 0;
     size_t output_size = 0;
-    unsigned long read_us = 0, buffer_us = 0, upload_us = 0;
-    unsigned long kernel_us = 0, download_us = 0, write_us = 0, cleanup_us = 0;
+    timing_t t = {0};
 
     // 调用压缩函数,复用OpenCL资源(context/queue/kernel)
     int ret = daemon_compress(
@@ -481,29 +503,33 @@ int handle_compress_request(request_t* req, response_t* resp)
         req->output_path,
         req->level,
         /* options */
-        req->standard_copy, req->mt_io, req->mt_threads, req->fixed_block_kb, req->force_map,
+        req->standard_copy, req->mt_io, req->mt_threads, req->fixed_block_kb, req->async_upload,
+        /* per-request coalesce/stdio overrides */
+        req->coalesce_output, req->coalesce_chunk_mb, req->coalesce_max_mb, req->stdio_buf_mb,
         &time_us,
         &output_size,
-        &read_us, &buffer_us, &upload_us,
-        &kernel_us, &download_us, &write_us, &cleanup_us
+        /* single timing struct */
+        &t
     );
 
     if (ret == 0) {
         resp->status = 0;
         resp->output_size = output_size;
-        resp->time_us = time_us;
-        resp->read_us = read_us;
-        resp->buffer_us = buffer_us;
-        resp->upload_us = upload_us;
-        resp->kernel_us = kernel_us;
-        resp->download_us = download_us;
-        resp->write_us = write_us;
-        resp->cleanup_us = cleanup_us;
+        /* Ensure OCL init time is not part of the per-request total.  The daemon
+         * initialises OpenCL at startup, and we explicitly zero that field for
+         * per-request timings; but in case some implementation fills it, subtract it.
+         */
+        unsigned long effective_time_us = time_us;
+        if (t.ocl_init_us > 0 && effective_time_us >= t.ocl_init_us) {
+            effective_time_us -= t.ocl_init_us;
+        }
+        resp->time_us = effective_time_us;
+        resp->timing = t;
         snprintf(resp->message, sizeof(resp->message),
                 "Success (saved ~%lums init)", g_state.init_time_ms);
 
         g_state.requests++;
-        g_state.total_time_ms += time_us / 1000;  // 统计用毫秒
+        g_state.total_time_ms += effective_time_us / 1000;  // 统计用毫秒
     } else {
         resp->status = -1;
         resp->output_size = 0;
@@ -525,6 +551,7 @@ int handle_decompress_request(request_t* req, response_t* resp)
 
     unsigned long time_us;
     size_t output_size;
+    timing_t t = {0};
 
     int prefer_vec = (g_state.kernel_decomp_vec != NULL) ? 1 : 0;
     cl_kernel kernel = prefer_vec ? g_state.kernel_decomp_vec : g_state.kernel_decomp;
@@ -540,7 +567,8 @@ int handle_decompress_request(request_t* req, response_t* resp)
         req->input_path,
         req->output_path,
         &time_us,
-        &output_size
+        &output_size,
+        &t
     );
 
     /* 如果向量化kernel因为不可压缩或运行失败导致非0返回，回退到标量kernel并重试（容错） */
@@ -558,16 +586,24 @@ int handle_decompress_request(request_t* req, response_t* resp)
             req->input_path,
             req->output_path,
             &time_us,
-            &output_size
+            &output_size,
+            &t
         );
     }
 
     if (ret == 0) {
         resp->status = 0;
-        resp->time_us = time_us;
+        /* Subtract any OCL init time from total so client-facing totals don't include startup init */
+        unsigned long effective_time_us = time_us;
+        if (t.ocl_init_us > 0 && effective_time_us >= t.ocl_init_us) {
+            effective_time_us -= t.ocl_init_us;
+        }
+        resp->time_us = effective_time_us;
         resp->output_size = output_size;
+        /* copy the compact timing structure into the response */
+        resp->timing = t;
         snprintf(resp->message, sizeof(resp->message), "OK");
-        printf("[DAEMON] 解压缩成功: %zu bytes, %.2f ms\n", output_size, time_us/1000.0);
+        printf("[DAEMON] 解压缩成功: %zu bytes, %.2f ms\n", output_size, effective_time_us/1000.0);
     } else {
         resp->status = -1;
         snprintf(resp->message, sizeof(resp->message), "Decompression failed");
@@ -622,6 +658,171 @@ void signal_handler(int sig)
         close(g_state.server_sock);
         g_state.server_sock = -1;
     }
+    /* release pidfile lock and remove pid file */
+    if (g_state.pid_fd >= 0) {
+        flock(g_state.pid_fd, LOCK_UN);
+        close(g_state.pid_fd);
+        g_state.pid_fd = -1;
+        unlink(PID_FILE);
+    }
+    /* close log file if we own one */
+    if (g_state.logf) {
+        fflush(g_state.logf);
+        fclose(g_state.logf);
+        g_state.logf = NULL;
+    }
+}
+
+/* Create a pidfile and acquire an exclusive lock to ensure a single daemon instance */
+static int create_pidfile(void)
+{
+    int fd = open(PID_FILE, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        perror("open pidfile");
+        return -1;
+    }
+    /* Try to acquire an exclusive non-blocking flock */
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        /* Another process holds the lock */
+        char buf[64] = {0};
+        lseek(fd, 0, SEEK_SET);
+        read(fd, buf, sizeof(buf) - 1);
+        fprintf(stderr, "[DAEMON] 无法获得pidfile锁，另一个守护进程可能正在运行: %s\n", PID_FILE);
+        if (buf[0]) fprintf(stderr, "[DAEMON] 另一个守护进程PID: %s\n", buf);
+        close(fd);
+        /* Attempt to interpret the pid in the file: if it's a stale pid (process not found), remove the file and try again once */
+        pid_t other_pid = 0;
+        if (buf[0]) other_pid = (pid_t)atoi(buf);
+        if (other_pid > 1) {
+            char proc_comm[128] = {0};
+            char comm_path[256];
+            snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", other_pid);
+            FILE* pf = fopen(comm_path, "r");
+            if (pf) {
+                if (fgets(proc_comm, sizeof(proc_comm), pf)) {
+                    size_t ln = strlen(proc_comm); if (ln>0 && proc_comm[ln-1]=='\n') proc_comm[ln-1]='\0';
+                }
+                fclose(pf);
+            }
+            /* If the process doesn't exist (pf is NULL), or the comm doesn't match, remove the stale pidfile and retry lock once */
+            if ((pf == NULL) || (strcmp(proc_comm, "lzo_gpu_daemon") != 0)) {
+                /* stale pidfile likely - try removing and retry once */
+                fprintf(stderr, "[DAEMON] Found stale pidfile or non-daemon process at PID %d — cleaning up pidfile and retrying\n", other_pid);
+                unlink(PID_FILE);
+                close(fd);
+                /* reopen and relock once */
+                fd = open(PID_FILE, O_RDWR | O_CREAT, 0644);
+                if (fd < 0) return -1;
+                if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+                    close(fd);
+                    return -1;
+                }
+                /* success on relock */
+            } else {
+                /* process exists, so we cannot proceed */
+                return -1;
+            }
+        }
+    }
+    /* Truncate and write our PID */
+    ftruncate(fd, 0);
+    char pidbuf[32];
+    int n = snprintf(pidbuf, sizeof(pidbuf), "%ld\n", (long)getpid());
+    write(fd, pidbuf, n);
+    fsync(fd);
+    /* Keep fd open (locked) for the lifetime of the process */
+    g_state.pid_fd = fd;
+    return 0;
+}
+
+/*
+ * Helper: find if another process with exe name 'lzo_gpu_daemon' (or comm) is running.
+ */
+static int find_running_daemons(void) {
+    DIR *proc = opendir("/proc");
+    if (!proc) return 0;
+    struct dirent *d;
+    pid_t self = getpid();
+    int count = 0;
+    while ((d = readdir(proc)) != NULL) {
+        /* If the dirent name isn't all digits, skip */
+        const char *pname = d->d_name;
+        int ok = 1;
+        for (const char *cp = pname; *cp; ++cp) if (*cp < '0' || *cp > '9') { ok = 0; break; }
+        if (!ok) continue;
+        pid_t pid = (pid_t)atoi(pname);
+        if (pid == 0 || pid == self) continue;
+        /* read /proc/<pid>/comm and compare filename */
+        char comm_path[256];
+        snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
+        FILE *f = fopen(comm_path, "r");
+        if (!f) continue;
+        char comm[128];
+        if (!fgets(comm, sizeof(comm), f)) { fclose(f); continue; }
+        fclose(f);
+        /* strip newline */
+        size_t ln = strlen(comm);
+        if (ln > 0 && comm[ln-1] == '\n') comm[ln-1] = '\0';
+        if (strcmp(comm, "lzo_gpu_daemon") == 0) {
+            count++;
+        } else {
+            /* Fallback: read exe link /proc/<pid>/exe and check basename */
+            char exe_p[256];
+            snprintf(exe_p, sizeof(exe_p), "/proc/%d/exe", pid);
+            char exe_path[256];
+            ssize_t r = readlink(exe_p, exe_path, sizeof(exe_path)-1);
+            if (r > 0) {
+                exe_path[r] = '\0';
+                const char *base = strrchr(exe_path, '/');
+                if (base) base++;
+                else base = exe_path;
+                if (strcmp(base, "lzo_gpu_daemon") == 0) count++;
+            }
+        }
+    }
+    closedir(proc);
+    return count;
+}
+
+static void remove_pidfile(void)
+{
+    if (g_state.pid_fd >= 0) {
+        flock(g_state.pid_fd, LOCK_UN);
+        close(g_state.pid_fd);
+        g_state.pid_fd = -1;
+        unlink(PID_FILE);
+    }
+}
+
+/* Open default log file under /tmp and duplicate stdout/stderr to it so users
+ * can inspect output via a known file regardless of how the process is started
+ * (foreground, background, system service, etc.).
+ */
+static int open_default_logfile(void)
+{
+    const char* path = "/tmp/lzo_gpu_daemon.stdout.log";
+    FILE* f = fopen(path, "a");
+    if (!f) {
+        fprintf(stderr, "[DAEMON] 无法打开日志文件: %s (错误=%d)\n", path, errno);
+        return -1;
+    }
+    /* Duplicate fd so both stdout/stderr are redirected. Keep FILE* open (fclose on exit). */
+    if (dup2(fileno(f), STDOUT_FILENO) < 0) {
+        fprintf(stderr, "[DAEMON] dup2 stdout failed: %d\n", errno);
+        fclose(f);
+        return -1;
+    }
+    if (dup2(fileno(f), STDERR_FILENO) < 0) {
+        fprintf(stderr, "[DAEMON] dup2 stderr failed: %d\n", errno);
+        fclose(f);
+        return -1;
+    }
+    /* Set line buffering so tail -f sees lines promptly */
+    setvbuf(stdout, NULL, _IOLBF, 8192);
+    setvbuf(stderr, NULL, _IOLBF, 8192);
+    g_state.logf = f;
+    fprintf(stdout, "[DAEMON] Logging to %s (fd=%d)\n", path, fileno(f));
+    return 0;
 }
 
 /*
@@ -638,7 +839,27 @@ int start_server(void)
         return -1;
     }
 
-    // 删除旧socket文件
+    // Check for an existing server that may already be bound to the socket.
+    // If the socket file exists and connecting succeeds, another daemon is listening.
+    if (access(SOCKET_PATH, F_OK) == 0) {
+        int csock = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (csock >= 0) {
+            memset(&addr, 0, sizeof(addr));
+            addr.sun_family = AF_UNIX;
+            strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+            if (connect(csock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+                /* Connection succeeded -> socket already in use by a running server */
+                fprintf(stderr, "[DAEMON] 另一个守护进程已在运行或socket被占用: %s\n", SOCKET_PATH);
+                close(csock);
+                close(g_state.server_sock);
+                return -1;
+            }
+            close(csock);
+            /* If connect failed with ECONNREFUSED/ENOENT or others, continue and unlink stale socket */
+        }
+    }
+
+    // 删除旧socket文件 (如果已经存在但没有运行中的守护进程)
     unlink(SOCKET_PATH);
 
     // 绑定地址
@@ -709,8 +930,14 @@ void run_server(void)
             snprintf(resp.message, sizeof(resp.message), "Unknown operation");
         }
 
-        // 发送响应
-        send(client_sock, &resp, sizeof(resp), 0);
+        /* 发送响应 (原子 - 仅发 response struct)
+         * NOTE: 不再将生成的压缩/解压输出文件的内容通过socket发送回客户端。
+         * 客户端应仅以 response struct 作为信号，客户端/脚本负责通过daemon返回的元信息/路径完成后续验证/读取。
+         */
+        ssize_t sent = send(client_sock, &resp, sizeof(resp), 0);
+        if (sent != sizeof(resp)) {
+            fprintf(stderr, "[DAEMON] 发送响应失败: sent=%zd expected=%zu\n", sent, sizeof(resp));
+        }
         close(client_sock);
     }
 
@@ -755,17 +982,22 @@ int main(int argc, char** argv)
             fprintf(stdout, "\nOptions:\n");
             fprintf(stdout, "  -h, --help       Show this help and exit\n");
             fprintf(stdout, "\nEnvironment variables (daemon & client / per-request options):\n");
+            fprintf(stdout, "  LZO_ASYNC_UPLOAD=0|1    (per-request) allow daemon to perform asynchronous uploads via non-blocking writes\n");
             fprintf(stdout, "  LZO_STANDARD_COPY=0|1    Use standard host->device copy (default: 0 for zero-copy)\n");
             fprintf(stdout, "  LZO_MT_IO=0|1            Enable multi-threaded I/O (pread) for reads/uploads\n");
-            fprintf(stdout, "  LZO_MT_IO_THREADS=N      Threads for multi-threaded I/O (1-32, default: 4)\n");
+            fprintf(stdout, "  LZO_MT_IO_THREADS=N      Threads for multi-threaded I/O (1-32, default: %d)\n", LZO_DEFAULT_MT_IO_THREADS);
             fprintf(stdout, "  LZO_FIXED_BLOCK_SIZE=N   Fixed block size in KB (overrides adaptive choice)\n");
-            fprintf(stdout, "  LZO_FORCE_MAP=0|1        Force use of mapped pinned buffer even if standard_copy=1\n");
+            /* LZO_FORCE_MAP removed: mapping path controlled by LZO_STANDARD_COPY */
             fprintf(stdout, "  LZO_OPENCL_DEVICE=CPU|GPU Select OpenCL device preference for daemon (env-level)\n");
             fprintf(stdout, "  LZO_DECOMP_VEC=0|1       Prefer vectorized decompressor if available (default:1)\n");
-            fprintf(stdout, "  LZO_FORCE_NBLK=N         (advanced) Force target number of blocks for blocking alg.\n");
+            /* LZO_FORCE_NBLK removed: block target heuristics are determined by device and adaptive logic */
             return 0;
         }
     }
+    /* initialize logfile pointer and default stdout/stderr duplication to /tmp */
+    g_state.logf = NULL;
+    open_default_logfile();
+
     printf("========================================\n");
     printf("LZO GPU守护进程\n");
     printf("========================================\n\n");
@@ -774,15 +1006,31 @@ int main(int argc, char** argv)
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
+    /* initialize pidfile fd */
+    g_state.pid_fd = -1;
+    /* detect existing daemons by name (ensure singleton); if found, abort. */
+    int existing = find_running_daemons();
+    if (existing > 0) {
+        fprintf(stderr, "[DAEMON] 错误: 发现 %d 个 'lzo_gpu_daemon' 进程正在运行; 仅允许单个守护进程。请停止重复进程后重试\n", existing);
+        return 1;
+    }
+    /* Create pidfile and acquire lock to ensure only one daemon instance */
+    if (create_pidfile() != 0) {
+        fprintf(stderr, "[DAEMON] 无法创建/锁定 pidfile，退出\n");
+        return 1;
+    }
+
     // 初始化OpenCL资源 (仅一次)
     if (init_opencl_resources() != 0) {
         fprintf(stderr, "OpenCL初始化失败\n");
+        remove_pidfile();
         return 1;
     }
 
     // 启动服务器
     if (start_server() != 0) {
         cleanup_opencl_resources();
+        remove_pidfile();
         return 1;
     }
 
@@ -796,6 +1044,13 @@ int main(int argc, char** argv)
     }
     unlink(SOCKET_PATH);
     cleanup_opencl_resources();
+    remove_pidfile();
+    /* Close logfile if we opened one */
+    if (g_state.logf) {
+        fflush(g_state.logf);
+        fclose(g_state.logf);
+        g_state.logf = NULL;
+    }
 
     // 打印统计信息
     print_stats();
