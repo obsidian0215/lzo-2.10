@@ -75,3 +75,4 @@ lzo_gpu_daemon
 *_original.cl
 *_opt.cl
 # end
+lzo_gpu/tools/benchmark_bandwidth

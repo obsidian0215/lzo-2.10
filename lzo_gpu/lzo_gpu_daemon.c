@@ -17,6 +17,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <limits.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <signal.h>
@@ -74,6 +75,40 @@ typedef struct {
 } daemon_state_t;
 
 static daemon_state_t g_state = {0};
+
+/* Helper to return computed pidfile path. By default this is PID_FILE (/tmp),
+ * but we allow override via OUT_DIR or LZO_DAEMON_PID env vars to store runtime
+ * artifacts within the repository (e.g. $OUT_DIR).
+ */
+static const char *daemon_pidfile_path(void)
+{
+    static char buf[PATH_MAX];
+    const char *env = getenv("LZO_DAEMON_PID");
+    if (env && env[0]) return env;
+    env = getenv("OUT_DIR");
+    if (env && env[0]) {
+        snprintf(buf, sizeof(buf), "%s/lzo_gpu_daemon.pid", env);
+        return buf;
+    }
+    return PID_FILE;
+}
+
+/* Helper to return computed socket path. By default it's SOCKET_PATH (/tmp),
+ * but allow override via OUT_DIR or LZO_DAEMON_SOCKET env var so runs can keep
+ * socket and related artifacts under the repository's exp_results directory.
+ */
+static const char *daemon_socket_path(void)
+{
+    static char buf[PATH_MAX];
+    const char *env = getenv("LZO_DAEMON_SOCKET");
+    if (env && env[0]) return env;
+    env = getenv("OUT_DIR");
+    if (env && env[0]) {
+        snprintf(buf, sizeof(buf), "%s/lzo_gpu_daemon.sock", env);
+        return buf;
+    }
+    return SOCKET_PATH;
+}
 
 /* 外部压缩函数声明 */
 extern int daemon_compress(
@@ -663,7 +698,7 @@ void signal_handler(int sig)
         flock(g_state.pid_fd, LOCK_UN);
         close(g_state.pid_fd);
         g_state.pid_fd = -1;
-        unlink(PID_FILE);
+        unlink(daemon_pidfile_path());
     }
     /* close log file if we own one */
     if (g_state.logf) {
@@ -676,7 +711,7 @@ void signal_handler(int sig)
 /* Create a pidfile and acquire an exclusive lock to ensure a single daemon instance */
 static int create_pidfile(void)
 {
-    int fd = open(PID_FILE, O_RDWR | O_CREAT, 0644);
+    int fd = open(daemon_pidfile_path(), O_RDWR | O_CREAT, 0644);
     if (fd < 0) {
         perror("open pidfile");
         return -1;
@@ -687,7 +722,7 @@ static int create_pidfile(void)
         char buf[64] = {0};
         lseek(fd, 0, SEEK_SET);
         read(fd, buf, sizeof(buf) - 1);
-        fprintf(stderr, "[DAEMON] 无法获得pidfile锁，另一个守护进程可能正在运行: %s\n", PID_FILE);
+        fprintf(stderr, "[DAEMON] 无法获得pidfile锁，另一个守护进程可能正在运行: %s\n", daemon_pidfile_path());
         if (buf[0]) fprintf(stderr, "[DAEMON] 另一个守护进程PID: %s\n", buf);
         close(fd);
         /* Attempt to interpret the pid in the file: if it's a stale pid (process not found), remove the file and try again once */
@@ -708,10 +743,10 @@ static int create_pidfile(void)
             if ((pf == NULL) || (strcmp(proc_comm, "lzo_gpu_daemon") != 0)) {
                 /* stale pidfile likely - try removing and retry once */
                 fprintf(stderr, "[DAEMON] Found stale pidfile or non-daemon process at PID %d — cleaning up pidfile and retrying\n", other_pid);
-                unlink(PID_FILE);
+                unlink(daemon_pidfile_path());
                 close(fd);
                 /* reopen and relock once */
-                fd = open(PID_FILE, O_RDWR | O_CREAT, 0644);
+                fd = open(daemon_pidfile_path(), O_RDWR | O_CREAT, 0644);
                 if (fd < 0) return -1;
                 if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
                     close(fd);
@@ -790,7 +825,7 @@ static void remove_pidfile(void)
         flock(g_state.pid_fd, LOCK_UN);
         close(g_state.pid_fd);
         g_state.pid_fd = -1;
-        unlink(PID_FILE);
+        unlink(daemon_pidfile_path());
     }
 }
 
@@ -800,7 +835,32 @@ static void remove_pidfile(void)
  */
 static int open_default_logfile(void)
 {
-    const char* path = "/tmp/lzo_gpu_daemon.stdout.log";
+    /* If stdout is not a TTY, assume the caller has already redirected stdout/stderr
+     * (e.g. via shell redirection) and skip duplicating to an extra logfile to avoid
+     * writing into /tmp by default.
+     */
+    if (!isatty(STDOUT_FILENO)) {
+        return 0;
+    }
+
+    char buf[PATH_MAX];
+    const char* path = getenv("LZO_DAEMON_LOG");
+    if (!path || path[0] == '\0') {
+        const char* out_dir = getenv("OUT_DIR");
+        if (out_dir && out_dir[0] != '\0') {
+            snprintf(buf, sizeof(buf), "%s/lzo_gpu_daemon.log", out_dir);
+            path = buf;
+        } else {
+            const char* tmpdir = getenv("TMPDIR");
+            if (tmpdir && tmpdir[0] != '\0') {
+                snprintf(buf, sizeof(buf), "%s/lzo_gpu_daemon.log", tmpdir);
+                path = buf;
+            } else {
+                path = "/tmp/lzo_gpu_daemon.log";
+            }
+        }
+    }
+
     FILE* f = fopen(path, "a");
     if (!f) {
         fprintf(stderr, "[DAEMON] 无法打开日志文件: %s (错误=%d)\n", path, errno);
@@ -841,15 +901,15 @@ int start_server(void)
 
     // Check for an existing server that may already be bound to the socket.
     // If the socket file exists and connecting succeeds, another daemon is listening.
-    if (access(SOCKET_PATH, F_OK) == 0) {
+    if (access(daemon_socket_path(), F_OK) == 0) {
         int csock = socket(AF_UNIX, SOCK_STREAM, 0);
         if (csock >= 0) {
             memset(&addr, 0, sizeof(addr));
             addr.sun_family = AF_UNIX;
-            strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+            strncpy(addr.sun_path, daemon_socket_path(), sizeof(addr.sun_path) - 1);
             if (connect(csock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
                 /* Connection succeeded -> socket already in use by a running server */
-                fprintf(stderr, "[DAEMON] 另一个守护进程已在运行或socket被占用: %s\n", SOCKET_PATH);
+                fprintf(stderr, "[DAEMON] 另一个守护进程已在运行或socket被占用: %s\n", daemon_socket_path());
                 close(csock);
                 close(g_state.server_sock);
                 return -1;
@@ -860,12 +920,12 @@ int start_server(void)
     }
 
     // 删除旧socket文件 (如果已经存在但没有运行中的守护进程)
-    unlink(SOCKET_PATH);
+    unlink(daemon_socket_path());
 
     // 绑定地址
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, daemon_socket_path(), sizeof(addr.sun_path) - 1);
 
     if (bind(g_state.server_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind失败");
@@ -877,12 +937,12 @@ int start_server(void)
     if (listen(g_state.server_sock, MAX_CLIENTS) < 0) {
         perror("listen失败");
         close(g_state.server_sock);
-        unlink(SOCKET_PATH);
+        unlink(daemon_socket_path());
         return -1;
     }
 
     printf("[DAEMON] ✅ 服务器启动成功\n");
-    printf("[DAEMON]    Socket: %s\n", SOCKET_PATH);
+    printf("[DAEMON]    Socket: %s\n", daemon_socket_path());
     printf("[DAEMON]    PID: %d\n", getpid());
 
     return 0;
@@ -1042,7 +1102,7 @@ int main(int argc, char** argv)
         close(g_state.server_sock);
         g_state.server_sock = -1;
     }
-    unlink(SOCKET_PATH);
+    unlink(daemon_socket_path());
     cleanup_opencl_resources();
     remove_pidfile();
     /* Close logfile if we opened one */

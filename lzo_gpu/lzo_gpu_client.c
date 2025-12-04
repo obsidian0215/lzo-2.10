@@ -14,8 +14,27 @@
 #include "timing.h"
 #include "lzo_defaults.h"
 #include <getopt.h>
+#include <limits.h>
 
 #define SOCKET_PATH "/tmp/lzo_gpu_daemon.sock"
+
+/* Determine socket path by checking LZO_DAEMON_SOCKET or OUT_DIR env vars,
+ * falling back to default SOCKET_PATH. This mirrors lzo_gpu_daemon's behavior so
+ * clients can connect to repo-local sockets created by the daemon when OUT_DIR
+ * is set (e.g., during experiments).
+ */
+static const char* client_socket_path(void)
+{
+    static char buf[PATH_MAX];
+    const char *env = getenv("LZO_DAEMON_SOCKET");
+    if (env && env[0]) return env;
+    env = getenv("OUT_DIR");
+    if (env && env[0]) {
+        snprintf(buf, sizeof(buf), "%s/lzo_gpu_daemon.sock", env);
+        return buf;
+    }
+    return SOCKET_PATH;
+}
 
 /* request_t/response_t - local protocol structs (mirror daemon's definitions) */
 typedef struct {
@@ -130,7 +149,7 @@ static void set_request_defaults(request_t* req) {
  */
 int is_daemon_running(void)
 {
-    return access(SOCKET_PATH, F_OK) == 0;
+    return access(client_socket_path(), F_OK) == 0;
 }
 
 /*
@@ -167,7 +186,7 @@ int decompress_with_daemon(const char* input, const char* output)
     // 连接守护进程
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, client_socket_path(), sizeof(addr.sun_path) - 1);
 
     if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("连接守护进程失败");
@@ -210,16 +229,16 @@ int decompress_with_daemon(const char* input, const char* output)
         /* Decompression path: show consistent breakdown matching daemon_decompress */
         printf("解压缩成功: %s -> %s\n", input, output);
         /* Printers align with daemon_decompress logging so the harness can parse them reliably */
-        printf("1. File Read           : %8.3f ms\n", resp.timing.file_read_us/1000.0);
-        printf("2. OCL Init            : %8.3f ms\n", resp.timing.ocl_init_us/1000.0);
-        printf("3. Kernel Load         : %8.3f ms\n", resp.timing.kernel_load_us/1000.0);
-        printf("4. Buffer Alloc        : %8.3f ms\n", resp.timing.buffer_alloc_in_us/1000.0);
-        printf("5. Data Upload         : %8.3f ms\n", resp.timing.data_upload_us/1000.0);
-        printf("6. Setup Args          : %8.3f ms\n", resp.timing.setup_args_us/1000.0);
-        printf("7. Kernel Exec         : %8.3f ms\n", resp.timing.kernel_exec_us/1000.0);
-        printf("8. Data Download       : %8.3f ms\n", resp.timing.download_total_us/1000.0);
-        printf("9. File Write          : %8.3f ms\n", resp.timing.file_write_us/1000.0);
-        printf("TOTAL                : %8.3f ms\n", resp.time_us/1000.0);
+        print_us_tag(stdout, "1. File Read", resp.timing.file_read_us);
+        print_us_tag(stdout, "2. OCL Init", resp.timing.ocl_init_us);
+        print_us_tag(stdout, "3. Kernel Load", resp.timing.kernel_load_us);
+        print_us_tag(stdout, "4. Buffer Alloc", resp.timing.buffer_alloc_in_us);
+        print_us_tag(stdout, "5. Data Upload", resp.timing.data_upload_us);
+        print_us_tag(stdout, "6. Setup Args", resp.timing.setup_args_us);
+        print_us_tag(stdout, "7. Kernel Exec", resp.timing.kernel_exec_us);
+        print_us_tag(stdout, "8. Data Download", resp.timing.download_total_us);
+        print_us_tag(stdout, "9. File Write", resp.timing.file_write_us);
+        print_us_tag(stdout, "TOTAL", (unsigned long)resp.time_us);
         /*
         printf("  压缩大小: %ld bytes (%.2f MB)\n", req.input_size, req.input_size / 1048576.0);
         printf("  原始大小: %ld bytes (%.2f MB)\n", resp.output_size, resp.output_size / 1048576.0);
@@ -269,7 +288,7 @@ int compress_with_daemon(const char* input, const char* output, int level)
     // 连接守护进程
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, client_socket_path(), sizeof(addr.sun_path) - 1);
 
     if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("连接守护进程失败");
@@ -310,20 +329,20 @@ int compress_with_daemon(const char* input, const char* output, int level)
     if (resp.status == 0) {
         /* Compression path: show breakdown matching daemon_compress logging */
         printf("压缩成功: %s -> %s\n", input, output);
-        printf("1. File Read           : %8.3f ms\n", resp.timing.file_read_us/1000.0);
-        printf("2. Blocking Calc       : %8.3f ms\n", resp.timing.blocking_calc_us/1000.0);
-        printf("3. Buffer Alloc (in)   : %8.3f ms\n", resp.timing.buffer_alloc_in_us/1000.0);
-        printf("4. Data Upload         : %8.3f ms\n", resp.timing.data_upload_us/1000.0);
-        printf("5. Buffer Alloc (out)  : %8.3f ms\n", resp.timing.buffer_alloc_out_us/1000.0);
-        printf("6. Buffer Alloc (len)  : %8.3f ms\n", resp.timing.buffer_alloc_len_us/1000.0);
-        printf("7. Setup Args          : %8.3f ms\n", resp.timing.setup_args_us/1000.0);
-        printf("8. Kernel Exec         : %8.3f ms\n", resp.timing.kernel_exec_us/1000.0);
-        printf("9. Download (len)      : %8.3f ms\n", resp.timing.download_len_us/1000.0);
-        printf("10. Download (bulk)    : %8.3f ms\n", resp.timing.download_bulk_us/1000.0);
-        printf("11. Download Total     : %8.3f ms\n", resp.timing.download_total_us/1000.0);
-        printf("12. File Write         : %8.3f ms\n", resp.timing.file_write_us/1000.0);
-        printf("13. Cleanup            : %8.3f ms\n", resp.timing.cleanup_us/1000.0);
-        printf("TOTAL                  : %8.3f ms\n", resp.time_us/1000.0);
+        print_us_tag(stdout, "1. File Read", resp.timing.file_read_us);
+        print_us_tag(stdout, "2. Blocking Calc", resp.timing.blocking_calc_us);
+        print_us_tag(stdout, "3. Buffer Alloc (in)", resp.timing.buffer_alloc_in_us);
+        print_us_tag(stdout, "4. Data Upload", resp.timing.data_upload_us);
+        print_us_tag(stdout, "5. Buffer Alloc (out)", resp.timing.buffer_alloc_out_us);
+        print_us_tag(stdout, "6. Buffer Alloc (len)", resp.timing.buffer_alloc_len_us);
+        print_us_tag(stdout, "7. Setup Args", resp.timing.setup_args_us);
+        print_us_tag(stdout, "8. Kernel Exec", resp.timing.kernel_exec_us);
+        print_us_tag(stdout, "9. Download (len)", resp.timing.download_len_us);
+        print_us_tag(stdout, "10. Download (bulk)", resp.timing.download_bulk_us);
+        print_us_tag(stdout, "11. Download Total", resp.timing.download_total_us);
+        print_us_tag(stdout, "12. File Write", resp.timing.file_write_us);
+        print_us_tag(stdout, "13. Cleanup", resp.timing.cleanup_us);
+        print_us_tag(stdout, "TOTAL", (unsigned long)resp.time_us);
         /*
         printf("  原始大小: %ld bytes (%.2f MB)\n", req.input_size, req.input_size / 1048576.0);
         printf("  压缩大小: %ld bytes (%.2f MB)\n", resp.output_size, resp.output_size / 1048576.0);

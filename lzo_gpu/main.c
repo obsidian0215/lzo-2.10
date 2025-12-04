@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include "timing.h"
 
 static char argv0[256]; // 存储程序名
 
@@ -52,7 +53,8 @@ static inline uint64_t now_ns(void)
 #endif
 
 static inline void print_ns(const char* tag, uint64_t ns) {
-    printf("%-22s : %8.3f ms\n", tag, ns / 1e6);
+    unsigned long us = (unsigned long)(ns / 1000ULL);
+    print_us_tag(stdout, tag, us);
 }
 
 static void choose_blocking(size_t in_sz, cl_device_id dev,

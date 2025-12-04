@@ -378,16 +378,19 @@ int daemon_decompress(
            kernel_thrpt);
     fprintf(stderr, "==============================\n\n");    /* 打印详细的时间分解（与standalone格式一致）*/
     fprintf(stderr, "\n=== Time Breakdown (Decompression) ===\n");
-    fprintf(stderr, "1. Buffer Alloc      : %8.3f ms\n", buf_us / 1000.0);
-    fprintf(stderr, "2. Data Upload       : %8.3f ms\n", upload_us / 1000.0);
-    fprintf(stderr, "3. Setup Args        : %8.3f ms\n", setup_us / 1000.0);
-    fprintf(stderr, "4. Kernel Exec       : %8.3f ms\n", exec_host_us / 1000.0);
+    print_us_tag(stderr, "1. Buffer Alloc", buf_us);
+    print_us_tag(stderr, "2. Data Upload", upload_us);
+    print_us_tag(stderr, "3. Setup Args", setup_us);
+    print_us_tag(stderr, "4. Kernel Exec", exec_host_us);
     if (exec_us_ev) {
-        fprintf(stderr, "   (event profiling) : %8.3f ms\n", exec_us_ev / 1000.0);
+        /* Indicate event-profiling based kernel time:
+         * use a dedicated tag, preserving the indenting style for readability
+         */
+        print_us_tag(stderr, "   (event profiling)", exec_us_ev);
     }
-    fprintf(stderr, "5. Data Download     : %8.3f ms\n", download_us / 1000.0);
-    fprintf(stderr, "6. File Write        : %8.3f ms\n", write_us / 1000.0);
-    fprintf(stderr, "TOTAL                : %8.3f ms\n", *time_us_out / 1000.0);
+    print_us_tag(stderr, "5. Data Download", download_us);
+    print_us_tag(stderr, "6. File Write", write_us);
+    print_us_tag(stderr, "TOTAL", (unsigned long)(*time_us_out));
     fprintf(stderr, "\n");
 
         /* 计算占比（与standalone格式一致），保护除以零 */

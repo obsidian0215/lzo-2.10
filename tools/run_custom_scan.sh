@@ -2,7 +2,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PARAM_SCAN="$ROOT/tools/param_scan.sh"
-OUT_DIR="$ROOT/exp_results/lzo_gpu/logs"
+# Default OUT_DIR is inside lzo_gpu/exp_results to keep all logs and results
+# under the lzo_gpu tree (as requested). Allow overriding by environment var.
+OUT_DIR="${OUT_DIR:-$ROOT/lzo_gpu/exp_results/logs}"
 SAMPLES_DIR="/root/samples"
 
 if [ ! -x "$PARAM_SCAN" ]; then
@@ -15,6 +17,7 @@ if [ -d "$OUT_DIR" ]; then
   mv "$OUT_DIR" "${OUT_DIR}.bak.$(date +%s)" || true
 fi
 mkdir -p "$OUT_DIR"
+export OUT_DIR
 
 REPEATS=3
 COMP_LEVELS="1,1k,1l,1o"
@@ -31,7 +34,8 @@ export LZO_MT_IO_THREADS="$MT_THREADS"
 echo "Starting daemon to support daemon-mode tests (if present)"
 if [ -x "$ROOT/lzo_gpu/lzo_gpu_daemon" ]; then
   if ! pgrep -f lzo_gpu_daemon >/dev/null 2>&1; then
-    (cd "$ROOT/lzo_gpu" && nohup ./lzo_gpu_daemon > /tmp/lzo_gpu_daemon.stdout.log 2>&1 &) || true
+    # Redirect daemon stdout to the OUT_DIR so logs remain inside lzo_gpu/exp_results
+    (cd "$ROOT/lzo_gpu" && nohup ./lzo_gpu_daemon > "$OUT_DIR/lzo_gpu_daemon.stdout.log" 2>&1 &) || true
     sleep 1
   else
     echo "Daemon already running"
@@ -45,14 +49,19 @@ export LZO_STANDARD_COPY_MODES="0"
 export LZO_MT_IO_MODES="1"
 unset LZO_ASYNC_UPLOAD
 export LZO_RUNNERS="standalone,daemon"
-nohup bash "$PARAM_SCAN" -s "$SAMPLES_DIR" || true
+LOGFILE="$OUT_DIR/param_scan_zero_mt_$(date +%s).log"
+echo "Logging param_scan output to $LOGFILE"
+# Run in foreground so analysis runs after param_scan completes; redirect all output to OUT_DIR
+bash "$PARAM_SCAN" -s "$SAMPLES_DIR" >> "$LOGFILE" 2>&1 || true
 
 echo "Running std_async (standard copy + async upload) across runners"
 export LZO_STANDARD_COPY_MODES="1"
 export LZO_MT_IO_MODES="0"
 export LZO_ASYNC_UPLOAD="1"
 export LZO_RUNNERS="standalone,daemon"
-nohup bash "$PARAM_SCAN" -s "$SAMPLES_DIR" || true
+LOGFILE="$OUT_DIR/param_scan_std_async_$(date +%s).log"
+echo "Logging param_scan output to $LOGFILE"
+bash "$PARAM_SCAN" -s "$SAMPLES_DIR" >> "$LOGFILE" 2>&1 || true
 
 echo "Completed runs for requested modes. Now run analysis & plotting"
 python3 "$ROOT/tools/analysis.py" analyze -i "$OUT_DIR/param_scans" -o "$OUT_DIR/summary.csv" || true

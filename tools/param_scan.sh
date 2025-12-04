@@ -20,6 +20,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRAPDIR="$ROOT/lzo_gpu"
 OUT_DIR="${OUT_DIR:-$ROOT/exp_results/lzo_gpu/logs/param_scans}"
 mkdir -p "$OUT_DIR"
+TMP_BASE="$OUT_DIR/tmp"
+mkdir -p "$TMP_BASE"
 
 # Defaults
 SAMPLES_DIR_DEFAULT="/root/samples"
@@ -192,9 +194,9 @@ for comp_level in "${COMP_LEVELS[@]}"; do
             mkdir -p "$cfg_dir_mode"
 
               if type lzo_mktemp_dir >/dev/null 2>&1; then
-                lzo_mktemp_dir tmp_run_dir || tmp_run_dir=$(mktemp -d /tmp/lzo_gpu_tmp.XXXXXX)
+                lzo_mktemp_dir tmp_run_dir || tmp_run_dir=$(mktemp -d "$TMP_BASE/lzo_gpu_tmp.XXXXXX")
               else
-                tmp_run_dir=$(mktemp -d /tmp/lzo_gpu_tmp.XXXXXX)
+                tmp_run_dir=$(mktemp -d "$TMP_BASE/lzo_gpu_tmp.XXXXXX")
               fi
 
               out_lzo="$tmp_run_dir/lzo_out_${sname}_run${r}.lzo"
@@ -247,7 +249,7 @@ for comp_level in "${COMP_LEVELS[@]}"; do
                 # Attempt to start daemon if not running
                 if ! pgrep -f lzo_gpu_daemon >/dev/null 2>&1; then
                   echo "Starting lzo_gpu_daemon for runner=daemon"
-                  (cd "$WRAPDIR" && nohup ./lzo_gpu_daemon > /tmp/lzo_gpu_daemon.stdout.log 2>&1 &) || true
+                  (cd "$WRAPDIR" && nohup ./lzo_gpu_daemon > "$OUT_DIR/lzo_gpu_daemon.stdout.log" 2>&1 &) || true
                   sleep 0.5
                 fi
               else

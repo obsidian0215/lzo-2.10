@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include "lzo_defaults.h"
+#include "timing.h"
 
 /* Helper for multi-threaded pread into a destination buffer.
  * Each thread handles a subrange (off,len) of the destination.
@@ -140,7 +141,9 @@ static inline uint64_t now_ns(void)
 #endif
 
 static inline void print_ns(const char* tag, uint64_t ns) {
-    printf("%-22s : %8.3f ms\n", tag, ns / 1e6);
+    unsigned long us = (unsigned long)(ns / 1000ULL);
+    /* print_us_tag is provided by timing.h */
+    print_us_tag(stdout, tag, us);
 }
 
 /* 解析块大小字符串，支持单位: B/KB/K/MB/M/GB/G，默认单位为KB */
@@ -947,6 +950,15 @@ int main(int argc, char** argv)
                         const char* build_opts = "-cl-std=CL2.0 -I. -I./lzo_gpu -I..";
                         err = clBuildProgram(prog_d, 1, &dev, build_opts, NULL, NULL);
                         if (err != CL_SUCCESS) {
+                            if (debug || 1) {
+                                size_t log_sz = 0;
+                                clGetProgramBuildInfo(prog_d, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
+                                char* log = malloc(log_sz+1);
+                                clGetProgramBuildInfo(prog_d, dev, CL_PROGRAM_BUILD_LOG, log_sz, log, NULL);
+                                log[log_sz]='\0';
+                                fprintf(stderr, "Build log (from source %s):\n%s\n", decomp_src, log);
+                                free(log);
+                            }
                             if (prog_d) { clReleaseProgram(prog_d); prog_d = NULL; }
                             load_failed = 1;
                         }
@@ -996,7 +1008,7 @@ int main(int argc, char** argv)
         cl_mem_flags f_comp = CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR;
         cl_mem d_comp = clCreateBuffer(ctx, f_comp, comp_sz, NULL, &err);
     CHECK(err);
-    /* 使用map上传压缩数据 */
+    /* 上传压缩数据 */
     void* mapped_comp = clEnqueueMapBuffer(q, d_comp, CL_TRUE, CL_MAP_WRITE, 0, comp_sz, 0, NULL, NULL, &err);
     CHECK(err);
     memcpy(mapped_comp, p, comp_sz);
@@ -1041,21 +1053,22 @@ int main(int argc, char** argv)
     cl_event evt_decomp;
     uint64_t t_exec_start = now_ns();
     CHECK(clEnqueueNDRangeKernel(q, krn_d, 1, NULL, &gsz, &lsz, 0, NULL, &evt_decomp));
+    /* 异步下载：启动非阻塞读取，然后立即返回（不等待） */
+    uint64_t t_read_start = now_ns();
+    cl_event evt_read;
+    unsigned char* out2 = malloc(orig_sz);
+    /* 先启动异步下载（不阻塞主线程） */
+    CHECK(clEnqueueReadBuffer(q, d_out2, CL_FALSE, 0, orig_sz, out2, 1, &evt_decomp, &evt_read));
+    /* 等待读取完成 */
+    clWaitForEvents(1, &evt_read);
     clWaitForEvents(1, &evt_decomp);
     uint64_t t_exec_end = now_ns();
-
-    /* 优化: 使用map读取解压数据(零拷贝) */
-    unsigned char* out2 = malloc(orig_sz);
-    uint64_t t_read_start = now_ns();
-    void* mapped_out2 = clEnqueueMapBuffer(q, d_out2, CL_TRUE, CL_MAP_READ, 0, orig_sz,
-                                           0, NULL, NULL, &err);
-    CHECK(err);
-    memcpy(out2, mapped_out2, orig_sz);
-    CHECK(clEnqueueUnmapMemObject(q, d_out2, mapped_out2, 0, NULL, NULL));
-    uint64_t t_read_end = now_ns();
+    uint64_t t_read_end = t_exec_end;  /* 读取完成时间 */
+    clReleaseEvent(evt_read);
 
     /* perform verify first if requested; on failure do not write and exit non-zero */
     if (verify_path) {
+        /* no debug: keep verify path clean */
         size_t ref_sz; unsigned char* ref = (unsigned char*)read_file(verify_path, &ref_sz);
         if (ref_sz != orig_sz || memcmp(ref, out2, orig_sz) != 0) {
             fprintf(stderr, "decompress verify FAILED!\n");
@@ -1106,30 +1119,38 @@ int main(int argc, char** argv)
                     return 1;
                 }
                 FILE* fo = fopen(output_path, "wb");
-                /* 使用 stdio 缓冲来减少小块 fwrite 导致的写入方差。
-                 * 默认缓冲为 LZO_DEFAULT_STDIO_BUF_MB (4MB); 不再从环境变量读取
-                 * 若需要调优，可通过CLI或将来添加的配置文件覆盖。
-                 */
-                char *vbuf = NULL;
-                /* If a per-request stdio buffer size was provided as a CLI override (not yet added),
-                 * it should be used here. For standalone mode, we keep the default LZO_DEFAULT_STDIO_BUF_MB.
-                 */
-                size_t vsize = (size_t)LZO_DEFAULT_STDIO_BUF_MB * 1024 * 1024; /* 默认 4MB */
                 if (!fo) { perror(output_path); return 1; }
-                if (orig_sz > 0) {
-                    /* cap buffer to output size */
-                    if (vsize > orig_sz) vsize = orig_sz;
-                    vbuf = (char*)malloc(vsize);
-                    if (vbuf) {
-                        if (setvbuf(fo, vbuf, _IOFBF, (int)vsize) != 0) {
-                            /* setvbuf 失败则继续，尽量不fatal */
+
+                /* 对大文件使用直接 write() 以避免 stdio 缓冲开销 */
+                int fd = fileno(fo);
+                if (fd >= 0 && orig_sz > 100 * 1024 * 1024) {
+                    /* 大文件: 使用系统 write() 直接写入 (不经过 stdio) */
+                    size_t write_chunk = 256 * 1024 * 1024;  /* 256MB chunks for fast sequential write */
+                    for (size_t offset = 0; offset < orig_sz; offset += write_chunk) {
+                        size_t to_write = (orig_sz - offset < write_chunk) ? (orig_sz - offset) : write_chunk;
+                        ssize_t written = write(fd, out2 + offset, to_write);
+                        if ((size_t)written != to_write) {
+                            perror("write"); fclose(fo); return 1;
+                        }
+                    }
+                } else {
+                    /* 小文件或无法获取 fd: 使用 stdio */
+                    char *vbuf = NULL;
+                    size_t vsize = (size_t)LZO_DEFAULT_STDIO_BUF_MB * 1024 * 1024;
+                    if (orig_sz > 0) {
+                        if (vsize > orig_sz) vsize = orig_sz;
+                        vbuf = (char*)malloc(vsize);
+                        if (vbuf && setvbuf(fo, vbuf, _IOFBF, (int)vsize) != 0) {
                             free(vbuf); vbuf = NULL;
                         }
                     }
+                    if (fwrite(out2, 1, orig_sz, fo) != orig_sz) {
+                        perror("fwrite"); if (vbuf) free(vbuf); fclose(fo); return 1;
+                    }
+                    if (vbuf) free(vbuf);
                 }
-                if (fwrite(out2, 1, orig_sz, fo) != orig_sz) { perror("fwrite"); if (vbuf) free(vbuf); fclose(fo); return 1; }
+
                 fclose(fo);
-                if (vbuf) { free(vbuf); vbuf = NULL; }
                 if (!suppress_non_data) printf("wrote %s\n", output_path);
             }
         }
@@ -1152,11 +1173,9 @@ int main(int argc, char** argv)
 #if ENABLE_COMPRESSION_RATIO_TRACKING
         /* 输出解压缩统计信息 */
         printf("\n=== Decompression Statistics ===\n");
-        printf("Compressed size  : %zu bytes (%.2f MB)\n", (size_t)lz_sz, lz_sz / (1024.0 * 1024.0));
-        printf("Output size      : %zu bytes (%.2f MB)\n", (size_t)orig_sz, orig_sz / (1024.0 * 1024.0));
-        printf("Expansion ratio  : %.2f:1 (%.2f%% of compressed)\n", ratio, 100.0 * ratio);
-        printf("Block size       : %u bytes (%u KB)\n", blk_sz, blk_sz / 1024);
-        printf("Number of blocks : %u\n", nblk);
+        printf("Compressed size    : %zu bytes (%.2f MB)\n", (size_t)lz_sz, lz_sz / (1024.0 * 1024.0));
+        printf("Output size        : %zu bytes (%.2f MB)\n", (size_t)orig_sz, orig_sz / (1024.0 * 1024.0));
+        printf("Block size (blocks):%u bytes/%u KB (%u)\n", blk_sz, blk_sz / 1024, nblk);
         printf("Kernel           : %s (vectorized=%s)\n",
                decomp_base,
                (strstr(decomp_base, "_vec") != NULL) ? "yes" : "no");
@@ -2015,17 +2034,10 @@ int main(int argc, char** argv)
 #if ENABLE_COMPRESSION_RATIO_TRACKING
     /* 输出压缩统计信息 */
     printf("\n=== Compression Statistics ===\n");
-    printf("Input size       : %zu bytes (%.2f MB)\n", in_sz, in_sz / (1024.0 * 1024.0));
-    printf("Compressed size  : %zu bytes (%.2f MB)\n", out_sz, out_sz / (1024.0 * 1024.0));
-    printf("Compression ratio: %.2f:1 (%.2f%% of original)\n", ratio, 100.0 / ratio);
-    long long space_diff = (long long)in_sz - (long long)out_sz;
-    printf("Space saved      : %lld bytes (%.2f MB, %.1f%%)\n",
-           space_diff,
-           space_diff / (1024.0 * 1024.0),
-           100.0 * (1.0 - 1.0/ratio));
-    printf("Block size       : %zu bytes (%zu KB)\n", blk, blk / 1024);
-    printf("Number of blocks : %zu\n", nblk);
-    printf("Avg block compr  : %.2f:1\n", ratio);
+    printf("Input size         : %zu bytes (%.2f MB)\n", in_sz, in_sz / (1024.0 * 1024.0));
+    printf("Compressed size    : %zu bytes (%.2f MB)\n", out_sz, out_sz / (1024.0 * 1024.0));
+    printf("Compression ratio  : %.2f:1 (%.2f%% of original)\n", ratio, 100.0 / ratio);
+    printf("Block size (blocks): %zu bytes/%zu KB (%zu)\n", blk, blk / 1024, nblk);
     printf("Kernel           : %s (from %s)\n", kernel_base, cl_src);
     printf("Work groups      : global=%zu, local=%zu\n", gsz, lsz);
     printf("Throughput       : %.2f MB/s (kernel: %.2f MB/s)\n",
@@ -2191,6 +2203,9 @@ int main(int argc, char** argv)
         clWaitForEvents(1, &evt_verify);
         unsigned char* out2 = malloc(in_sz);
         CHECK(clEnqueueReadBuffer(q, d_out2, CL_TRUE, 0, in_sz, out2, 0, NULL, NULL));
+
+        /* Optional debug: read and print per-block output lengths when env var set */
+        /* no debug (restored) */
 
         /* Phase 8.3: in_buf不再存在，重新读取原始文件用于验证 */
         size_t verify_sz;

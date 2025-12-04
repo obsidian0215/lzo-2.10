@@ -158,10 +158,15 @@ static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos,
         }
         if (offset == 4 && len >= 8) {
             uchar p0 = m_pos[0], p1 = m_pos[1], p2 = m_pos[2], p3 = m_pos[3];
+            uchar16 pat16 = (uchar16)(p0,p1,p2,p3,p0,p1,p2,p3,p0,p1,p2,p3,p0,p1,p2,p3);
             uchar8 pat8 = (uchar8)(p0,p1,p2,p3,p0,p1,p2,p3);
-            while (len >= 8) { vstore8(pat8, 0, op); op += 8; m_pos += 8; len -= 8; }
-            while (len >= 4) { *((__generic uint*)op) = *((__generic const uint*)m_pos); op += 4; len -= 4; }
-            while (len--) *op++ = *m_pos++;
+            while (len >= 16) { vstore16(pat16, 0, op); op += 16; len -= 16; }
+            while (len >= 8) { vstore8(pat8, 0, op); op += 8; len -= 8; }
+            while (len >= 4) { *op++ = p0; *op++ = p1; *op++ = p2; *op++ = p3; len -= 4; }
+            /* 尾部处理：剩余 0-3 字节 */
+            if (len >= 1) *op++ = p0;
+            if (len >= 2) *op++ = p1;
+            if (len >= 3) *op++ = p2;
             return;
         }
         if (offset == 6 && len >= 8) {
@@ -200,6 +205,19 @@ static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos,
 
     /* 长距离匹配：可以安全使用向量拷贝 */
     if (offset >= 16) {
+        /* 循环展开 + ILP 优化：交错 load/store 减少依赖链 */
+        while (len >= 64) {
+            uchar16 v0 = vload16(0, m_pos);
+            uchar16 v1 = vload16(0, m_pos + 16);
+            vstore16(v0, 0, op);          // 立即使用 v0，释放寄存器
+            uchar16 v2 = vload16(0, m_pos + 32);
+            vstore16(v1, 0, op + 16);     // 立即使用 v1
+            uchar16 v3 = vload16(0, m_pos + 48);
+            vstore16(v2, 0, op + 32);     // 立即使用 v2
+            vstore16(v3, 0, op + 48);     // 使用 v3
+            op += 64; m_pos += 64; len -= 64;
+        }
+
         /* 16字节向量拷贝 */
         while (len >= 16) {
             uchar16 v = vload16(0, m_pos);
@@ -278,11 +296,18 @@ static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos,
         /* offset=4: 重复4字节模式 */
         else if (offset == 4 && len >= 8) {
             uchar p0 = m_pos[0], p1 = m_pos[1], p2 = m_pos[2], p3 = m_pos[3];
+            uchar16 pat16 = (uchar16)(p0,p1,p2,p3,p0,p1,p2,p3,p0,p1,p2,p3,p0,p1,p2,p3);
             uchar8 pat8 = (uchar8)(p0, p1, p2, p3, p0, p1, p2, p3);
+            while (len >= 16) { vstore16(pat16, 0, op); op += 16; len -= 16; }
             while (len >= 8) {
                 vstore8(pat8, 0, op);
                 op += 8; len -= 8;
             }
+            while (len >= 4) { *op++ = p0; *op++ = p1; *op++ = p2; *op++ = p3; len -= 4; }
+            /* 尾部处理：剩余 0-3 字节 */
+            if (len >= 1) *op++ = p0;
+            if (len >= 2) *op++ = p1;
+            if (len >= 3) *op++ = p2;
         }
         /* offset=6: repeat 6-byte pattern - use 8-byte vector loads/stores
          * (reading 8 bytes from m_pos for repeated pattern is safe and faster)

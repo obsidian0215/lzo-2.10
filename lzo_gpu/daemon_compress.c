@@ -1230,23 +1230,23 @@ after_std_read:
 
     /* 打印详细的时间分解（对齐 standalone 格式）*/
     fprintf(stderr, "\n=== Time Breakdown (Compression) ===\n");
-    fprintf(stderr, "1. File Read           : %8.3f ms\n", read_us / 1000.0);
-    fprintf(stderr, "2. Blocking Calc       : %8.3f ms\n", blocking_us / 1000.0);
-    fprintf(stderr, "3. Buffer Alloc (in)   : %8.3f ms\n", buffer_in_us / 1000.0);
-    fprintf(stderr, "4. Data Upload         : %8.3f ms\n", upload_us / 1000.0);
-    fprintf(stderr, "5. Buffer Alloc (out)  : %8.3f ms\n", buffer_out_us / 1000.0);
-    fprintf(stderr, "6. Buffer Alloc (len)  : %8.3f ms\n", buffer_len_us / 1000.0);
-    fprintf(stderr, "7. Setup Args          : %8.3f ms\n", kernel_setup_us / 1000.0);
-    fprintf(stderr, "8. Kernel Exec         : %8.3f ms\n", kernel_exec_us / 1000.0);
+    print_us_tag(stderr, "1. File Read", read_us);
+    print_us_tag(stderr, "2. Blocking Calc", blocking_us);
+    print_us_tag(stderr, "3. Buffer Alloc (in)", buffer_in_us);
+    print_us_tag(stderr, "4. Data Upload", upload_us);
+    print_us_tag(stderr, "5. Buffer Alloc (out)", buffer_out_us);
+    print_us_tag(stderr, "6. Buffer Alloc (len)", buffer_len_us);
+    print_us_tag(stderr, "7. Setup Args", kernel_setup_us);
+    print_us_tag(stderr, "8. Kernel Exec", kernel_exec_us);
     if (exec_us_ev) {
-        fprintf(stderr, "   (event profiling)   : %8.3f ms\n", exec_us_ev / 1000.0);
+        print_us_tag(stderr, "   (event profiling)", exec_us_ev);
     }
-    fprintf(stderr, "9. Download (len)      : %8.3f ms\n", download_len_us / 1000.0);
-    fprintf(stderr, "10. Download (bulk)    : %8.3f ms\n", download_bulk_us / 1000.0);
-    fprintf(stderr, "11. Download Total     : %8.3f ms\n", download_us / 1000.0);
-    fprintf(stderr, "12. File Write         : %8.3f ms\n", write_us / 1000.0);
-    fprintf(stderr, "13. Cleanup            : %8.3f ms\n", cleanup_us / 1000.0);
-    fprintf(stderr, "TOTAL                  : %8.3f ms\n", total_us / 1000.0);
+    print_us_tag(stderr, "9. Download (len)", download_len_us);
+    print_us_tag(stderr, "10. Download (bulk)", download_bulk_us);
+    print_us_tag(stderr, "11. Download Total", download_us);
+    print_us_tag(stderr, "12. File Write", write_us);
+    print_us_tag(stderr, "13. Cleanup", cleanup_us);
+    print_us_tag(stderr, "TOTAL", total_us);
     fprintf(stderr, "\n");
 
         /* 计算占比（对齐 standalone 格式） - 保护除以零 */

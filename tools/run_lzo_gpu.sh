@@ -140,6 +140,8 @@ EOF
     fi
 
     mkdir -p "$PARAM_SCAN_OUT_DIR"
+    TMP_BASE="$PARAM_SCAN_OUT_DIR/tmp"
+    mkdir -p "$TMP_BASE"
 
     if [ ! -d "$SAMPLES_DIR" ]; then
       echo "Samples directory not found: $SAMPLES_DIR" >&2
@@ -197,9 +199,9 @@ EOF
           mkdir -p "$cfg_dir"
 
           if type lzo_mktemp_dir >/dev/null 2>&1; then
-            lzo_mktemp_dir tmp_run_dir || tmp_run_dir=$(mktemp -d /tmp/lzo_gpu_tmp.XXXXXX)
+            lzo_mktemp_dir tmp_run_dir || tmp_run_dir=$(mktemp -d "$TMP_BASE/lzo_gpu_tmp.XXXXXX")
           else
-            tmp_run_dir=$(mktemp -d /tmp/lzo_gpu_tmp.XXXXXX)
+            tmp_run_dir=$(mktemp -d "$TMP_BASE/lzo_gpu_tmp.XXXXXX")
           fi
 
           out_lzo="$tmp_run_dir/lzo_out_${sname}_run${r}.lzo"

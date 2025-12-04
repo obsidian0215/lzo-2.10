@@ -141,6 +141,21 @@ static double diff_ms_ts(const struct timespec *start, const struct timespec *en
     return (end->tv_sec - start->tv_sec) * 1000.0 + (end->tv_nsec - start->tv_nsec) / 1000000.0;
 }
 
+/* Helper to format a millisecond value into ms or us string depending on magnitude.
+ * Writes a compact string into 'buf' (buflen should be at least 32).
+ * For ms >= 1.0, shows '%.3f ms'; for 0 < ms < 1.0 shows '%.0f us'; for 0, prints 'N/A'.
+ */
+static void format_ms_or_us(char *buf, size_t buflen, double ms) {
+    if (!buf || buflen == 0) return;
+    if (ms <= 0.0) {
+        snprintf(buf, buflen, "N/A");
+    } else if (ms >= 1.0) {
+        snprintf(buf, buflen, "%.3f ms", ms);
+    } else {
+        snprintf(buf, buflen, "%.0f us", ms * 1000.0);
+    }
+}
+
 static size_t choose_block_size(size_t total_bytes, int threads) {
     if (threads < 1) threads = 1;
     size_t blk = (threads > 0) ? (total_bytes + (size_t)threads - 1u) / (size_t)threads : total_bytes;
@@ -564,12 +579,20 @@ static void run_benchmark(const unsigned char *data, size_t size,
     rc = decompress_block(single_comp, single_comp_len, single_out, size);
     clock_gettime(clk, &t1);
     double single_decomp_ms = diff_ms_ts(&t0, &t1);
-    fprintf(stderr, "Single  Compress : %.3f ms (%.2f MB/s)\n",
-            single_comp_ms, size ? (size / 1048576.0) / (single_comp_ms / 1000.0) : 0.0);
-    fprintf(stderr, "Single  Decompress: %.3f ms (%.2f MB/s) verify=%s\n",
-            single_decomp_ms,
-            size ? (size / 1048576.0) / (single_decomp_ms / 1000.0) : 0.0,
-            (rc == LZO_E_OK && memcmp(single_out, data, size) == 0) ? "OK" : "FAIL");
+    {
+        char s[32];
+        format_ms_or_us(s, sizeof(s), single_comp_ms);
+        fprintf(stderr, "Single  Compress : %s (%.2f MB/s)\n",
+                s, (single_comp_ms > 0.0) ? (size / 1048576.0) / (single_comp_ms / 1000.0) : 0.0);
+    }
+    {
+        char s[32];
+        format_ms_or_us(s, sizeof(s), single_decomp_ms);
+        fprintf(stderr, "Single  Decompress: %s (%.2f MB/s) verify=%s\n",
+                s,
+                (single_decomp_ms > 0.0) ? (size / 1048576.0) / (single_decomp_ms / 1000.0) : 0.0,
+                (rc == LZO_E_OK && memcmp(single_out, data, size) == 0) ? "OK" : "FAIL");
+    }
 
     free(single_out);
 
@@ -586,10 +609,14 @@ static void run_benchmark(const unsigned char *data, size_t size,
         return;
     }
 
-    fprintf(stderr, "Multi   Compress : %.3f ms (%zu blocks, %.2f MB/s)\n",
-            multi_comp_ms,
-            chunk_count,
-            size ? (size / 1048576.0) / (multi_comp_ms / 1000.0) : 0.0);
+    {
+        char s[32];
+        format_ms_or_us(s, sizeof(s), multi_comp_ms);
+        fprintf(stderr, "Multi   Compress : %s (%zu blocks, %.2f MB/s)\n",
+                s,
+                chunk_count,
+                (multi_comp_ms > 0.0) ? (size / 1048576.0) / (multi_comp_ms / 1000.0) : 0.0);
+    }
 
     unsigned char *multi_out = (unsigned char *)malloc(size ? size : 1u);
     if (!multi_out) {
@@ -603,10 +630,14 @@ static void run_benchmark(const unsigned char *data, size_t size,
 
     double multi_decomp_ms = 0.0;
     rc = decompress_multi(chunks, chunk_count, threads, &multi_decomp_ms);
-    fprintf(stderr, "Multi   Decompress: %.3f ms (%.2f MB/s) verify=%s\n",
-            multi_decomp_ms,
-            size ? (size / 1048576.0) / (multi_decomp_ms / 1000.0) : 0.0,
-            (rc == LZO_E_OK && memcmp(multi_out, data, size) == 0) ? "OK" : "FAIL");
+    {
+        char s[32];
+        format_ms_or_us(s, sizeof(s), multi_decomp_ms);
+        fprintf(stderr, "Multi   Decompress: %s (%.2f MB/s) verify=%s\n",
+                s,
+                (multi_decomp_ms > 0.0) ? (size / 1048576.0) / (multi_decomp_ms / 1000.0) : 0.0,
+                (rc == LZO_E_OK && memcmp(multi_out, data, size) == 0) ? "OK" : "FAIL");
+    }
 
     free(multi_out);
     free(single_comp);
@@ -617,7 +648,6 @@ static int compress_file(const char *input_path, const char *output_path,
                          int level, int threads, int do_bench, int verify_only) {
     struct timespec t_total_start, t_total_end;
     clock_gettime(CLOCK_MONOTONIC, &t_total_start);
-
     struct timespec t_read_start, t_read_end;
     clock_gettime(CLOCK_MONOTONIC, &t_read_start);
 
@@ -706,9 +736,14 @@ static int compress_file(const char *input_path, const char *output_path,
             free_compression_chunks(chunks, chunk_count);
             return 1;
         }
-        fprintf(stderr, "Verify OK: in=%zu out=%zu ratio=%.2f%% comp_time=%.3fms decomp_time=%.3fms\n",
+        {
+            char comp_s[32], decomp_s[32];
+            format_ms_or_us(comp_s, sizeof(comp_s), comp_ms);
+            format_ms_or_us(decomp_s, sizeof(decomp_s), multi_decomp_ms);
+            fprintf(stderr, "Verify OK: in=%zu out=%zu ratio=%.2f%% comp_time=%s decomp_time=%s\n",
                 input_size, total_comp, input_size ? (100.0 * total_comp / input_size) : 0.0,
-                comp_ms, multi_decomp_ms);
+                comp_s, decomp_s);
+        }
         free(multi_out);
         /* skip writing output file when verifying */
     } else {
@@ -744,17 +779,19 @@ static int compress_file(const char *input_path, const char *output_path,
         }
 
         if (verify_only) {
+            char comp_s[32];
+            format_ms_or_us(comp_s, sizeof(comp_s), comp_ms);
             fprintf(stderr,
-                    "Compressed %zu bytes -> %zu bytes (%.2f%%) blocks=%zu block_sz=%zu threads=%d alg=%s time=%.3f ms (%.2f MB/s)\n",
-                    input_size,
-                    total_comp,
-                    input_size ? (100.0 * total_comp / input_size) : 0.0,
-                    chunk_count,
-                    block_size,
-                    threads,
-                    alg_to_str(used_alg),
-                    comp_ms,
-                    comp_ms > 0.0 ? (input_size / 1048576.0) / (comp_ms / 1000.0) : 0.0);
+                "Compressed %zu bytes -> %zu bytes (%.2f%%) blocks=%zu block_sz=%zu threads=%d alg=%s time=%s (%.2f MB/s)\n",
+                input_size,
+                total_comp,
+                input_size ? (100.0 * total_comp / input_size) : 0.0,
+                chunk_count,
+                block_size,
+                threads,
+                alg_to_str(used_alg),
+                comp_s,
+                comp_ms > 0.0 ? (input_size / 1048576.0) / (comp_ms / 1000.0) : 0.0);
         } else {
             fprintf(stderr,
                     "Compressed %zu bytes -> %zu bytes (%.2f%%) blocks=%zu block_sz=%zu threads=%d alg=%s\n",
@@ -765,14 +802,21 @@ static int compress_file(const char *input_path, const char *output_path,
                     block_size,
                     threads,
                     alg_to_str(used_alg));
-            fprintf(stderr,
-                    "[TIMING] 总耗时=%.3fms (%.2f MB/s): 读文件=%.3fms, 算法=%.3fms, 准备=%.3fms, 写文件=%.3fms\n",
+                {
+                char read_s[32], comp_s[32], prepare_s[32], write_s[32];
+                format_ms_or_us(read_s, sizeof(read_s), read_ms);
+                format_ms_or_us(comp_s, sizeof(comp_s), comp_ms);
+                format_ms_or_us(prepare_s, sizeof(prepare_s), prepare_ms);
+                format_ms_or_us(write_s, sizeof(write_s), write_ms);
+                fprintf(stderr,
+                    "[TIMING] 总耗时=%.3fms (%.2f MB/s): 读文件=%s, 算法=%s, 准备=%s, 写文件=%s\n",
                     total_ms,
                     total_ms > 0.0 ? (input_size / 1048576.0) / (total_ms / 1000.0) : 0.0,
-                    read_ms,
-                    comp_ms,
-                    prepare_ms,
-                    write_ms);
+                    read_s,
+                    comp_s,
+                    prepare_s,
+                    write_s);
+                }
         }
     }
 
@@ -880,15 +924,19 @@ static int decompress_file(const char *input_path, const char *output_path,
 
     if (verify_only) {
         /* Don't write output; just report verification via successful decompression */
-        fprintf(stderr,
-                "Verify decompress OK: compressed=%zu decompressed=%u (blocks=%u block_sz=%u threads=%d time=%.3f ms %.2f MB/s)\n",
+        {
+            char decomp_s[32];
+            format_ms_or_us(decomp_s, sizeof(decomp_s), decomp_ms);
+            fprintf(stderr,
+                "Verify decompress OK: compressed=%zu decompressed=%u (blocks=%u block_sz=%u threads=%d time=%s %.2f MB/s)\n",
                 total_comp,
                 orig_sz,
                 nblk,
                 blk_sz,
                 threads,
-                decomp_ms,
+                decomp_s,
                 decomp_ms > 0.0 ? (orig_sz / 1048576.0) / (decomp_ms / 1000.0) : 0.0);
+        }
     } else {
         if (write_entire(output_path, output, output_size) != 0) {
             fprintf(stderr, "failed to write output\n");
@@ -898,15 +946,19 @@ static int decompress_file(const char *input_path, const char *output_path,
             return 1;
         }
 
-        fprintf(stderr,
-                "Decompressed %zu bytes -> %u bytes (blocks=%u block_sz=%u threads=%d time=%.3f ms %.2f MB/s)\n",
+        {
+            char decomp_s[32];
+            format_ms_or_us(decomp_s, sizeof(decomp_s), decomp_ms);
+            fprintf(stderr,
+                "Decompressed %zu bytes -> %u bytes (blocks=%u block_sz=%u threads=%d time=%s %.2f MB/s)\n",
                 total_comp,
                 orig_sz,
                 nblk,
                 blk_sz,
                 threads,
-                decomp_ms,
+                decomp_s,
                 decomp_ms > 0.0 ? (orig_sz / 1048576.0) / (decomp_ms / 1000.0) : 0.0);
+        }
     }
 
     free(output);
@@ -927,13 +979,14 @@ static int parse_int(const char *s, int *out) {
 
 static void print_usage(const char *prog) {
         fprintf(stderr,
-            "Usage: %s [options] <input> [output]\n"
+            "Usage: %s [options] <input>\n"
             "Options:\n"
             "  -d              Decompress instead of compress\n"
             "  -t <threads>    Worker thread count (default %d)\n"
             "  --verify        Verify round-trip instead of writing outputs\n"
-            "  -L <alg>        Select algorithm variant.\n"
+            "  -l <alg>        Select algorithm variant.\n"
             "                  Allowed values: 1, 1k, 1l, 1o. Not valid with -d.\n"
+            "  -o <path>       Output path (- for stdout). If omitted a default is generated from input\n"
             "  --benchmark     Run benchmark metrics after operation\n"
             "  -h, --help      Show this help\n"
             "  Use '-' for stdin/stdout. Output defaults to input with .lzo (compress)\n"
@@ -960,11 +1013,29 @@ int main(int argc, char **argv) {
     const char *output = NULL;
     char *auto_output = NULL;
 
-    for (int i = 1; i < argc; ++i) {
+    int arg_idx = 1;
+    /* Support compact numeric flags like -1/-2/-3/-4 to select common strategy, or -d for decompress.
+     * These are accepted as the first argument, mirroring the behavior of lzo_gpu and other tools.
+     */
+    if (argc >= 2) {
+        if (strcmp(argv[1], "-d") == 0) {
+            mode_decompress = 1; arg_idx = 2;
+        } else if (strcmp(argv[1], "-1") == 0) {
+            level = 1; arg_idx = 2;
+        } else if (strcmp(argv[1], "-2") == 0) {
+            level = 2; arg_idx = 2;
+        } else if (strcmp(argv[1], "-3") == 0 || strcmp(argv[1], "-c") == 0) {
+            level = 3; arg_idx = 2;
+        } else if (strcmp(argv[1], "-4") == 0) {
+            level = 4; arg_idx = 2;
+        }
+    }
+
+    for (int i = arg_idx; i < argc; ++i) {
         const char *arg = argv[i];
         if (strcmp(arg, "-d") == 0) {
             if (kernel_spec) {
-                fprintf(stderr, "-L cannot be used with -d (decompress mode)\n");
+                fprintf(stderr, "-l cannot be used with -d (decompress mode)\n");
                 print_usage(argv[0]);
                 free(auto_output);
                 return 1;
@@ -986,15 +1057,23 @@ int main(int argc, char **argv) {
             do_bench = 1;
         } else if (strcmp(arg, "--verify") == 0) {
             verify_only = 1;
-        } else if (strcmp(arg, "-L") == 0) {
+        } else if (strcmp(arg, "-o") == 0 || strcmp(arg, "--output") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "-L requires an argument\n");
+                fprintf(stderr, "-o requires an argument\n");
+                print_usage(argv[0]);
+                free(auto_output);
+                return 1;
+            }
+            output = argv[++i];
+        } else if (strcmp(arg, "-l") == 0 || strcmp(arg, "-L") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "-l requires an argument\n");
                 print_usage(argv[0]);
                 free(auto_output);
                 return 1;
             }
             if (mode_decompress) {
-                fprintf(stderr, "-L cannot be used with -d (decompress mode)\n");
+                fprintf(stderr, "-l cannot be used with -d (decompress mode)\n");
                 print_usage(argv[0]);
                 free(auto_output);
                 return 1;
@@ -1003,7 +1082,7 @@ int main(int argc, char **argv) {
             /* validate allowed labels */
             if (!(strcasecmp(kernel_spec, "1") == 0 || strcasecmp(kernel_spec, "1k") == 0 ||
                   strcasecmp(kernel_spec, "1l") == 0 || strcasecmp(kernel_spec, "1o") == 0)) {
-                fprintf(stderr, "-L accepts only: 1, 1k, 1l, 1o\n");
+                fprintf(stderr, "-l accepts only: 1, 1k, 1l, 1o\n");
                 print_usage(argv[0]);
                 free(auto_output);
                 return 1;
@@ -1078,7 +1157,7 @@ int main(int argc, char **argv) {
 
     int rc;
     /* If a kernel/algorithm specifier was provided, map it to a compression level.
-    * -L is intended to select algorithm variant (e.g. 1x, 1k, 1o, 1l) and can
+    * -l is intended to select algorithm variant (e.g. 1x, 1k, 1o, 1l) and can
     * be used instead of numeric flags. If mapping fails, we leave numeric level.
      */
     /* Only set a default algorithm label when compressing; do not set/print
@@ -1179,4 +1258,19 @@ static int compress_block_into(const unsigned char *in, size_t in_size,
     if (rc != LZO_E_OK) return rc;
     *out_size = (size_t)dst_len;
     return LZO_E_OK;
+}
+
+/* Helper: print a timing value in microseconds with a friendly unit.
+ * If value is zero, print N/A. For >=1000 us, print ms with fractional parts;
+ * otherwise print integer microseconds.
+ */
+static inline void print_us_tag(FILE *f, const char *tag, unsigned long us) {
+    if (!f) return;
+    if (us == 0) {
+        fprintf(f, "%-22s : %8s\n", tag, "N/A");
+    } else if (us >= 1000UL) {
+        fprintf(f, "%-22s : %8.3f ms\n", tag, us / 1000.0);
+    } else {
+        fprintf(f, "%-22s : %8lu us\n", tag, us);
+    }
 }

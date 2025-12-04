@@ -2,7 +2,7 @@
 # Unified LZO CPU benchmark runner
 # Supports three modes:
 #   single - Run single configuration (original run_lzo_cpu.sh)
-#   batch  - Run batch tests with iterations (original run_full_test.sh)  
+#   batch  - Run batch tests with iterations (original run_full_test.sh)
 #   sweep  - Run parameter sweep experiments (original run_full_experiments.sh)
 
 set -euo pipefail
@@ -245,12 +245,12 @@ run_single_mode() {
           verify_out_file="$run_dir/verify.log"
           cmd_prefix=$(pin_cmd)
           echo "[$(date -u)] sample=$sample_base alg=$alg threads=$threads iter=$it" | tee -a "$LOG_FILE"
-          
+
           # Compress
           if [ -n "$cmd_prefix" ]; then
-            eval "$cmd_prefix \"$BIN\" \"$sample\" \"$outtmp\" -L $alg -t $threads" > "$comp_out_file" 2>&1 || true
+            eval "$cmd_prefix \"$BIN\" -l $alg -t $threads -o \"$outtmp\" \"$sample\"" > "$comp_out_file" 2>&1 || true
           else
-            "$BIN" "$sample" "$outtmp" -L "$alg" -t $threads > "$comp_out_file" 2>&1 || true
+            "$BIN" -l "$alg" -t $threads -o "$outtmp" "$sample" > "$comp_out_file" 2>&1 || true
           fi
           comp_out=$(cat "$comp_out_file")
           comp_bytes=$(grep -oE -- '-> [0-9]+ bytes' "$comp_out_file" | head -n1 | grep -oE '[0-9]+' || echo 0)
@@ -260,9 +260,9 @@ run_single_mode() {
 
           # Decompress verify
           if [ -n "$cmd_prefix" ]; then
-            eval "$cmd_prefix \"$BIN\" -d --verify \"$outtmp\" -t $threads" > "$verify_out_file" 2>&1 || true
+            eval "$cmd_prefix \"$BIN\" -d --verify -t $threads \"$outtmp\"" > "$verify_out_file" 2>&1 || true
           else
-            "$BIN" -d --verify "$outtmp" -t $threads > "$verify_out_file" 2>&1 || true
+            "$BIN" -d --verify -t $threads "$outtmp" > "$verify_out_file" 2>&1 || true
           fi
           decomp_out=$(cat "$verify_out_file")
           decomp_ms=$(grep -oE -- 'time=[0-9]+\.[0-9]+' "$verify_out_file" | tail -n1 | sed 's/time=//' || echo 0)
@@ -309,7 +309,7 @@ run_batch_mode() {
   OUT_DIR="$OUT_DIR/full_test"
   mkdir -p "$OUT_DIR"
   CSV_FILE="$OUT_DIR/full_test_results.csv"
-  
+
   # Check binary exists
   if [[ ! -x "$BIN" ]]; then
     echo "Error: Binary not found or not executable: $BIN" >&2
@@ -348,29 +348,29 @@ run_batch_mode() {
 
   for sample_path in "${SAMPLES[@]}"; do
     sample_name=$(basename "$sample_path")
-    
+
     for alg in "${ALGS[@]}"; do
       for threads in "${THREADS[@]}"; do
         for iter in $(seq 1 $BATCH_ITERATIONS); do
           current_test=$((current_test + 1))
           progress=$((current_test * 100 / total_tests))
-          
+
           echo -ne "\r[Progress: $progress% ($current_test/$total_tests)] Testing: $sample_name alg=$alg threads=$threads iter=$iter"
-          
+
           # Run compression test with taskset
-          output=$(taskset -c "$BATCH_CPU_CORES" "$BIN" -L "$alg" -t "$threads" --benchmark "$sample_path" 2>&1 || true)
-          
+          output=$(taskset -c "$BATCH_CPU_CORES" "$BIN" -l "$alg" -t "$threads" --benchmark -o "$outtmp" "$sample_path" 2>&1 || true)
+
           # Parse output
           orig_bytes=$(echo "$output" | grep -oP 'Compressed \K[0-9]+' | head -1 || echo "0")
           comp_bytes=$(echo "$output" | grep -oP 'Compressed [0-9]+ bytes -> \K[0-9]+' | head -1 || echo "0")
           ratio=$(echo "$output" | grep -oP '\(\K[0-9.]+(?=%\))' | head -1 || echo "0")
-          
+
           # Multi Compress/Decompress lines
           comp_time=$(echo "$output" | grep 'Multi.*Compress' | grep -oP '\K[0-9.]+(?= ms)' || echo "0")
           comp_mbps=$(echo "$output" | grep 'Multi.*Compress' | grep -oP '\(.*\K[0-9.]+(?= MB/s)' || echo "0")
           decomp_time=$(echo "$output" | grep 'Multi.*Decompress' | grep -oP '\K[0-9.]+(?= ms)' || echo "0")
           decomp_mbps=$(echo "$output" | grep 'Multi.*Decompress' | grep -oP '\K[0-9.]+(?= MB/s)' || echo "0")
-          
+
           # Write to CSV (atomic write with flock if available)
           if command -v flock &> /dev/null; then
             (
@@ -607,7 +607,7 @@ run_sweep_mode() {
     local name=$1; shift
     local outdir="$OUT_DIR/$name"
     mkdir -p "$outdir"
-    
+
     # Build runner command - call this script in single mode
     cmd=( "$0" "single" -o "$outdir" "$@" )
     printf '%q ' "${cmd[@]}" > "$outdir/run_cmd.txt"
