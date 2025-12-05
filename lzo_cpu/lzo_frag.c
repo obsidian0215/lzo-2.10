@@ -793,30 +793,31 @@ static int compress_file(const char *input_path, const char *output_path,
                 comp_s,
                 comp_ms > 0.0 ? (input_size / 1048576.0) / (comp_ms / 1000.0) : 0.0);
         } else {
+            // Calculate throughput: overall and kernel
+            double throughput = total_ms > 0.0 ? (input_size / 1048576.0) / (total_ms / 1000.0) : 0.0;
+            double kernel_throughput = comp_ms > 0.0 ? (input_size / 1048576.0) / (comp_ms / 1000.0) : 0.0;
+            double ratio_pct = input_size ? (100.0 * total_comp / input_size) : 0.0;
+
             fprintf(stderr,
                     "Compressed %zu bytes -> %zu bytes (%.2f%%) blocks=%zu block_sz=%zu threads=%d alg=%s\n",
                     input_size,
                     total_comp,
-                    input_size ? (100.0 * total_comp / input_size) : 0.0,
+                    ratio_pct,
                     chunk_count,
                     block_size,
                     threads,
                     alg_to_str(used_alg));
-                {
-                char read_s[32], comp_s[32], prepare_s[32], write_s[32];
-                format_ms_or_us(read_s, sizeof(read_s), read_ms);
-                format_ms_or_us(comp_s, sizeof(comp_s), comp_ms);
-                format_ms_or_us(prepare_s, sizeof(prepare_s), prepare_ms);
-                format_ms_or_us(write_s, sizeof(write_s), write_ms);
-                fprintf(stderr,
-                    "[TIMING] 总耗时=%.3fms (%.2f MB/s): 读文件=%s, 算法=%s, 准备=%s, 写文件=%s\n",
-                    total_ms,
-                    total_ms > 0.0 ? (input_size / 1048576.0) / (total_ms / 1000.0) : 0.0,
-                    read_s,
-                    comp_s,
-                    prepare_s,
-                    write_s);
-                }
+
+            // Output timing in GPU-compatible format
+            fprintf(stderr, "=== Timing Breakdown ===\n");
+            fprintf(stderr, "1. File Read       : %.2f ms (%.1f%%)\n", read_ms, total_ms > 0 ? 100.0*read_ms/total_ms : 0);
+            fprintf(stderr, "2. Compress        : %.2f ms (%.1f%%)\n", comp_ms, total_ms > 0 ? 100.0*comp_ms/total_ms : 0);
+            fprintf(stderr, "3. Prepare Output  : %.2f ms (%.1f%%)\n", prepare_ms, total_ms > 0 ? 100.0*prepare_ms/total_ms : 0);
+            fprintf(stderr, "4. File Write      : %.2f ms (%.1f%%)\n", write_ms, total_ms > 0 ? 100.0*write_ms/total_ms : 0);
+            fprintf(stderr, "------------------------\n");
+            fprintf(stderr, "TOTAL              : %.2f ms\n", total_ms);
+            fprintf(stderr, "Throughput         : %.2f MB/s (kernel: %.2f MB/s)\n", throughput, kernel_throughput);
+            fprintf(stderr, "Compression ratio  : %.2f%% (%.2f : 1)\n", ratio_pct, ratio_pct > 0 ? 100.0/ratio_pct : 0);
         }
     }
 
@@ -830,8 +831,16 @@ static int compress_file(const char *input_path, const char *output_path,
 
 static int decompress_file(const char *input_path, const char *output_path,
                            int threads, int verify_only) {
+#ifdef CLOCK_MONOTONIC_RAW
+    const clockid_t clk = CLOCK_MONOTONIC_RAW;
+#else
+    const clockid_t clk = CLOCK_MONOTONIC;
+#endif
+    struct timespec t_total_start, t_read_end, t_write_start, t_write_end, t_total_end;
+    clock_gettime(clk, &t_total_start);
     size_t comp_size = 0;
     unsigned char *comp = read_entire(input_path, &comp_size);
+    clock_gettime(clk, &t_read_end);
     if (!comp && comp_size != 0) return 1;
 
     if (comp_size < 14u) {
@@ -922,22 +931,35 @@ static int decompress_file(const char *input_path, const char *output_path,
         return 1;
     }
 
+    double read_ms = diff_ms_ts(&t_total_start, &t_read_end);
+    double write_ms = 0.0;
+
     if (verify_only) {
-        /* Don't write output; just report verification via successful decompression */
-        {
-            char decomp_s[32];
-            format_ms_or_us(decomp_s, sizeof(decomp_s), decomp_ms);
-            fprintf(stderr,
-                "Verify decompress OK: compressed=%zu decompressed=%u (blocks=%u block_sz=%u threads=%d time=%s %.2f MB/s)\n",
-                total_comp,
-                orig_sz,
-                nblk,
-                blk_sz,
-                threads,
-                decomp_s,
-                decomp_ms > 0.0 ? (orig_sz / 1048576.0) / (decomp_ms / 1000.0) : 0.0);
-        }
+        clock_gettime(clk, &t_total_end);
+        double total_ms = diff_ms_ts(&t_total_start, &t_total_end);
+        double throughput = total_ms > 0.0 ? (orig_sz / 1048576.0) / (total_ms / 1000.0) : 0.0;
+        double kernel_throughput = decomp_ms > 0.0 ? (orig_sz / 1048576.0) / (decomp_ms / 1000.0) : 0.0;
+
+        fprintf(stderr, "Verify decompress OK\n");
+        fprintf(stderr, "\n=== Decompression Statistics ===\n");
+        fprintf(stderr, "Compressed size    : %zu bytes (%.2f MB)\n", total_comp, total_comp / 1048576.0);
+        fprintf(stderr, "Output size        : %u bytes (%.2f MB)\n", orig_sz, orig_sz / 1048576.0);
+        fprintf(stderr, "Block size (blocks): %u bytes/%u KB (%u)\n", blk_sz, blk_sz / 1024, nblk);
+        fprintf(stderr, "Threads            : %d\n", threads);
+        fprintf(stderr, "Throughput         : %.2f MB/s (kernel: %.2f MB/s)\n", throughput, kernel_throughput);
+        fprintf(stderr, "==============================\n\n");
+
+        fprintf(stderr, "=== Time Breakdown (Decompression) ===\n");
+        fprintf(stderr, "1. File Read           : %8.3f ms\n", read_ms);
+        fprintf(stderr, "2. Decompress          : %8.3f ms\n", decomp_ms);
+        fprintf(stderr, "TOTAL                  : %8.3f ms\n", total_ms);
+        fprintf(stderr, "\n=== Percentage Breakdown ===\n");
+        double denom = total_ms > 0.0 ? total_ms : 1.0;
+        fprintf(stderr, "Decompress      : %6.2f%%\n", 100.0 * decomp_ms / denom);
+        fprintf(stderr, "File Read       : %6.2f%%\n", 100.0 * read_ms / denom);
+        fprintf(stderr, "\n");
     } else {
+        clock_gettime(clk, &t_write_start);
         if (write_entire(output_path, output, output_size) != 0) {
             fprintf(stderr, "failed to write output\n");
             free(output);
@@ -945,20 +967,36 @@ static int decompress_file(const char *input_path, const char *output_path,
             free(chunks);
             return 1;
         }
+        clock_gettime(clk, &t_write_end);
+        clock_gettime(clk, &t_total_end);
 
-        {
-            char decomp_s[32];
-            format_ms_or_us(decomp_s, sizeof(decomp_s), decomp_ms);
-            fprintf(stderr,
-                "Decompressed %zu bytes -> %u bytes (blocks=%u block_sz=%u threads=%d time=%s %.2f MB/s)\n",
-                total_comp,
-                orig_sz,
-                nblk,
-                blk_sz,
-                threads,
-                decomp_s,
-                decomp_ms > 0.0 ? (orig_sz / 1048576.0) / (decomp_ms / 1000.0) : 0.0);
-        }
+        write_ms = diff_ms_ts(&t_write_start, &t_write_end);
+        double total_ms = diff_ms_ts(&t_total_start, &t_total_end);
+        double throughput = total_ms > 0.0 ? (orig_sz / 1048576.0) / (total_ms / 1000.0) : 0.0;
+        double kernel_throughput = decomp_ms > 0.0 ? (orig_sz / 1048576.0) / (decomp_ms / 1000.0) : 0.0;
+
+        fprintf(stderr, "wrote %s\n", output_path);
+        fprintf(stderr, "\n=== Decompression Statistics ===\n");
+        fprintf(stderr, "Compressed size    : %zu bytes (%.2f MB)\n", total_comp, total_comp / 1048576.0);
+        fprintf(stderr, "Output size        : %u bytes (%.2f MB)\n", orig_sz, orig_sz / 1048576.0);
+        fprintf(stderr, "Block size (blocks): %u bytes/%u KB (%u)\n", blk_sz, blk_sz / 1024, nblk);
+        fprintf(stderr, "Threads            : %d\n", threads);
+        fprintf(stderr, "Throughput         : %.2f MB/s (kernel: %.2f MB/s)\n", throughput, kernel_throughput);
+        fprintf(stderr, "==============================\n\n");
+
+        fprintf(stderr, "=== Time Breakdown (Decompression) ===\n");
+        fprintf(stderr, "1. File Read           : %8.3f ms\n", read_ms);
+        fprintf(stderr, "2. Decompress          : %8.3f ms\n", decomp_ms);
+        fprintf(stderr, "3. File Write          : %8.3f ms\n", write_ms);
+        fprintf(stderr, "TOTAL                  : %8.3f ms\n", total_ms);
+        fprintf(stderr, "\n=== Percentage Breakdown ===\n");
+        double denom = total_ms > 0.0 ? total_ms : 1.0;
+        fprintf(stderr, "Decompress      : %6.2f%%\n", 100.0 * decomp_ms / denom);
+        fprintf(stderr, "File I/O        : %6.2f%% (read=%.2f%% + write=%.2f%%)\n",
+            100.0 * (read_ms + write_ms) / denom,
+            100.0 * read_ms / denom,
+            100.0 * write_ms / denom);
+        fprintf(stderr, "\n");
     }
 
     free(output);

@@ -226,27 +226,47 @@ int decompress_with_daemon(const char* input, const char* output)
 
     // 处理响应
     if (resp.status == 0) {
-        /* Decompression path: show consistent breakdown matching daemon_decompress */
-        printf("解压缩成功: %s -> %s\n", input, output);
-        /* Printers align with daemon_decompress logging so the harness can parse them reliably */
-        print_us_tag(stdout, "1. File Read", resp.timing.file_read_us);
-        print_us_tag(stdout, "2. OCL Init", resp.timing.ocl_init_us);
-        print_us_tag(stdout, "3. Kernel Load", resp.timing.kernel_load_us);
-        print_us_tag(stdout, "4. Buffer Alloc", resp.timing.buffer_alloc_in_us);
-        print_us_tag(stdout, "5. Data Upload", resp.timing.data_upload_us);
-        print_us_tag(stdout, "6. Setup Args", resp.timing.setup_args_us);
-        print_us_tag(stdout, "7. Kernel Exec", resp.timing.kernel_exec_us);
-        print_us_tag(stdout, "8. Data Download", resp.timing.download_total_us);
-        print_us_tag(stdout, "9. File Write", resp.timing.file_write_us);
-        print_us_tag(stdout, "TOTAL", (unsigned long)resp.time_us);
-        /*
-        printf("  压缩大小: %ld bytes (%.2f MB)\n", req.input_size, req.input_size / 1048576.0);
-        printf("  原始大小: %ld bytes (%.2f MB)\n", resp.output_size, resp.output_size / 1048576.0);
-        printf("  扩展比:   %.4f:1\n", (double)resp.output_size / req.input_size);
-        printf("  耗时:     %.3f ms\n", resp.time_us / 1000.0);
-        printf("  吞吐量:   %.2f MB/s\n", (resp.output_size / 1048576.0) / (resp.time_us / 1000000.0));
-        printf("  %s\n", resp.message);
-        */
+        /* Decompression path: output format matching lzo_gpu standalone */
+        double orig_mb = resp.output_size / (1024.0 * 1024.0);
+        double comp_mb = req.input_size / (1024.0 * 1024.0);
+        double total_ms = resp.time_us / 1000.0;
+        double kernel_ms = resp.timing.kernel_exec_us / 1000.0;
+        double throughput = total_ms > 0 ? orig_mb / (total_ms / 1000.0) : 0;
+        double kernel_throughput = kernel_ms > 0 ? orig_mb / (kernel_ms / 1000.0) : 0;
+
+        fprintf(stderr, "\n=== Decompression Statistics ===\n");
+        fprintf(stderr, "Compressed size  : %zu bytes (%.2f MB)\n", (size_t)req.input_size, comp_mb);
+        fprintf(stderr, "Output size      : %zu bytes (%.2f MB)\n", (size_t)resp.output_size, orig_mb);
+        fprintf(stderr, "Expansion ratio  : %.2f:1\n", req.input_size > 0 ? (double)resp.output_size / req.input_size : 0);
+        fprintf(stderr, "Throughput       : %.2f MB/s (kernel: %.2f MB/s)\n", throughput, kernel_throughput);
+        fprintf(stderr, "==============================\n\n");
+
+        fprintf(stderr, "=== Timing Breakdown ===\n");
+        fprintf(stderr, "1. File Read       : %.2f ms (%.1f%%)\n",
+                resp.timing.file_read_us / 1000.0,
+                resp.time_us > 0 ? 100.0 * resp.timing.file_read_us / resp.time_us : 0);
+        fprintf(stderr, "2. Buffer Alloc    : %.2f ms (%.1f%%)\n",
+                resp.timing.buffer_alloc_in_us / 1000.0,
+                resp.time_us > 0 ? 100.0 * resp.timing.buffer_alloc_in_us / resp.time_us : 0);
+        fprintf(stderr, "3. Data Upload     : %.2f ms (%.1f%%)\n",
+                resp.timing.data_upload_us / 1000.0,
+                resp.time_us > 0 ? 100.0 * resp.timing.data_upload_us / resp.time_us : 0);
+        fprintf(stderr, "4. Setup Args      : %.2f ms (%.1f%%)\n",
+                resp.timing.setup_args_us / 1000.0,
+                resp.time_us > 0 ? 100.0 * resp.timing.setup_args_us / resp.time_us : 0);
+        fprintf(stderr, "5. Kernel Exec     : %.2f ms (%.1f%%)\n",
+                resp.timing.kernel_exec_us / 1000.0,
+                resp.time_us > 0 ? 100.0 * resp.timing.kernel_exec_us / resp.time_us : 0);
+        fprintf(stderr, "6. Data Download   : %.2f ms (%.1f%%)\n",
+                resp.timing.download_total_us / 1000.0,
+                resp.time_us > 0 ? 100.0 * resp.timing.download_total_us / resp.time_us : 0);
+        fprintf(stderr, "7. File Write      : %.2f ms (%.1f%%)\n",
+                resp.timing.file_write_us / 1000.0,
+                resp.time_us > 0 ? 100.0 * resp.timing.file_write_us / resp.time_us : 0);
+        fprintf(stderr, "------------------------\n");
+        fprintf(stderr, "TOTAL              : %.2f ms\n", total_ms);
+        fprintf(stderr, "Throughput         : %.2f MB/s (kernel: %.2f MB/s)\n", throughput, kernel_throughput);
+
         return 0;
     } else {
         fprintf(stderr, "解压缩失败: %s\n", resp.message);
@@ -327,36 +347,49 @@ int compress_with_daemon(const char* input, const char* output, int level)
 
     // 处理响应
     if (resp.status == 0) {
-        /* Compression path: show breakdown matching daemon_compress logging */
-        printf("压缩成功: %s -> %s\n", input, output);
-        print_us_tag(stdout, "1. File Read", resp.timing.file_read_us);
-        print_us_tag(stdout, "2. Blocking Calc", resp.timing.blocking_calc_us);
-        print_us_tag(stdout, "3. Buffer Alloc (in)", resp.timing.buffer_alloc_in_us);
-        print_us_tag(stdout, "4. Data Upload", resp.timing.data_upload_us);
-        print_us_tag(stdout, "5. Buffer Alloc (out)", resp.timing.buffer_alloc_out_us);
-        print_us_tag(stdout, "6. Buffer Alloc (len)", resp.timing.buffer_alloc_len_us);
-        print_us_tag(stdout, "7. Setup Args", resp.timing.setup_args_us);
-        print_us_tag(stdout, "8. Kernel Exec", resp.timing.kernel_exec_us);
-        print_us_tag(stdout, "9. Download (len)", resp.timing.download_len_us);
-        print_us_tag(stdout, "10. Download (bulk)", resp.timing.download_bulk_us);
-        print_us_tag(stdout, "11. Download Total", resp.timing.download_total_us);
-        print_us_tag(stdout, "12. File Write", resp.timing.file_write_us);
-        print_us_tag(stdout, "13. Cleanup", resp.timing.cleanup_us);
-        print_us_tag(stdout, "TOTAL", (unsigned long)resp.time_us);
-        /*
-        printf("  原始大小: %ld bytes (%.2f MB)\n", req.input_size, req.input_size / 1048576.0);
-        printf("  压缩大小: %ld bytes (%.2f MB)\n", resp.output_size, resp.output_size / 1048576.0);
-        printf("  压缩比:   %.4f:1 (节省 %.2f%%)\n",
-               (double)req.input_size / resp.output_size,
-               (1.0 - (double)resp.output_size / req.input_size) * 100);
-        printf("  总耗时:   %.3f ms (%.2f MB/s)\n",
-               resp.time_us / 1000.0,
-               (req.input_size / 1048576.0) / (resp.time_us / 1000000.0));
-        printf("  [时间分解] 读文件=%.2fms, 缓冲区=%.2fms, 上传=%.2fms, Kernel=%.2fms, 下载=%.2fms, 写文件=%.2fms, 清理=%.2fms\n",
-               resp.read_us/1000.0, resp.buffer_us/1000.0, resp.upload_us/1000.0, resp.kernel_us/1000.0,
-               resp.download_us/1000.0, resp.write_us/1000.0, resp.cleanup_us/1000.0);
-        printf("  %s\n", resp.message);
-        */
+        /* Compression path: output format matching lzo_gpu standalone */
+        double orig_mb = req.input_size / (1024.0 * 1024.0);
+        double comp_mb = resp.output_size / (1024.0 * 1024.0);
+        double total_ms = resp.time_us / 1000.0;
+        double kernel_ms = resp.timing.kernel_exec_us / 1000.0;
+        double throughput = total_ms > 0 ? orig_mb / (total_ms / 1000.0) : 0;
+        double kernel_throughput = kernel_ms > 0 ? orig_mb / (kernel_ms / 1000.0) : 0;
+        double ratio = resp.output_size > 0 ? (double)req.input_size / resp.output_size : 0;
+        double ratio_pct = req.input_size > 0 ? 100.0 * resp.output_size / req.input_size : 0;
+
+        fprintf(stderr, "\n=== Compression Statistics ===\n");
+        fprintf(stderr, "Input size       : %zu bytes (%.2f MB)\n", (size_t)req.input_size, orig_mb);
+        fprintf(stderr, "Compressed size  : %zu bytes (%.2f MB)\n", (size_t)resp.output_size, comp_mb);
+        fprintf(stderr, "Compression ratio: %.2f:1 (%.2f%% of original)\n", ratio, ratio_pct);
+        fprintf(stderr, "Throughput       : %.2f MB/s (kernel: %.2f MB/s)\n", throughput, kernel_throughput);
+        fprintf(stderr, "==============================\n\n");
+
+        fprintf(stderr, "=== Timing Breakdown ===\n");
+        fprintf(stderr, "1. File Read       : %.2f ms (%.1f%%)\n",
+                resp.timing.file_read_us / 1000.0,
+                resp.time_us > 0 ? 100.0 * resp.timing.file_read_us / resp.time_us : 0);
+        fprintf(stderr, "2. Blocking Calc   : %.2f ms (%.1f%%)\n",
+                resp.timing.blocking_calc_us / 1000.0,
+                resp.time_us > 0 ? 100.0 * resp.timing.blocking_calc_us / resp.time_us : 0);
+        fprintf(stderr, "3. Buffer Alloc    : %.2f ms (%.1f%%)\n",
+                resp.timing.buffer_alloc_in_us / 1000.0,
+                resp.time_us > 0 ? 100.0 * resp.timing.buffer_alloc_in_us / resp.time_us : 0);
+        fprintf(stderr, "4. Data Upload     : %.2f ms (%.1f%%)\n",
+                resp.timing.data_upload_us / 1000.0,
+                resp.time_us > 0 ? 100.0 * resp.timing.data_upload_us / resp.time_us : 0);
+        fprintf(stderr, "5. Kernel Exec     : %.2f ms (%.1f%%)\n",
+                resp.timing.kernel_exec_us / 1000.0,
+                resp.time_us > 0 ? 100.0 * resp.timing.kernel_exec_us / resp.time_us : 0);
+        fprintf(stderr, "6. Data Download   : %.2f ms (%.1f%%)\n",
+                resp.timing.download_total_us / 1000.0,
+                resp.time_us > 0 ? 100.0 * resp.timing.download_total_us / resp.time_us : 0);
+        fprintf(stderr, "7. File Write      : %.2f ms (%.1f%%)\n",
+                resp.timing.file_write_us / 1000.0,
+                resp.time_us > 0 ? 100.0 * resp.timing.file_write_us / resp.time_us : 0);
+        fprintf(stderr, "------------------------\n");
+        fprintf(stderr, "TOTAL              : %.2f ms\n", total_ms);
+        fprintf(stderr, "Throughput         : %.2f MB/s (kernel: %.2f MB/s)\n", throughput, kernel_throughput);
+
         return 0;
     } else {
         fprintf(stderr, "压缩失败: %s\n", resp.message);
@@ -372,12 +405,35 @@ int compress_with_daemon(const char* input, const char* output, int level)
  * 默认level=1 (lzo1x_1): 基于性能测试,所有变体速度相近,
  * 选择D_BITS=14的标准版本以获得最佳通用性
  */
+static void show_help(const char* prog) {
+    fprintf(stderr, "LZO GPU Client - 通过守护进程进行 GPU 加速压缩/解压\n\n");
+    fprintf(stderr, "用法: %s [选项] <input>\n", prog);
+    fprintf(stderr, "选项:\n");
+    fprintf(stderr, "  -L, -l, --level <1|1k|1l|1o>  压缩级别 (默认: 1l)\n");
+    fprintf(stderr, "  -d, --decompress              解压缩模式\n");
+    fprintf(stderr, "  -o, --output <file>           指定输出文件\n");
+    fprintf(stderr, "  -h, --help                    显示此帮助信息\n\n");
+    fprintf(stderr, "示例:\n");
+    fprintf(stderr, "  %s input.txt -o output.lzo           # 使用 level=1l 压缩\n", prog);
+    fprintf(stderr, "  %s -l 1k input.txt -o output.lzo     # 使用 lzo1x_1k 压缩\n", prog);
+    fprintf(stderr, "  %s -d input.lzo -o output.txt        # 解压缩\n", prog);
+    fprintf(stderr, "  %s -d input.lzo                      # 解压缩 (自动去除 .lzo 后缀)\n\n", prog);
+    fprintf(stderr, "环境变量 (客户端请求选项):\n");
+    fprintf(stderr, "  LZO_STANDARD_COPY=0|1    使用标准 host->device 拷贝 (默认: 0=zero-copy)\n");
+    fprintf(stderr, "  LZO_MT_IO=0|1            启用多线程 I/O (默认: 0)\n");
+    fprintf(stderr, "  LZO_MT_IO_THREADS=N      I/O 线程数 (1-32; 默认: %d)\n", LZO_DEFAULT_MT_IO_THREADS);
+    fprintf(stderr, "  LZO_FIXED_BLOCK_SIZE=N   固定块大小 (KB) (0=自适应)\n");
+    fprintf(stderr, "  LZO_DECOMP_VEC=0|1       使用向量化解压 (默认: 1)\n");
+    fprintf(stderr, "\n注意: 需要先启动 lzo_gpu_daemon 守护进程\n");
+}
+
 int main(int argc, char** argv)
 {
     const char* input = NULL;
     const char* output = NULL;
     int level = 7;  // 默认: lzo1x_1 (D_BITS=14, 标准配置)
     char operation = 'C';  // 默认压缩
+    int show_help_flag = 0;
 
     // Parse client-level CLI options (per-request overrides) first
     set_request_defaults(&g_cli_req_flags);
@@ -386,7 +442,7 @@ int main(int argc, char** argv)
     // 解析参数
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            input = NULL; output = NULL; // force help print below
+            show_help_flag = 1;
             break;
         }
         if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) {
@@ -425,15 +481,23 @@ int main(int argc, char** argv)
         }
     }
 
+    // 显示帮助
+    if (show_help_flag || argc < 2) {
+        show_help(argv[0]);
+        return show_help_flag ? 0 : 1;
+    }
+
     /* If output not provided, compute sensible defaults:
      * - For compression: input -> input + ".lzo"
      * - For decompression: if input ends with .lzo, strip it; else append ".dec"
      */
+    if (!input) {
+        fprintf(stderr, "错误: 未指定输入文件\n");
+        show_help(argv[0]);
+        return 1;
+    }
+
     if (!output) {
-        if (!input) {
-            fprintf(stderr, "错误: 未指定输入文件\n");
-            return 1;
-        }
         size_t ilen = strlen(input);
         if (operation == 'C') {
             size_t n = ilen + 5 + 1; /* ".lzo" + NUL */
@@ -462,54 +526,6 @@ int main(int argc, char** argv)
             }
         }
     }
-
-    // 检查必需参数
-    if (!input || !output) {
-        fprintf(stderr, "用法: %s [选项] <input>\n", argv[0]);
-        fprintf(stderr, "选项:\n");
-        fprintf(stderr, "  -L, -l, --level <1|1k|1l|1o>  压缩级别 (默认: 1l)\n");
-        fprintf(stderr, "  -d, --decompress          解压缩模式\n");
-        fprintf(stderr, "  -o, --output <out>        指定输出文件 (必须)\n");
-        fprintf(stderr, "  -h, --help                Show this help\n\n");
-
-        fprintf(stderr, "Examples:\n");
-        fprintf(stderr, "  %s input.txt -o output.lzo           # 使用level=1l压缩\n", argv[0]);
-        fprintf(stderr, "  %s -l 1k input.txt -o output.lzo     # 使用lzo1x_1k压缩\n", argv[0]);
-        fprintf(stderr, "  %s -d input.lzo -o output.txt        # 解压缩 (输出必须使用 -o/--output)\n\n", argv[0]);
-
-        fprintf(stderr, "Client / per-request options (via environment variables):\n");
-        fprintf(stderr, "  LZO_STANDARD_COPY=0|1    Request daemon to use standard host->device copy (default: 0=zero-copy)\n");
-        /* LZO_FORCE_MAP removed: use LZO_STANDARD_COPY to select mapping */
-        fprintf(stderr, "  LZO_MT_IO=0|1            Enable multi-threaded I/O for reads/uploads (default: 0)\n");
-        fprintf(stderr, "  LZO_MT_IO_THREADS=N      Number of I/O threads (1-32; default: %d)\n", LZO_DEFAULT_MT_IO_THREADS);
-        fprintf(stderr, "  LZO_FIXED_BLOCK_SIZE=N   Request fixed block size (KB) for daemon (0 = adaptive)\n");
-        fprintf(stderr, "  LZO_ASYNC_UPLOAD=0|1    Request daemon to use asynchronous uploads (non-blocking clEnqueueWriteBuffer)\n");
-        fprintf(stderr, "  LZO_OPENCL_DEVICE=CPU|GPU Select device preference for daemon (daemon may ignore)\n");
-        fprintf(stderr, "  LZO_DECOMP_VEC=0|1       Prefer vectorized decompressor (daemon-side; default:1)\n");
-        fprintf(stderr, "  LZO_COALESCE_OUTPUT=0|1  Enable coalesced file output (default: same as daemon defaults)\n");
-        fprintf(stderr, "  LZO_COALESCE_CHUNK_MB=N   Coalesce chunk size in MB (default from lzo_defaults.h)\n");
-        fprintf(stderr, "  LZO_COALESCE_MAX_MB=N     Max MB to coalesce in one write (default from lzo_defaults.h)\n");
-        fprintf(stderr, "  LZO_STDIO_BUF_MB=N        Size of stdio write buffer in MB (default from lzo_defaults.h)\n\n");
-
-        fprintf(stderr, "Notes:\n");
-        fprintf(stderr, "  - The client reads these environment variables and sends them per-request to the daemon.\n");
-        fprintf(stderr, "  - The daemon may choose to accept or ignore certain preferences (device choice, etc.) depending on its configuration.\n\n");
-
-        return 1;
-    }
-
-    /* Parse additional client CLI flags (sets per-request options that
-     * override env vars). These are non-positional flags that may come
-     * anywhere on the command line, so parse them now.
-     */
-    /* initialize defaults (-1 = unspecified) */
-    {
-        /* We'll do this on a local request obj later, for now just parse values. */
-    }
-
-    /* Perform parsing of per-request flags to override env options */
-    // (we parse whole argv but non-positionally so the earlier simple parsing is preserved)
-    // note: the parse_client_cli_opts uses getopt_long which doesn't consume positional arguments necessarily
 
     /* If the operation is decompression, go to decompress path */
     if (operation == 'D') {

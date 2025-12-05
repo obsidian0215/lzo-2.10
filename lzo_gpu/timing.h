@@ -35,12 +35,12 @@ typedef struct {
 
 /* Helper: print a timing value given in microseconds, choosing a human-friendly
  * unit. For values >= 1000 us, print ms with fractional parts. For values < 1000
- * us, print as integer microseconds. If a value is 0, print "N/A" for clarity.
+ * us, print as integer microseconds. If a value is 0, print "0.000 ms" (e.g., zero-copy mode).
  */
 static inline void print_us_tag(FILE *f, const char *tag, unsigned long us) {
     if (!f) return;
     if (us == 0) {
-        fprintf(f, "%-22s : %8s\n", tag, "N/A");
+        fprintf(f, "%-22s : %8.3f ms\n", tag, 0.0);  /* zero-copy mode */
     } else if (us >= 1000ul) {
         fprintf(f, "%-22s : %8.3f ms\n", tag, us / 1000.0);
     } else {

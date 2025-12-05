@@ -13,6 +13,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <errno.h>
+#include <libgen.h>
+#include <linux/limits.h>
 #include "lzo_defaults.h"
 #include "timing.h"
 
@@ -695,6 +697,8 @@ int main(int argc, char** argv)
     /* debug is now global */
     int verify_flag = 0; /* only when set, do roundtrip/verify prints */
     int decompress_mode = 0;
+    int daemon_mode = 0;      /* --daemon: start as daemon */
+    int use_daemon_mode = 0;  /* --use-daemon: delegate to daemon */
     const char *in_path = NULL;
     const char *lz_path = NULL;
     const char *orig_path = NULL;
@@ -712,6 +716,8 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) { show_help = 1; }
         if (strcmp(argv[i], "-d") == 0) { decompress_mode = 1; }
+        if (strcmp(argv[i], "--daemon") == 0) { daemon_mode = 1; }
+        if (strcmp(argv[i], "--use-daemon") == 0) { use_daemon_mode = 1; }
     }
 
     /* pass 2: parse options and positionals with knowledge of mode */
@@ -742,6 +748,8 @@ int main(int argc, char** argv)
             continue;
         }
         if (strcmp(arg, "-d") == 0) { /* already noted */ continue; }
+        if (strcmp(arg, "--daemon") == 0) { /* already noted */ continue; }
+        if (strcmp(arg, "--use-daemon") == 0) { /* already noted */ continue; }
         /* positional */
         if (arg[0] != '-') {
             if (decompress_mode) {
@@ -818,7 +826,70 @@ int main(int argc, char** argv)
         printf("\n  Which binary honors which option:\n");
         printf("    - standalone (./lzo_gpu) supports all above flags and exposes low-level control (best for local testing).\n");
         printf("    - daemon (./lzo_gpu_daemon) accepts per-request options sent by clients (see lzo_gpu_client help). Some global daemon-config flags may still be ignored.\n");
+        printf("\nDaemon mode:\n");
+        printf("  --daemon                   Start as a daemon server (pre-initialize OpenCL, accept requests via socket)\n");
+        printf("  --use-daemon               Delegate compression/decompression to a running daemon (faster for repeated operations)\n");
         return 0;
+    }
+
+    /* Handle --daemon mode: start daemon server */
+    if (daemon_mode) {
+        fprintf(stderr, "Starting LZO GPU daemon...\n");
+        /* Execute the daemon binary */
+        char daemon_path[PATH_MAX];
+        char *self_path = realpath("/proc/self/exe", NULL);
+        if (self_path) {
+            char *dir = dirname(self_path);
+            snprintf(daemon_path, sizeof(daemon_path), "%s/lzo_gpu_daemon", dir);
+            free(self_path);
+        } else {
+            strcpy(daemon_path, "./lzo_gpu_daemon");
+        }
+        execl(daemon_path, "lzo_gpu_daemon", NULL);
+        perror("Failed to start daemon");
+        return 1;
+    }
+
+    /* Handle --use-daemon mode: delegate to daemon via client */
+    if (use_daemon_mode) {
+        char client_path[PATH_MAX];
+        char *self_path = realpath("/proc/self/exe", NULL);
+        if (self_path) {
+            char *dir = dirname(self_path);
+            snprintf(client_path, sizeof(client_path), "%s/lzo_gpu_client", dir);
+            free(self_path);
+        } else {
+            strcpy(client_path, "./lzo_gpu_client");
+        }
+
+        /* Build argument list for client */
+        char *client_argv[20];
+        int client_argc = 0;
+        client_argv[client_argc++] = "lzo_gpu_client";
+
+        if (decompress_mode) {
+            client_argv[client_argc++] = "-d";
+        } else {
+            client_argv[client_argc++] = "-L";
+            client_argv[client_argc++] = (char*)comp_level;
+        }
+
+        if (output_path) {
+            client_argv[client_argc++] = "-o";
+            client_argv[client_argc++] = (char*)output_path;
+        }
+
+        if (decompress_mode && lz_path) {
+            client_argv[client_argc++] = (char*)lz_path;
+        } else if (in_path) {
+            client_argv[client_argc++] = (char*)in_path;
+        }
+
+        client_argv[client_argc] = NULL;
+
+        execv(client_path, client_argv);
+        perror("Failed to execute client");
+        return 1;
     }
 
     /* Decompress mode */
@@ -1040,9 +1111,10 @@ int main(int argc, char** argv)
     CHECK(clSetKernelArg(krn_d, 6, sizeof(cl_uint), &nblk));
     uint64_t t_upload_end = now_ns();
 
-    /* 解压优化: local_size=8 可提升20%性能 (测试显示8是最优值)
-     * 原因: 解压无需大量私有内存，可利用work-group的cache共享 */
-    size_t lsz = 8;  /* 优化: 从1改为8, 解压性能 +20.2% */
+    /* 解压优化: local_size=1 最优 (每个work-item独立处理一个块)
+     * 测试结果: local_size=1 比 local_size=8 快 ~180% (3050 vs 1091 MB/s)
+     * 原因: 解压是独立任务，无需work-group协作，local_size=1避免同步开销 */
+    size_t lsz = 1;  /* 优化: 从8改回1, 解压性能 +180% */
     const char* local_size_env = getenv("LZO_LOCAL_SIZE");
     if (local_size_env) {
         lsz = (size_t)atoi(local_size_env);
@@ -1053,17 +1125,20 @@ int main(int argc, char** argv)
     cl_event evt_decomp;
     uint64_t t_exec_start = now_ns();
     CHECK(clEnqueueNDRangeKernel(q, krn_d, 1, NULL, &gsz, &lsz, 0, NULL, &evt_decomp));
+    uint64_t t_kernel_end = now_ns();
+
     /* 异步下载：启动非阻塞读取，然后立即返回（不等待） */
     uint64_t t_read_start = now_ns();
     cl_event evt_read;
     unsigned char* out2 = malloc(orig_sz);
     /* 先启动异步下载（不阻塞主线程） */
     CHECK(clEnqueueReadBuffer(q, d_out2, CL_FALSE, 0, orig_sz, out2, 1, &evt_decomp, &evt_read));
-    /* 等待读取完成 */
-    clWaitForEvents(1, &evt_read);
+
+    /* 等待kernel和读取完成 */
     clWaitForEvents(1, &evt_decomp);
     uint64_t t_exec_end = now_ns();
-    uint64_t t_read_end = t_exec_end;  /* 读取完成时间 */
+    clWaitForEvents(1, &evt_read);
+    uint64_t t_read_end = now_ns();
     clReleaseEvent(evt_read);
 
     /* perform verify first if requested; on failure do not write and exit non-zero */
@@ -1144,7 +1219,9 @@ int main(int argc, char** argv)
                             free(vbuf); vbuf = NULL;
                         }
                     }
-                    if (fwrite(out2, 1, orig_sz, fo) != orig_sz) {
+                    size_t written = fwrite(out2, 1, orig_sz, fo);
+                    fflush(fo);  /* 确保数据写入 */
+                    if (written != orig_sz) {
                         perror("fwrite"); if (vbuf) free(vbuf); fclose(fo); return 1;
                     }
                     if (vbuf) free(vbuf);
@@ -1163,8 +1240,8 @@ int main(int argc, char** argv)
         double ms_kernel_load = (t_kernel_load_end - t_kernel_load_start)/1e6;
         double ms_buffer = (t_buffer_end - t_buffer_start)/1e6;
         double ms_upload = (t_upload_end - t_upload_start)/1e6;
-        double ms_kernel = (t_exec_end - t_exec_start)/1e6;
-        double ms_download = (t_read_end - t_read_start)/1e6;
+        double ms_kernel = (t_exec_end - t_exec_start)/1e6;  /* kernel执行时间 */
+        double ms_download = (t_read_end - t_exec_end)/1e6;  /* kernel完成后的数据传输时间 */
         double ms_write = (t_write_end - t_write_start)/1e6;
         double ms_total = (t_total_end - t_start_total)/1e6;
         double ratio = lz_sz > 0 ? (double)orig_sz / (double)lz_sz : 0.0;
@@ -1194,7 +1271,7 @@ int main(int argc, char** argv)
         print_ns("4. Buffer Alloc", t_buffer_end - t_buffer_start);
         print_ns("5. Data Upload", t_upload_end - t_upload_start);
         print_ns("6. Kernel Exec", t_exec_end - t_exec_start);
-        print_ns("7. Data Download", t_read_end - t_read_start);
+        print_ns("7. Data Download", t_read_end - t_exec_end);
         print_ns("8. File Write", t_write_end - t_write_start);
         print_ns("TOTAL", t_total_end - t_start_total);
         printf("\n");
@@ -1204,6 +1281,7 @@ int main(int argc, char** argv)
          /* protect against zero total */
          double denom = (ms_total > 0.0) ? ms_total : 1.0;
          int zero_total = (ms_total <= 0.0);
+
          printf("Kernel Exec     : %6.2f%%\n", zero_total ? 0.0 : 100.0 * ms_kernel / denom);
          printf("Data Transfer   : %6.2f%% (upload=%.2f%% + download=%.2f%%)\n",
              zero_total ? 0.0 : 100.0 * (ms_upload + ms_download) / denom,

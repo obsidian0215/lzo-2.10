@@ -282,8 +282,12 @@ static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos,
             uchar8 pat8 = (uchar8)(p0, p1, p0, p1, p0, p1, p0, p1);
             while (len >= 8) {
                 vstore8(pat8, 0, op);
-                op += 8; len -= 8;
+                op += 8; m_pos += 8; len -= 8;
             }
+            /* 尾部处理 */
+            while (len >= 2) { *op++ = p0; *op++ = p1; len -= 2; }
+            if (len >= 1) *op++ = p0;
+            return;
         }
         /* offset=3: 重复3字节模式 */
         else if (offset == 3 && len >= 6) {
@@ -292,6 +296,10 @@ static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos,
                 op[0] = c0; op[1] = c1; op[2] = c2;
                 op += 3; len -= 3;
             }
+            /* 尾部处理 */
+            if (len >= 1) *op++ = c0;
+            if (len >= 2) *op++ = c1;
+            return;
         }
         /* offset=4: 重复4字节模式 */
         else if (offset == 4 && len >= 8) {
@@ -308,6 +316,7 @@ static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos,
             if (len >= 1) *op++ = p0;
             if (len >= 2) *op++ = p1;
             if (len >= 3) *op++ = p2;
+            return;
         }
         /* offset=6: repeat 6-byte pattern - use 8-byte vector loads/stores
          * (reading 8 bytes from m_pos for repeated pattern is safe and faster)
@@ -317,11 +326,25 @@ static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos,
             uchar8 pat8 = (uchar8)(p0, p1, p2, p3, p4, p5, p0, p1);
             while (len >= 8) {
                 vstore8(pat8, 0, op);
-                op += 8; len -= 8;
+                op += 8; m_pos += 8; len -= 8;
             }
+            /* 尾部处理 */
+            while (len >= 6) {
+                op[0] = p0; op[1] = p1; op[2] = p2; op[3] = p3; op[4] = p4; op[5] = p5;
+                op += 6; len -= 6;
+            }
+            if (len >= 1) *op++ = p0;
+            if (len >= 2) *op++ = p1;
+            if (len >= 3) *op++ = p2;
+            if (len >= 4) *op++ = p3;
+            if (len >= 5) *op++ = p4;
+            return;
         }
-        /* offset=5-7: 无法安全使用vload8 (需要读取8字节但只有offset字节有效)
-         * 直接fallthrough到标量拷贝 */
+        /* offset=5,7: 无法安全使用向量拷贝，使用标量拷贝 */
+        else {
+            while (len--) *op++ = *m_pos++;
+            return;
+        }
     }
 
     /* 尾部逐字节拷贝 */
