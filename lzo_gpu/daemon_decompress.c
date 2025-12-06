@@ -13,6 +13,12 @@
 #include <stdint.h>
 #include <time.h>
 
+/* Phase 8: 输出Buffer缓存阈值 (MB)
+ * 小于此阈值的输出buffer会被缓存复用，避免频繁分配
+ * 大于此阈值的会每次释放，防止GPU内存耗尽
+ * 可通过 LZO_DECOMP_CACHE_MB 环境变量调整 */
+#define DEFAULT_DECOMP_CACHE_MB 256
+
 #define CHECK(err) do { if ((err) != CL_SUCCESS) { \
     fprintf(stderr, "OpenCL error %d at %s:%d\n", (err), __FILE__, __LINE__); \
     return -1; \
@@ -39,7 +45,9 @@ static struct {
 } decomp_buffer_cache = {0};
 
 static cl_mem get_or_create_buffer(cl_context ctx, cl_mem* cached_buf, size_t* cached_size,
-                                    size_t required_size, cl_mem_flags flags, cl_int* err_out) {
+                                    size_t required_size, cl_mem_flags flags, cl_int* err_out,
+                                    const char* name) {
+    (void)name; /* suppress unused warning in release builds */
     if (*cached_size < required_size) {
         if (*cached_buf) {
             clReleaseMemObject(*cached_buf);
@@ -183,22 +191,22 @@ int daemon_decompress(
 
     cl_mem d_comp = get_or_create_buffer(ctx, &decomp_buffer_cache.d_comp,
                                          &decomp_buffer_cache.comp_size,
-                                         comp_sz, CL_MEM_READ_ONLY, &err);
+                                         comp_sz, CL_MEM_READ_ONLY, &err, "d_comp");
     CHECK(err);
 
     cl_mem d_off = get_or_create_buffer(ctx, &decomp_buffer_cache.d_off,
                                         &decomp_buffer_cache.off_size,
-                                        (nblk + 1) * sizeof(cl_uint), CL_MEM_READ_ONLY, &err);
+                                        (nblk + 1) * sizeof(cl_uint), CL_MEM_READ_ONLY, &err, "d_off");
     CHECK(err);
 
     cl_mem d_out = get_or_create_buffer(ctx, &decomp_buffer_cache.d_out,
                                         &decomp_buffer_cache.out_size,
-                                        orig_sz, CL_MEM_WRITE_ONLY, &err);
+                                        orig_sz, CL_MEM_WRITE_ONLY, &err, "d_out");
     CHECK(err);
 
     cl_mem d_out_lens = get_or_create_buffer(ctx, &decomp_buffer_cache.d_out_lens,
                                              &decomp_buffer_cache.lens_size,
-                                             nblk * sizeof(cl_uint), CL_MEM_WRITE_ONLY, &err);
+                                             nblk * sizeof(cl_uint), CL_MEM_WRITE_ONLY, &err, "d_out_lens");
     CHECK(err);
 
     uint64_t t_buf_end = now_ns();
@@ -325,19 +333,29 @@ int daemon_decompress(
 
     uint64_t t_write_end = now_ns();
 
-    // 10. 清理输出buffer以避免GPU内存耗尽 (保留输入buffer缓存以提升性能)
-    /* 解压缩的输出buffer每次都可能很大(800MB+)，如果缓存会导致GPU内存不足
-     * 因此每次都释放输出buffer，只保留输入相关的buffer缓存 */
-    if (decomp_buffer_cache.d_out) {
-        clReleaseMemObject(decomp_buffer_cache.d_out);
-        decomp_buffer_cache.d_out = NULL;
-        decomp_buffer_cache.out_size = 0;
+    // 10. 智能缓存策略: 小buffer缓存复用，大buffer每次释放
+    /* 读取缓存阈值: 默认256MB，可通过 LZO_DECOMP_CACHE_MB 调整 */
+    size_t cache_threshold_mb = DEFAULT_DECOMP_CACHE_MB;
+    const char* cache_env = getenv("LZO_DECOMP_CACHE_MB");
+    if (cache_env) {
+        cache_threshold_mb = (size_t)atoi(cache_env);
     }
-    if (decomp_buffer_cache.d_out_lens) {
-        clReleaseMemObject(decomp_buffer_cache.d_out_lens);
-        decomp_buffer_cache.d_out_lens = NULL;
-        decomp_buffer_cache.lens_size = 0;
+    size_t cache_threshold = cache_threshold_mb * 1024 * 1024;
+
+    /* 只有当输出buffer超过阈值时才释放，否则保留供下次复用 */
+    if (orig_sz > cache_threshold) {
+        if (decomp_buffer_cache.d_out) {
+            clReleaseMemObject(decomp_buffer_cache.d_out);
+            decomp_buffer_cache.d_out = NULL;
+            decomp_buffer_cache.out_size = 0;
+        }
+        if (decomp_buffer_cache.d_out_lens) {
+            clReleaseMemObject(decomp_buffer_cache.d_out_lens);
+            decomp_buffer_cache.d_out_lens = NULL;
+            decomp_buffer_cache.lens_size = 0;
+        }
     }
+    /* else: 保留buffer缓存供下次使用 */
 
     // free(lz_buf); // 已移除
     free(off_arr);
