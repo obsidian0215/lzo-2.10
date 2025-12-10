@@ -31,6 +31,18 @@ typedef struct {
 
     unsigned long file_write_us;
     unsigned long cleanup_us;
+    /* Additional meta fields communicated through the timing struct so clients
+     * receive the same levels of detail as standalone logs. These are used by
+     * the client to surface block/kernel/workgroup information in client
+     * output. They are intentionally placed at the end of the struct so
+     * existing timing field layout remains stable for backward compatibility.
+     */
+    unsigned long blk_size_bytes; /* block size in bytes (blk_sz) */
+    unsigned long nblk;          /* number of blocks */
+    unsigned long global_size;   /* global work size used for kernel */
+    unsigned long local_size;    /* local work size used for kernel */
+    char kernel_name[32];        /* null-terminated kernel name used */
+    unsigned int kernel_vectorized; /* boolean: 1 if vectorized kernel used */
 } timing_t;
 
 /* Helper: print a timing value given in microseconds, choosing a human-friendly

@@ -237,7 +237,15 @@ int decompress_with_daemon(const char* input, const char* output)
         fprintf(stderr, "\n=== Decompression Statistics ===\n");
         fprintf(stderr, "Compressed size  : %zu bytes (%.2f MB)\n", (size_t)req.input_size, comp_mb);
         fprintf(stderr, "Output size      : %zu bytes (%.2f MB)\n", (size_t)resp.output_size, orig_mb);
-        fprintf(stderr, "Expansion ratio  : %.2f:1\n", req.input_size > 0 ? (double)resp.output_size / req.input_size : 0);
+        fprintf(stderr, "Block size       : %lu bytes/%lu KB\n",
+            (unsigned long)resp.timing.blk_size_bytes,
+            (unsigned long)(resp.timing.blk_size_bytes / 1024UL));
+        fprintf(stderr, "Kernel           : %s (vectorized=%s)\n",
+            resp.timing.kernel_name[0] ? resp.timing.kernel_name : "unknown",
+            resp.timing.kernel_vectorized ? "yes" : "no");
+        fprintf(stderr, "Work groups      : global=%lu, local=%lu\n",
+            (unsigned long)resp.timing.global_size,
+            (unsigned long)resp.timing.local_size);
         fprintf(stderr, "Throughput       : %.2f MB/s (kernel: %.2f MB/s)\n", throughput, kernel_throughput);
         fprintf(stderr, "==============================\n\n");
 
@@ -361,6 +369,16 @@ int compress_with_daemon(const char* input, const char* output, int level)
         fprintf(stderr, "Input size       : %zu bytes (%.2f MB)\n", (size_t)req.input_size, orig_mb);
         fprintf(stderr, "Compressed size  : %zu bytes (%.2f MB)\n", (size_t)resp.output_size, comp_mb);
         fprintf(stderr, "Compression ratio: %.2f:1 (%.2f%% of original)\n", ratio, ratio_pct);
+        fprintf(stderr, "Block size (blocks): %lu bytes/%lu KB (%lu)\n",
+            (unsigned long)resp.timing.blk_size_bytes,
+            (unsigned long)(resp.timing.blk_size_bytes / 1024UL),
+            (unsigned long)resp.timing.nblk);
+        fprintf(stderr, "Kernel           : %s (vectorized=%s)\n",
+            resp.timing.kernel_name[0] ? resp.timing.kernel_name : "unknown",
+            resp.timing.kernel_vectorized ? "yes" : "no");
+        fprintf(stderr, "Work groups      : global=%lu, local=%lu\n",
+            (unsigned long)resp.timing.global_size,
+            (unsigned long)resp.timing.local_size);
         fprintf(stderr, "Throughput       : %.2f MB/s (kernel: %.2f MB/s)\n", throughput, kernel_throughput);
         fprintf(stderr, "==============================\n\n");
 

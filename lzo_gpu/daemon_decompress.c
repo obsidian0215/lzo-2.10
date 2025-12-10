@@ -383,7 +383,6 @@ int daemon_decompress(
     fprintf(stderr, "\n=== Decompression Statistics ===\n");
     fprintf(stderr, "Compressed size  : %zu bytes (%.2f MB)\n", comp_sz, comp_sz / (1024.0 * 1024.0));
     fprintf(stderr, "Output size      : %u bytes (%.2f MB)\n", orig_sz, orig_sz / (1024.0 * 1024.0));
-    fprintf(stderr, "Expansion ratio  : %.2f:1 (%.2f%% of compressed)\n", ratio, 100.0 * ratio);
     fprintf(stderr, "Block size       : %u bytes (%u KB)\n", blk_sz, blk_sz / 1024);
     fprintf(stderr, "Number of blocks : %u\n", nblk);
     fprintf(stderr, "Kernel           : %s (vectorized=%s)\n",
@@ -451,6 +450,14 @@ int daemon_decompress(
         t_out->download_len_us = 0;
         t_out->download_bulk_us = 0;
         t_out->cleanup_us = 0;
+        /* Fill additional metadata for client consumption */
+        t_out->blk_size_bytes = (unsigned long)blk_sz;
+        t_out->nblk = (unsigned long)nblk;
+        t_out->global_size = (unsigned long)global_size;
+        t_out->local_size = (unsigned long)local_size;
+        memset(t_out->kernel_name, 0, sizeof(t_out->kernel_name));
+        strncpy(t_out->kernel_name, prefer_vec ? "lzo1x_decomp_vec" : "lzo1x_decomp", sizeof(t_out->kernel_name) - 1);
+        t_out->kernel_vectorized = prefer_vec ? 1u : 0u;
     }
 
     return 0;

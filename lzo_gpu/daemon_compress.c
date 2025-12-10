@@ -1198,24 +1198,28 @@ after_std_read:
         t_out->download_total_us = download_us;
         t_out->file_write_us = write_us;
         t_out->cleanup_us = cleanup_us;
+        /* Fill additional metadata for client consumption */
+        t_out->blk_size_bytes = (unsigned long)blk;
+        t_out->nblk = (unsigned long)nblk;
+        t_out->global_size = (unsigned long)gsz;
+        t_out->local_size = (unsigned long)lsz;
+        memset(t_out->kernel_name, 0, sizeof(t_out->kernel_name));
+        /* kernel_name is set by caller (handle_compress_request) to the
+         * actual string; if not provided, leave as empty string. */
+        t_out->kernel_vectorized = 0u; /* not applicable for compression kernels */
     }
 
     /* 输出统计信息 (always print for consistency) */
     double ratio = comp_total > 0 ? (double)in_sz / (double)comp_total : 0.0;
-    long long space_diff = (long long)in_sz - (long long)comp_total;
 
     fprintf(stderr, "\n=== Compression Statistics ===\n");
     fprintf(stderr, "Input size       : %zu bytes (%.2f MB)\n", in_sz, in_sz / (1024.0 * 1024.0));
     fprintf(stderr, "Compressed size  : %zu bytes (%.2f MB)\n", comp_total, comp_total / (1024.0 * 1024.0));
     fprintf(stderr, "Compression ratio: %.2f:1 (%.2f%% of original)\n", ratio, 100.0 / ratio);
-    fprintf(stderr, "Space saved      : %lld bytes (%.2f MB, %.1f%%)\n",
-           space_diff,
-           space_diff / (1024.0 * 1024.0),
-           100.0 * (1.0 - 1.0/ratio));
     fprintf(stderr, "Block size       : %zu bytes (%zu KB)\n", blk, blk / 1024);
     fprintf(stderr, "Number of blocks : %zu\n", nblk);
     fprintf(stderr, "Compression level: %d\n", level);
-    fprintf(stderr, "Work groups      : global=%zu, local=auto\n", gsz);
+    fprintf(stderr, "Work groups      : global=%zu, local=%zu\n", gsz, lsz);
     double kernel_thrpt = kernel_exec_us > 0 ? ((double)in_sz / (1024.0*1024.0)) / (kernel_exec_us/1000000.0) : 0.0;
     fprintf(stderr, "Throughput       : %.2f MB/s (kernel: %.2f MB/s)\n",
            ((double)in_sz / (1024.0*1024.0)) / (total_us/1000000.0),

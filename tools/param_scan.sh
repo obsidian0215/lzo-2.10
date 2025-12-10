@@ -20,7 +20,7 @@ LZO_GPU="$REPO_DIR/lzo_gpu/lzo_gpu"
 LZO_GPU_DIR="$REPO_DIR/lzo_gpu"
 LZO_GPU_DAEMON="$REPO_DIR/lzo_gpu/lzo_gpu_daemon"
 LZO_GPU_CLIENT="$REPO_DIR/lzo_gpu/lzo_gpu_client"
-SAMPLES_DIR="${SAMPLES_DIR:-$HOME/samples}"
+SAMPLES_DIR="${SAMPLES_DIR:-/root/samples}"
 
 # 结果文件
 RESULTS_DIR="$REPO_DIR/exp_results/param_scan"
@@ -623,7 +623,7 @@ case "${1:-}" in
         echo "  -h, --help     Show this help"
         echo ""
         echo "Environment:"
-        echo "  SAMPLES_DIR    Directory containing test samples (default: ~/samples)"
+        echo "  SAMPLES_DIR    Directory containing test samples (default: /root/samples)"
         ;;
     *)
         quick_scan

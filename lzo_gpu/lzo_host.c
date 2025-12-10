@@ -2115,12 +2115,11 @@ int main(int argc, char** argv)
     printf("Input size         : %zu bytes (%.2f MB)\n", in_sz, in_sz / (1024.0 * 1024.0));
     printf("Compressed size    : %zu bytes (%.2f MB)\n", out_sz, out_sz / (1024.0 * 1024.0));
     printf("Compression ratio  : %.2f:1 (%.2f%% of original)\n", ratio, 100.0 / ratio);
-    printf("Block size (blocks): %zu bytes/%zu KB (%zu)\n", blk, blk / 1024, nblk);
-    printf("Kernel           : %s (from %s)\n", kernel_base, cl_src);
-    printf("Work groups      : global=%zu, local=%zu\n", gsz, lsz);
-    printf("Throughput       : %.2f MB/s (kernel: %.2f MB/s)\n",
-           ((double)in_sz / (1024.0*1024.0)) / (ms_total/1000.0),
-           thrpt);
+    printf("Block size         : %zu bytes/%zu KB\n", blk, blk / 1024);
+    printf("Kernel             : %s (from %s)\n", kernel_base, cl_src);
+    printf("Work groups        : global=%zu, local=%zu\n", gsz, lsz);
+    printf("Throughput         : %.2f MB/s (kernel: %.2f MB/s)\n",
+           ((double)in_sz / (1024.0*1024.0)) / (ms_total/1000.0), thrpt);
     printf("==============================\n\n");
 #endif
 

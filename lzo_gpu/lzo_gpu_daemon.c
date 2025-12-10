@@ -560,6 +560,13 @@ int handle_compress_request(request_t* req, response_t* resp)
         }
         resp->time_us = effective_time_us;
         resp->timing = t;
+        /* annotate kernel name into the timing struct so clients can print it */
+        /* annotate kernel name into the timing struct so clients can print it */
+        if (sizeof(resp->timing.kernel_name) > 0) {
+            memset(resp->timing.kernel_name, 0, sizeof(resp->timing.kernel_name));
+            strncpy(resp->timing.kernel_name, kernel_names[kernel_idx], sizeof(resp->timing.kernel_name)-1);
+        }
+        resp->timing.kernel_vectorized = 0u; /* compression kernels are not marked as vectorized */
         snprintf(resp->message, sizeof(resp->message),
                 "Success (saved ~%lums init)", g_state.init_time_ms);
 
