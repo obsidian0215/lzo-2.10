@@ -15,6 +15,7 @@
 #include "lzo_defaults.h"
 #include <getopt.h>
 #include <limits.h>
+#include <stddef.h>
 
 #define SOCKET_PATH "/tmp/lzo_gpu_daemon.sock"
 
@@ -36,21 +37,47 @@ static const char* client_socket_path(void)
     return SOCKET_PATH;
 }
 
+/* parse human-friendly size string and return KB (rounded) */
+static int parse_size_kb(const char* s)
+{
+    if (!s || !*s) return 0;
+    char* end;
+    double val = strtod(s, &end);
+    if (end == s) return 0;
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end == '\0') {
+        /* no unit - assume KB */
+        return (int) (val);
+    }
+    if (strcasecmp(end, "B") == 0 || strcasecmp(end, "BYTES") == 0) {
+        return (int) ((val + 1023) / 1024); /* round up to KB */
+    }
+    if (strcasecmp(end, "K") == 0 || strcasecmp(end, "KB") == 0) {
+        return (int) (val);
+    }
+    if (strcasecmp(end, "M") == 0 || strcasecmp(end, "MB") == 0) {
+        return (int) (val * 1024);
+    }
+    if (strcasecmp(end, "G") == 0 || strcasecmp(end, "GB") == 0) {
+        return (int) (val * 1024 * 1024);
+    }
+    return 0;
+}
+
 /* request_t/response_t - local protocol structs (mirror daemon's definitions) */
 typedef struct {
     char operation;
     char input_path[256];
     char output_path[256];
     int level;
+    int alg;
     size_t input_size;
     /* options passed to daemon (populated from env vars) */
     int standard_copy; /* 0/1 */
     int mt_io;        /* 0/1 */
     int mt_threads;   /* number of IO threads */
-    int async_upload; /* 0/1 */
     int fixed_block_kb; /* 0=no fixed size, else KB */
-    int prefer_cpu;   /* 0=gpu, 1=cpu */
-    int decomp_vec;   /* 0=scalar decomp, 1=vector (default) */
+    int local_size;     /* 0=unspecified, else local size for kernel */
     /* Optional overrides for coalescing and stdio buffer (per-request) */
     int coalesce_output; /* -1 unspecified; 0=no coalesce; 1=coalesce */
     int coalesce_chunk_mb; /* -1 unspecified; positive value overrides default chunk size */
@@ -82,17 +109,11 @@ static void fill_request_env_flags(request_t* req) {
     s = getenv("LZO_MT_IO"); req->mt_io = (s && atoi(s) == 1) ? 1 : 0;
     s = getenv("LZO_MT_IO_THREADS"); req->mt_threads = s ? atoi(s) : LZO_DEFAULT_MT_IO_THREADS;
     if (req->mt_threads < 1) req->mt_threads = 1; if (req->mt_threads > 32) req->mt_threads = 32;
-    s = getenv("LZO_FIXED_BLOCK_SIZE"); req->fixed_block_kb = s ? atoi(s) : 0;
-    /* LZO_FORCE_MAP has been deprecated; mapping behavior is controlled via LZO_STANDARD_COPY */
-    s = getenv("LZO_OPENCL_DEVICE"); req->prefer_cpu = (s && strcmp(s, "CPU") == 0) ? 1 : 0;
-    s = getenv("LZO_DECOMP_VEC"); req->decomp_vec = (s && atoi(s) == 0) ? 0 : 1;
-    s = getenv("LZO_ASYNC_UPLOAD"); req->async_upload = (s && atoi(s) == 1) ? 1 : 0;
     /* coalesce/stdio flags: support env overrides only if CLI didn't set them. */
     if (req->coalesce_output == -1) { s = getenv("LZO_COALESCE_OUTPUT"); if (s) req->coalesce_output = atoi(s) ? 1 : 0; }
     if (req->coalesce_chunk_mb == -1) { s = getenv("LZO_COALESCE_CHUNK_MB"); if (s) req->coalesce_chunk_mb = atoi(s); }
     if (req->coalesce_max_mb == -1) { s = getenv("LZO_COALESCE_MAX_MB"); if (s) req->coalesce_max_mb = atoi(s); }
     if (req->stdio_buf_mb == -1) { s = getenv("LZO_STDIO_BUF_MB"); if (s) req->stdio_buf_mb = atoi(s); }
-    /* profile_writes removed; use LZO_DEBUG for diagnostics */
 }
 
 /* Simple CLI parsing for per-request flags. These CLI flags override env vars. */
@@ -101,28 +122,14 @@ static void fill_request_env_flags(request_t* req) {
  */
 static request_t g_cli_req_flags; /* global overrides parsed from CLI */
 static void parse_client_cli_opts(int argc, char** argv, request_t* req) {
-    /* Manual, minimal long-option parsing to read per-request flags that can be provided
-     * via --option=value or --option value. This avoids interacting with getopt_long
-     * and consuming/printing short-option errors for -l / -o, which the main parser
-     * handles.
-     */
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
-        if (strncmp(a, "--mt-io=", 8) == 0) { req->mt_io = atoi(a + 8) ? 1 : 0; continue; }
-        if (strcmp(a, "--mt-io") == 0 && i + 1 < argc) { req->mt_io = atoi(argv[++i]) ? 1 : 0; continue; }
-        if (strncmp(a, "--mt-io-threads=", 16) == 0) { req->mt_threads = atoi(a + 16); continue; }
-        if (strcmp(a, "--mt-io-threads") == 0 && i + 1 < argc) { req->mt_threads = atoi(argv[++i]); continue; }
-        if (strncmp(a, "--standard-copy=", 16) == 0) { req->standard_copy = atoi(a + 16) ? 1 : 0; continue; }
-        if (strcmp(a, "--standard-copy") == 0 && i + 1 < argc) { req->standard_copy = atoi(argv[++i]) ? 1 : 0; continue; }
-        if (strncmp(a, "--async-upload=", 15) == 0) { req->async_upload = atoi(a + 15) ? 1 : 0; continue; }
-        if (strcmp(a, "--async-upload") == 0 && i + 1 < argc) { req->async_upload = atoi(argv[++i]) ? 1 : 0; continue; }
-        if (strncmp(a, "--fixed-block-size=", 19) == 0) { req->fixed_block_kb = atoi(a + 19); continue; }
-        if (strcmp(a, "--fixed-block-size") == 0 && i + 1 < argc) { req->fixed_block_kb = atoi(argv[++i]); continue; }
-        if (strncmp(a, "--prefer-cpu=", 13) == 0) { req->prefer_cpu = atoi(a + 13) ? 1 : 0; continue; }
-        if (strcmp(a, "--prefer-cpu") == 0 && i + 1 < argc) { req->prefer_cpu = atoi(argv[++i]) ? 1 : 0; continue; }
-        if (strncmp(a, "--decomp-vec=", 13) == 0) { req->decomp_vec = atoi(a + 13) ? 1 : 0; continue; }
-        if (strcmp(a, "--decomp-vec") == 0 && i + 1 < argc) { req->decomp_vec = atoi(argv[++i]) ? 1 : 0; continue; }
-        /* ignore other arguments; main() will parse short options and operands */
+        if (strncmp(a, "-B=", 3) == 0) { req->fixed_block_kb = parse_size_kb(a + 3); argv[i] = "--"; continue; }
+        if (strcmp(a, "-B") == 0 && i + 1 < argc) { argv[i] = "--"; req->fixed_block_kb = parse_size_kb(argv[++i]); argv[i] = "--"; continue; }
+        if (strncmp(a, "--block-size=", 13) == 0) { req->fixed_block_kb = parse_size_kb(a + 13); argv[i] = "--"; continue; }
+        if (strcmp(a, "--block-size") == 0 && i + 1 < argc) { argv[i] = "--"; req->fixed_block_kb = parse_size_kb(argv[++i]); argv[i] = "--"; continue; }
+        if (strncmp(a, "--local=", 8) == 0) { req->local_size = atoi(a + 8); argv[i] = "--"; continue; }
+        if (strcmp(a, "--local") == 0 && i + 1 < argc) { argv[i] = "--"; req->local_size = atoi(argv[++i]); argv[i] = "--"; continue; }
     }
 }
 
@@ -131,11 +138,8 @@ static void set_request_defaults(request_t* req) {
     req->standard_copy = 0;
     req->mt_io = 0;
     req->mt_threads = LZO_DEFAULT_MT_IO_THREADS;
-    req->async_upload = 0;
     req->fixed_block_kb = 0;
-    /* force_map option removed; no default to set */
-    req->prefer_cpu = 0;
-    req->decomp_vec = 1;
+    req->local_size = 0;
     /* per-request coalesce/stdio defaults: -1 means unspecified so daemon uses defaults */
     req->coalesce_output = -1;
     req->coalesce_chunk_mb = -1;
@@ -155,7 +159,7 @@ int is_daemon_running(void)
 /*
  * 向守护进程发送解压缩请求
  */
-int decompress_with_daemon(const char* input, const char* output)
+int decompress_with_daemon(const char* input, const char* output, int alg)
 {
     int sock;
     struct sockaddr_un addr;
@@ -203,6 +207,7 @@ int decompress_with_daemon(const char* input, const char* output)
     strncpy(req.input_path, input, sizeof(req.input_path) - 1);
     strncpy(req.output_path, output, sizeof(req.output_path) - 1);
     req.level = 0;  // 解压缩不需要level
+    req.alg = alg;  // 指定算法
     req.input_size = st.st_size;
 
     /* fill options from env for fields still unspecified */
@@ -240,9 +245,8 @@ int decompress_with_daemon(const char* input, const char* output)
         fprintf(stderr, "Block size       : %lu bytes/%lu KB\n",
             (unsigned long)resp.timing.blk_size_bytes,
             (unsigned long)(resp.timing.blk_size_bytes / 1024UL));
-        fprintf(stderr, "Kernel           : %s (vectorized=%s)\n",
-            resp.timing.kernel_name[0] ? resp.timing.kernel_name : "unknown",
-            resp.timing.kernel_vectorized ? "yes" : "no");
+        fprintf(stderr, "Kernel           : %s\n",
+            resp.timing.kernel_name[0] ? resp.timing.kernel_name : "unknown");
         fprintf(stderr, "Work groups      : global=%lu, local=%lu\n",
             (unsigned long)resp.timing.global_size,
             (unsigned long)resp.timing.local_size);
@@ -285,7 +289,7 @@ int decompress_with_daemon(const char* input, const char* output)
 /*
  * 向守护进程发送压缩请求
  */
-int compress_with_daemon(const char* input, const char* output, int level)
+int compress_with_daemon(const char* input, const char* output, int alg, int level)
 {
     int sock;
     struct sockaddr_un addr;
@@ -328,9 +332,17 @@ int compress_with_daemon(const char* input, const char* output, int level)
     memset(&req, 0, sizeof(req));
     set_request_defaults(&req);
     memcpy(&req, &g_cli_req_flags, sizeof(req));
+                    /* Diagnostic: print final request fields to stderr to confirm CLI parsing */
+                    if (getenv("LZO_DEBUG")) {
+                    fprintf(stderr, "[CLIENT] Request opts: fixed_block_kb=%d local_size=%d standard_copy=%d mt_io=%d mt_threads=%d sizeof(req)=%zu\n",
+                        req.fixed_block_kb, req.local_size, req.standard_copy, req.mt_io, req.mt_threads, sizeof(req));
+                    fprintf(stderr, "[CLIENT] offsetof: fixed_block_kb=%zu local_size=%zu\n",
+                        offsetof(request_t, fixed_block_kb), offsetof(request_t, local_size));
+                    }
     req.operation = 'C';
     strncpy(req.input_path, input, sizeof(req.input_path) - 1);
     strncpy(req.output_path, output, sizeof(req.output_path) - 1);
+    req.alg = alg;
     req.level = level;
     req.input_size = st.st_size;
 
@@ -373,9 +385,8 @@ int compress_with_daemon(const char* input, const char* output, int level)
             (unsigned long)resp.timing.blk_size_bytes,
             (unsigned long)(resp.timing.blk_size_bytes / 1024UL),
             (unsigned long)resp.timing.nblk);
-        fprintf(stderr, "Kernel           : %s (vectorized=%s)\n",
-            resp.timing.kernel_name[0] ? resp.timing.kernel_name : "unknown",
-            resp.timing.kernel_vectorized ? "yes" : "no");
+        fprintf(stderr, "Kernel           : %s\n",
+            resp.timing.kernel_name[0] ? resp.timing.kernel_name : "unknown");
         fprintf(stderr, "Work groups      : global=%lu, local=%lu\n",
             (unsigned long)resp.timing.global_size,
             (unsigned long)resp.timing.local_size);
@@ -415,41 +426,39 @@ int compress_with_daemon(const char* input, const char* output, int level)
     }
 }
 
-/*
- * 客户端主函数
- * 支持: -l/--level <1|1k|1l|1o> 压缩级别
- *       -d/--decompress 解压缩模式
- *
- * 默认level=1 (lzo1x_1): 基于性能测试,所有变体速度相近,
- * 选择D_BITS=14的标准版本以获得最佳通用性
- */
 static void show_help(const char* prog) {
     fprintf(stderr, "LZO GPU Client - 通过守护进程进行 GPU 加速压缩/解压\n\n");
     fprintf(stderr, "用法: %s [选项] <input>\n", prog);
     fprintf(stderr, "选项:\n");
-    fprintf(stderr, "  -L, -l, --level <1|1k|1l|1o>  压缩级别 (默认: 1l)\n");
-    fprintf(stderr, "  -d, --decompress              解压缩模式\n");
-    fprintf(stderr, "  -o, --output <file>           指定输出文件\n");
-    fprintf(stderr, "  -h, --help                    显示此帮助信息\n\n");
+    fprintf(stderr, "  -h, --help                    Show help and exit.\n");
+    fprintf(stderr, "  -L, -l, --level <1|1k|1l|1o>  Set compression level/kernel variant (default: 1l).\n");
+    fprintf(stderr, "  -B N, --block-size N          Fixed block size; accepts units (B/KB/MB), e.g., -B 64KB.\n");
+    fprintf(stderr, "  --local N                     Local work-group size for kernel (1, 8, 64). Compression kernels require local=1 and will be forced.\n");
+    fprintf(stderr, "  -d, --decompress              Decompress mode.\n");
+    fprintf(stderr, "  -o, --output <file>           Output file.\n\n");
     fprintf(stderr, "示例:\n");
-    fprintf(stderr, "  %s input.txt -o output.lzo           # 使用 level=1l 压缩\n", prog);
-    fprintf(stderr, "  %s -l 1k input.txt -o output.lzo     # 使用 lzo1x_1k 压缩\n", prog);
-    fprintf(stderr, "  %s -d input.lzo -o output.txt        # 解压缩\n", prog);
-    fprintf(stderr, "  %s -d input.lzo                      # 解压缩 (自动去除 .lzo 后缀)\n\n", prog);
-    fprintf(stderr, "环境变量 (客户端请求选项):\n");
-    fprintf(stderr, "  LZO_STANDARD_COPY=0|1    使用标准 host->device 拷贝 (默认: 0=zero-copy)\n");
-    fprintf(stderr, "  LZO_MT_IO=0|1            启用多线程 I/O (默认: 0)\n");
-    fprintf(stderr, "  LZO_MT_IO_THREADS=N      I/O 线程数 (1-32; 默认: %d)\n", LZO_DEFAULT_MT_IO_THREADS);
-    fprintf(stderr, "  LZO_FIXED_BLOCK_SIZE=N   固定块大小 (KB) (0=自适应)\n");
-    fprintf(stderr, "  LZO_DECOMP_VEC=0|1       使用向量化解压 (默认: 1)\n");
+    fprintf(stderr, "  %s input.txt -o output.lzo\n", prog);
+    fprintf(stderr, "  %s -l 1k input.txt -o output.lzo\n", prog);
+    fprintf(stderr, "  %s -d input.lzo -o output.txt\n\n", prog);
+    fprintf(stderr, "Environment variables (defaults used by client if CLI options not present):\n");
+    fprintf(stderr, "  LZO_STANDARD_COPY=0|1       Default copy mode (0=zero-copy, 1=standard copy).\n");
+    fprintf(stderr, "  LZO_MT_IO=0|1               Enable multi-threaded I/O by default.\n");
+    fprintf(stderr, "  LZO_MT_IO_THREADS=N         Default number of I/O threads (1-32).\n");
+    fprintf(stderr, "  LZO_COALESCE_OUTPUT=0|1     Enable output coalescing by default.\n");
+    fprintf(stderr, "  LZO_STDIO_BUF_MB=N          Default stdio buffer size in MB for file writes.\n");
     fprintf(stderr, "\n注意: 需要先启动 lzo_gpu_daemon 守护进程\n");
 }
 
+
+/*
+ * 客户端主函数
+ */
 int main(int argc, char** argv)
 {
     const char* input = NULL;
     const char* output = NULL;
-    int level = 7;  // 默认: lzo1x_1 (D_BITS=14, 标准配置)
+    int level = 12;  // 默认: 12 bits (4KB dict)
+    int alg = 0;     // 默认: lzo1x
     char operation = 'C';  // 默认压缩
     int show_help_flag = 0;
 
@@ -465,23 +474,34 @@ int main(int argc, char** argv)
         }
         if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) {
             operation = 'D';
+        } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--alg") == 0) {
+            if (i + 1 < argc) {
+                i++;
+                if (strcmp(argv[i], "1x") == 0 || strcmp(argv[i], "lzo1x") == 0) alg = 0;
+                else if (strcmp(argv[i], "1y") == 0 || strcmp(argv[i], "lzo1y") == 0) alg = 1;
+                else {
+                    fprintf(stderr, "错误: 未知算法 '%s'. 支持: 1x, 1y\n", argv[i]);
+                    return 1;
+                }
+            } else {
+                fprintf(stderr, "错误: --alg 需要参数\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "-L") == 0 || strcmp(argv[i], "--level") == 0) {
             if (i + 1 < argc) {
                 i++;
-                // 支持 1/1k/1l/1o 格式
-                if (strcmp(argv[i], "1") == 0) {
-                    level = 1;
-                } else if (strcmp(argv[i], "1k") == 0) {
-                    level = 5;  // 映射到1k (level 4-6)
-                } else if (strcmp(argv[i], "1l") == 0) {
-                    level = 7;  // 映射到1l (level 7-8)
-                } else if (strcmp(argv[i], "1o") == 0) {
-                    level = 9;  // 映射到1o (level 9)
+                // 支持 10-14
+                int val = atoi(argv[i]);
+                if (val >= 10 && val <= 14) {
+                    level = val;
                 } else {
-                    // 也支持数字1-9
-                    level = atoi(argv[i]);
-                    if (level < 1 || level > 9) {
-                        fprintf(stderr, "错误: level必须是 1/1k/1l/1o 或 1-9\n");
+                    // 尝试兼容旧参数
+                    if (strcmp(argv[i], "1") == 0) level = 12;
+                    else if (strcmp(argv[i], "1k") == 0) level = 10;
+                    else if (strcmp(argv[i], "1l") == 0) level = 11;
+                    else if (strcmp(argv[i], "1o") == 0) level = 14; // or 15? 14 is max for now
+                    else {
+                        fprintf(stderr, "错误: level必须是 10-14 (bits)\n");
                         return 1;
                     }
                 }
@@ -491,6 +511,11 @@ int main(int argc, char** argv)
             }
         } else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) {
             if (i + 1 < argc) { output = argv[++i]; } else { fprintf(stderr, "错误: -o/--output 需要参数\n"); return 1; }
+        } else if (argv[i][0] == '-') {
+            /* unknown/long options are handled by parse_client_cli_opts(), so
+             * ignore them here so they are not treated as a positional input
+             */
+            continue;
         } else if (!input) {
             input = argv[i];
         } else {
@@ -547,8 +572,8 @@ int main(int argc, char** argv)
 
     /* If the operation is decompression, go to decompress path */
     if (operation == 'D') {
-        return decompress_with_daemon(input, output);
+        return decompress_with_daemon(input, output, alg);
     }
 
-    return compress_with_daemon(input, output, level);
+    return compress_with_daemon(input, output, alg, level);
 }

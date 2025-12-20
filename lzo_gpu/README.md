@@ -11,11 +11,13 @@ This document explains the three ways to run the GPU-enabled LZO compressor and 
 The README below documents per-binary CLI flags and which environment variables they honor.
 
 ### ./lzo_gpu (standalone)
-- Basic usage: ./lzo_gpu [--debug|-v] [--verify|-c] [-L <level>] [-o <out.lzo>] <input_file>
+- Basic usage: ./lzo_gpu [--debug|-v] [--verify|-c] [-L <level>] [-B <blocksize>] [--local <N>] [-o <out.lzo>] <input_file>
   - -L|--level <1|1k|1l|1o|1-9> : compression level / kernel variant (default: 1l for GPU-optimized)
   - -o|--output <path>         : output archive path (default: input + .lzo)
   - --verify|-c                : (compress) in-memory roundtrip verify
   - -d|--decompress             : switch to decompress mode (see help output)
+  - -B <blocksize>|--block-size <blocksize> : fix block size (units accepted: B/KB/MB). When provided adaptive selection is disabled.
+  - --local <N>                 : set local work-group size for kernels (1,8,64). Compression kernels require local=1 and will be forced to 1.
   - -h|--help                   : show help (detailed usage and environment variables)
 
 ### ./lzo_gpu_daemon (daemon)
@@ -23,8 +25,10 @@ The README below documents per-binary CLI flags and which environment variables 
   - -h|--help : print daemon usage and environment variables / per-request options
 
 ### ./lzo_gpu_client (client)
-- Basic usage: ./lzo_gpu_client [--help] [-d] [-l <1|1k|1l|1o|1-9>] <input_file> <output_file>
+- Basic usage: ./lzo_gpu_client [--help] [-d] [-l <1|1k|1l|1o|1-9>] [-B blocksize] [--local N] <input_file> <output_file>
   - -l|--level   : compression level (used for compression requests)
+  - -B|--block-size : fixed block size for compression (sent as per-request option to daemon)
+  - --local N : local workgroup size for compressors/decompressors (sent as per-request option to daemon)
   - -d|--decompress : run in decompress mode (client will ask daemon to decompress)
   - -h|--help    : show help and the environment variables the client will include in each request
 
@@ -50,6 +54,15 @@ The README below documents per-binary CLI flags and which environment variables 
   - Threads with zero-length subranges are skipped — no useless threads are spawned.
   - If thread creation fails, code gracefully falls back to single-threaded `fread`.
 
+## CLI options (summary)
+Common flags available to the binaries:
+- `-L|--level <1|1k|1l|1o|1-9>` : compression level / kernel variant (default: 1l).
+- `-B|--block-size <size>` : fixed per-block size (accepts units: B/KB/MB). When provided, adaptive block selection is disabled.
+- `--local <N>` : local work-group size for kernels (1,8,64).
+- `-d|--decompress` : decompress mode.
+- `-o|--output <file>` : specify output file.
+- `--help|-h` : display help.
+
 ## Key environment variables (summary)
 Grouped and explained concisely.
 
@@ -60,12 +73,8 @@ MT I/O
 - `LZO_MT_IO=0|1` — enable multi-threaded pread / parallel upload.
 - `LZO_MT_IO_THREADS=N` — 1..32 (default 4 when mt_io enabled).
 
-Block sizing and adaptive tuning
-- `LZO_FIXED_BLOCK_SIZE=N` — fix the per-block size in KB (overrides adaptive algorithm)
-
 OpenCL & misc
 - `LZO_OPENCL_DEVICE=CPU|GPU` — device preference (may be ignored by daemon)
-- `LZO_DECOMP_VEC=0|1` — prefer vectorized decompressor (default 1) or force scalar
 - `LZO_DEBUG=1` — enable debug prints/timings
 
 ### Full environment variable table (name / allowed values / default / supported)
@@ -75,14 +84,12 @@ OpenCL & misc
 | LZO_STANDARD_COPY | 0 / 1 | 0 | standalone, client->daemon request | 0 = zero-copy (map & fread), 1 = standard (host->device upload). Daemon honors per-request option but may be configured to ignore. |
 | LZO_MT_IO | 0 / 1 | 0 | standalone, client->daemon request | Enables multi-threaded pread + parallel uploads. Worker thread fallback to single-threaded fread on error. |
 | LZO_MT_IO_THREADS | integer (1-32) | 4 when LZO_MT_IO=1; otherwise N/A | standalone, client->daemon request | Number of I/O worker threads. Ignored unless LZO_MT_IO=1. |
-| LZO_FIXED_BLOCK_SIZE | positive integer (KB) | 0 (adaptive) | standalone, client->daemon request | When set (>0), forces block size in KB. Use 0 to enable adaptive behavior. |
 | LZO_OPENCL_DEVICE | CPU / GPU | GPU | standalone, daemon | Device preference — daemon may ignore depending on its configuration and available devices. |
-| LZO_DECOMP_VEC | 0 / 1 | 1 | standalone, client->daemon request, daemon | Prefer vectorized decompressor (1) or scalar (0). Default is vectorized when available. |
 | LZO_DEBUG | 0 / 1 | 0 | standalone, daemon, client | Enable verbose debug output and timing traces. |
 
 ### Asynchronous uploads (LZO_ASYNC_UPLOAD)
 
-For implementation details, measurement results, tuning advice and reproduction steps see `PERFORMANCE_SUMMARY.md` (search for “异步流水线 / async uploads”).
+Note: Asynchronous uploads (LZO_ASYNC_UPLOAD) have been removed from the codebase and are no longer supported. Any historical references in the performance notes remain for archival purposes; refer to `PERFORMANCE_SUMMARY.md` for past measurements.
 
 
 
@@ -90,7 +97,6 @@ For implementation details, measurement results, tuning advice and reproduction 
 ### Environment defaults & dependency rules
 - Default device selection is GPU unless `LZO_OPENCL_DEVICE=CPU`.
 - `LZO_MT_IO_THREADS` is meaningful only when `LZO_MT_IO=1`; default 4 threads in that case (bounded to 1..32).
-- `LZO_FIXED_BLOCK_SIZE` overrides adaptive block sizing — use the KB value (e.g., 64 for 64KB).
 
 
 ## Client -> Daemon behavior
@@ -119,7 +125,7 @@ For implementation details, measurement results, tuning advice and reproduction 
 
 ## Notes for maintainers
 - The standalone and daemon implementations share the same design: use pinned host buffers when possible, allow zero-copy for iGPUs, allow standard-copy uploads for dGPUs, and optionally parallelize file I/O.
-- Check `lzo_host.c` and `daemon_compress.c` for the latest implementation details and test coverage.
+- Check `lzo_gpu_standalone.c` and `daemon_compress.c` for the latest implementation details and test coverage.
 
 ---
 The repository includes a consolidated Python runner `tools/bench.py` which re-runs the `/tmp/sample_*` benchmarks across the standard modes and prints a concise comparison table. Run it from the project root:
@@ -180,8 +186,8 @@ export LZO_MT_IO_THREADS=8
 Force a fixed block size to reproduce or explore block-splitting impacts (KB):
 
 ```bash
-export LZO_FIXED_BLOCK_SIZE=64   # 64KB blocks
-./lzo_gpu input.bin -o out.lzo
+./lzo_gpu -B 64KB input.bin -o out.lzo
+
 ```
 
 ## Tuning advice / troubleshooting
@@ -197,7 +203,6 @@ export LZO_FIXED_BLOCK_SIZE=64   # 64KB blocks
 ### Common diagnostics
 
 - Enable debug traces to inspect timings: `export LZO_DEBUG=1` — this prints time breakdowns for each stage.
-- Use `LZO_DECOMP_VEC=0` to force scalar decompression if vectorized decompression (decomp_vec) fails in your environment.
 - If daemon is not applying preferences, confirm `lzo_gpu_client` is sending options (check client help) and daemon's logs for accepted/ignored options.
 
 ## Next steps / further optimizations (ideas)

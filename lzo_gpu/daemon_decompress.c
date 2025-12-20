@@ -1,7 +1,5 @@
 /*
  * daemon_decompress.c - 守护进程解压缩核心逻辑
- *
- * Phase 7.2: 同步Pinned Memory和Buffer缓存优化
  */
 
 #include <CL/cl.h>
@@ -12,8 +10,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <sys/stat.h>
+#include "lzo_gpu_utils.h"
 
-/* Phase 8: 输出Buffer缓存阈值 (MB)
+/* Buffer缓存阈值 (MB)
  * 小于此阈值的输出buffer会被缓存复用，避免频繁分配
  * 大于此阈值的会每次释放，防止GPU内存耗尽
  * 可通过 LZO_DECOMP_CACHE_MB 环境变量调整 */
@@ -67,40 +67,10 @@ static cl_mem get_or_create_buffer(cl_context ctx, cl_mem* cached_buf, size_t* c
     return *cached_buf;
 }
 
-/* 读取文件 */
-static void* read_file_data(const char* path, size_t* size_out) {
-    FILE* f = fopen(path, "rb");
-    if (!f) {
-        perror("fopen");
-        return NULL;
-    }
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    void* buf = malloc(sz);
-    if (!buf) {
-        fclose(f);
-        return NULL;
-    }
-
-    if (fread(buf, 1, sz, f) != (size_t)sz) {
-        perror("fread");
-        free(buf);
-        fclose(f);
-        return NULL;
-    }
-
-    fclose(f);
-    *size_out = sz;
-    return buf;
-}
-
 /*
  * 守护进程解压缩函数
  * 复用预分配的OpenCL资源,仅执行必要的解压缩操作
  *
- * Phase 7.2更新:
  * - Pinned Memory优化
  * - Buffer缓存机制
  */
@@ -109,12 +79,12 @@ int daemon_decompress(
     cl_context ctx,
     cl_command_queue queue,
     cl_device_id device,
-    cl_kernel kernel,         // 解压缩kernel (标量或向量)
-    int prefer_vec,           // caller indicates this call was intended for vectorized kernel
+    cl_kernel kernel,         // 解压缩kernel
     /* 请求参数 */
     const char* input_path,
     const char* output_path,
     /* 输出统计 */
+    int local_size_param,
     unsigned long* time_us_out,
     size_t* output_size_out,
     /* optional detailed timings (microseconds) in a compact struct */
@@ -144,10 +114,11 @@ int daemon_decompress(
     }
 
     // 读取头部信息
-    uint32_t orig_sz, blk_sz, nblk;
+    uint32_t orig_sz, blk_sz, nblk, alg_id;
     if (fread(&orig_sz, sizeof(orig_sz), 1, f_in) != 1 ||
         fread(&blk_sz, sizeof(blk_sz), 1, f_in) != 1 ||
-        fread(&nblk, sizeof(nblk), 1, f_in) != 1) {
+        fread(&nblk, sizeof(nblk), 1, f_in) != 1 ||
+        fread(&alg_id, sizeof(alg_id), 1, f_in) != 1) {
         perror("fread header");
         fclose(f_in);
         return -1;
@@ -251,14 +222,9 @@ int daemon_decompress(
     uint64_t t_setup_end = now_ns();
 
     // 7. 执行kernel
-    /* 优化: local_size默认使用8（与 standalone 保持一致），可通过环境变量 LZO_LOCAL_SIZE 覆盖
-       使用较大的local_size能让解压向量化/标量kernel在同一work-group共享资源，提高吞吐 */
-    size_t local_size = 8;
-    const char* ls_env = getenv("LZO_LOCAL_SIZE");
-    if (ls_env) {
-        size_t v = (size_t)atoi(ls_env);
-        if (v >= 1) local_size = v;
-    }
+    /* 优化: 较大的local_size能让解压向量化/标量kernel在同一work-group共享资源，提高吞吐 */
+    /* local_size specified by client request (0 = unspecified); default 8 for daemon */
+    size_t local_size = (local_size_param > 0) ? (size_t)local_size_param : LZO_LOCAL_SIZE_DEFAULT;
     size_t global_size = ((size_t)nblk + local_size - 1) / local_size * local_size;
     uint64_t t_exec_start = now_ns();
     /* Always log kernel launch configuration so profiler traces are visible in daemon logs */
@@ -291,17 +257,14 @@ int daemon_decompress(
         fprintf(stderr, "[DECOMP] no event returned from clEnqueueNDRangeKernel\n");
     }
 
-    // 8. Phase 6.1: 使用map下载解压数据 (零拷贝DMA)
-    /* 优化: 移除 out_buf 分配，直接从 mapped_out 写入文件 */
+    /* Zero-Copy: 移除 out_buf 分配，直接从 mapped_out 写入文件，避免下载 */
     // unsigned char* out_buf = malloc(orig_sz);
-
-    /* 如果evt profiling 有效，使用它计算kernel执行时间（ns）否则回退到wall-clock */
 
     uint64_t t_download_start = now_ns();
     void* mapped_out = clEnqueueMapBuffer(queue, d_out, CL_TRUE, CL_MAP_READ, 0, orig_sz,
                                           0, NULL, NULL, &err);
     CHECK(err);
-    // memcpy(out_buf, mapped_out, orig_sz); // 移除memcpy
+    // memcpy(out_buf, mapped_out, orig_sz);
     uint64_t t_download_end = now_ns();
 
     // 9. 写入输出文件
@@ -311,7 +274,6 @@ int daemon_decompress(
         perror("fopen output");
         clEnqueueUnmapMemObject(queue, d_out, mapped_out, 0, NULL, NULL);
         // free(out_buf);
-        // free(lz_buf); // 已移除
         free(off_arr);
         return -1;
     }
@@ -321,7 +283,6 @@ int daemon_decompress(
         fclose(fout);
         clEnqueueUnmapMemObject(queue, d_out, mapped_out, 0, NULL, NULL);
         // free(out_buf);
-        // free(lz_buf); // 已移除
         free(off_arr);
         return -1;
     }
@@ -384,10 +345,6 @@ int daemon_decompress(
     fprintf(stderr, "Compressed size  : %zu bytes (%.2f MB)\n", comp_sz, comp_sz / (1024.0 * 1024.0));
     fprintf(stderr, "Output size      : %u bytes (%.2f MB)\n", orig_sz, orig_sz / (1024.0 * 1024.0));
     fprintf(stderr, "Block size       : %u bytes (%u KB)\n", blk_sz, blk_sz / 1024);
-    fprintf(stderr, "Number of blocks : %u\n", nblk);
-    fprintf(stderr, "Kernel           : %s (vectorized=%s)\n",
-           prefer_vec ? "lzo1x_decomp_vec" : "lzo1x_decomp",
-           prefer_vec ? "yes" : "no");
     fprintf(stderr, "Work groups      : global=%zu, local=%zu\n", global_size, local_size);
     double kernel_thrpt = exec_host_us > 0 ? ((double)orig_sz / (1024.0*1024.0)) / (exec_host_us/1000000.0) : 0.0;
     fprintf(stderr, "Throughput       : %.2f MB/s (kernel: %.2f MB/s)\n",
@@ -456,8 +413,7 @@ int daemon_decompress(
         t_out->global_size = (unsigned long)global_size;
         t_out->local_size = (unsigned long)local_size;
         memset(t_out->kernel_name, 0, sizeof(t_out->kernel_name));
-        strncpy(t_out->kernel_name, prefer_vec ? "lzo1x_decomp_vec" : "lzo1x_decomp", sizeof(t_out->kernel_name) - 1);
-        t_out->kernel_vectorized = prefer_vec ? 1u : 0u;
+        strncpy(t_out->kernel_name, "lzo1x_decomp", sizeof(t_out->kernel_name) - 1);
     }
 
     return 0;

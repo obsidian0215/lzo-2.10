@@ -9,21 +9,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "lzo_gpu_utils.h"
 
-static char* read_file(const char* path, size_t* sz_out) {
-    FILE* fp = fopen(path, "rb");
-    if (!fp) { perror(path); return NULL; }
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    char* buf = malloc(sz + 1);
-    if (!buf) { fclose(fp); return NULL; }
-    if (fread(buf, 1, sz, fp) != (size_t)sz) { free(buf); fclose(fp); return NULL; }
-    buf[sz] = '\0';
-    fclose(fp);
-    if (sz_out) *sz_out = (size_t)sz;
-    return buf;
-}
+/* Use lzo_gpu_utils.lzo_read_file to read kernel source files and stdin. */
 
 int main(int argc, char** argv) {
     if (argc < 3) {
@@ -32,6 +20,7 @@ int main(int argc, char** argv) {
     }
     const char* src_path = argv[1];
     const char* out_path = argv[2];
+    const char* extra_opts = (argc > 3) ? argv[3] : "";
 
     cl_int err;
     cl_platform_id pf;
@@ -41,7 +30,7 @@ int main(int argc, char** argv) {
         if (clGetDeviceIDs(pf, CL_DEVICE_TYPE_ALL, 1, &dev, NULL) != CL_SUCCESS) { fprintf(stderr, "no OpenCL device\n"); return 1; }
     }
 
-    size_t src_len; char* src = read_file(src_path, &src_len);
+    size_t src_len; char* src = lzo_read_file(src_path, &src_len);
     if (!src) { fprintf(stderr, "failed to read source %s\n", src_path); return 1; }
 
     cl_context ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, &err);
@@ -51,7 +40,9 @@ int main(int argc, char** argv) {
     if (!prog || err != CL_SUCCESS) { fprintf(stderr, "clCreateProgramWithSource failed: %d\n", err); clReleaseContext(ctx); free(src); return 1; }
 
     /* request OpenCL 2.0/C2.0 for kernels that use generic address space */
-    const char* build_opts = "-cl-std=CL2.0";
+    char build_opts[256];
+    snprintf(build_opts, sizeof(build_opts), "-cl-std=CL2.0 %s", extra_opts);
+
     err = clBuildProgram(prog, 1, &dev, build_opts, NULL, NULL);
     if (err != CL_SUCCESS) {
         size_t log_sz = 0; clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);

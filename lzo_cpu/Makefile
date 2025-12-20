@@ -6,7 +6,8 @@
 
 PROGRAM = lzo_cpu
 # Fully decoupled build: use local copies under lzo_cpu (include and src)
-SOURCES = lzo_frag.c lzo1x_1k.c lzo1x_1l.c lzo1x_1.c lzo1x_1o.c lzo1x_d1.c \
+SOURCES = lzo_frag.c lzo1x_1k.c lzo1x_1l.c lzo1x_1.c lzo1x_1o.c lzo1x_d1.c lzo1x_d2.c \
+		  lzo1y_1.c lzo1y_d1.c lzo1y_d2.c \
 		  src/lzo_init.c src/lzo_ptr.c src/lzo_str.c src/lzo_util.c src/lzo_crc.c
 
 default:

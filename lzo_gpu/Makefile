@@ -8,25 +8,25 @@ CL_SOURCES := $(wildcard *.cl)
 
 all: build_kernel lzo_gpu lzo_gpu_daemon lzo_gpu_client precompile-combos
 
-build_kernel: build_kernel.c
-	$(CC) $(CFLAGS) -o build_kernel build_kernel.c $(LDFLAGS)
+build_kernel: build_kernel.c lzo_gpu_utils.c
+	$(CC) $(CFLAGS) -o build_kernel build_kernel.c lzo_gpu_utils.c $(LDFLAGS)
 
 
-# build the GPU host CLI
-lzo_gpu: lzo_host.c
-	$(CC) $(CFLAGS) -o lzo_gpu lzo_host.c $(LDFLAGS)
+# build the GPU host CLI (standalone renamed source)
+lzo_gpu: lzo_gpu_standalone.c lzo_gpu_utils.c
+	$(CC) $(CFLAGS) -o lzo_gpu lzo_gpu_standalone.c lzo_gpu_utils.c $(LDFLAGS)
 
 # build the GPU daemon
-lzo_gpu_daemon: lzo_gpu_daemon.c daemon_compress.c daemon_decompress.c
-	$(CC) $(CFLAGS) -o lzo_gpu_daemon lzo_gpu_daemon.c daemon_compress.c daemon_decompress.c $(LDFLAGS) -lpthread
+lzo_gpu_daemon: lzo_gpu_daemon.c daemon_compress.c daemon_decompress.c lzo_gpu_utils.c
+	$(CC) $(CFLAGS) -o lzo_gpu_daemon lzo_gpu_daemon.c daemon_compress.c daemon_decompress.c lzo_gpu_utils.c $(LDFLAGS) -lpthread
 
 # build the GPU client
 lzo_gpu_client: lzo_gpu_client.c
 	$(CC) $(CFLAGS) -o lzo_gpu_client lzo_gpu_client.c
 
 precompile: build_kernel
-	# If KERNEL is specified, build only that kernel (basename without .cl)
-	# Usage: make precompile KERNEL=lzo1x_1
+# If KERNEL is specified, build only that kernel (basename without .cl)
+	# Usage: make precompile KERNEL=lzo1x_12
 	if [ -n "$(KERNEL)" ]; then \
 		src="$(KERNEL).cl"; \
 		if [ ! -f "$$src" ]; then echo "Kernel source $$src not found"; exit 1; fi; \
@@ -36,25 +36,21 @@ precompile: build_kernel
 	fi
 
 
-precompile-all:
-	# precompile each kernel source into a same-named .bin (e.g. lzo1x_1.cl -> lzo1x_1.bin)
-	@if [ -z "$(CL_SOURCES)" ]; then \
-		echo "No .cl kernel sources found, skipping precompile-all"; \
-	else \
-		for f in $(CL_SOURCES); do \
-			bn=$${f%%.cl}.bin; \
-			echo "Building $$f -> $$bn"; \
-			./build_kernel $$f $$bn || exit 1; \
-		done; \
-	fi
-
-# Build combinations of core kernels and frontend strategies into precompiled binaries.
-# For each core (like lzo1x_1, lzo1x_1k, ...) and each frontend wrapper (atomic/delayed/...)
-# create a temporary directory, copy the frontend there and copy the chosen core as
-# `lzo1x_1.cl` so that the frontend's `#include "lzo1x_1.cl"` picks up the selected core.
-# Output binaries are named `<core>_<frontend>.bin` (both basenames without .cl).
 precompile-combos: build_kernel
-	@./tools/precompile_combos.sh
+# Generate binaries for all algorithms and dictionary sizes
+	@for alg in lzo1x lzo1y; do \
+		for bits in 10 11 12 14; do \
+			echo "Building $${alg}_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits})..."; \
+			./build_kernel $${alg}.cl $${alg}_$${bits}.clbin "-I. -D D_BITS=$${bits}" || exit 1; \
+		done; \
+	done
+# Also build decompression kernels
+	@for alg in lzo1x lzo1y; do \
+		echo "Building $${alg}_decomp.clbin..."; \
+		./build_kernel $${alg}_decomp.cl $${alg}_decomp.clbin "-I." || exit 1; \
+	done
+
+precompile-all: precompile-combos
 
 .PHONY: help check-opencl testdata
 
@@ -103,6 +99,6 @@ testdata:
 	python3 ../tools/generate-test-data.py --suite --out-dir "$$OUTDIR" || (echo "failed to generate test data"; exit 1)
 
 clean:
-	rm -f build_kernel lzo_gpu lzo_gpu_daemon lzo_gpu_client *.bin
+	rm -f build_kernel lzo_gpu lzo_gpu_daemon lzo_gpu_client *.bin *.clbin
 
 .PHONY: all build_kernel lzo_gpu lzo_gpu_daemon lzo_gpu_client precompile precompile-all clean

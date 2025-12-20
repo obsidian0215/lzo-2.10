@@ -34,7 +34,7 @@ with open(in_path, 'rb') as f:
 # nblk: u32
 # len array: nblk x u32
 
-if len(data) < 2 + 4 + 4 + 4:
+if len(data) < 2 + 4 + 4 + 4 + 4:
     print("File too short or invalid format")
     sys.exit(1)
 
@@ -47,6 +47,7 @@ if magic != 0x4C5A:  # 'LZ'
 orig_sz = struct.unpack_from('<I', data, offset)[0]; offset += 4
 blk_sz = struct.unpack_from('<I', data, offset)[0]; offset += 4
 nblk = struct.unpack_from('<I', data, offset)[0]; offset += 4
+alg_id = struct.unpack_from('<I', data, offset)[0]; offset += 4
 
 if block_idx < 0 or block_idx >= nblk:
     print(f"Invalid block index {block_idx}, nblk={nblk}")
@@ -77,6 +78,7 @@ with open(out_path, 'wb') as fo:
     fo.write(struct.pack('<I', block_uncomp))
     fo.write(struct.pack('<I', blk_sz))
     fo.write(struct.pack('<I', 1))  # single block
+    fo.write(struct.pack('<I', alg_id))
     fo.write(struct.pack('<I', length))
     fo.write(block_data)
 

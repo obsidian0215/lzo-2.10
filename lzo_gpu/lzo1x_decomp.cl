@@ -1,11 +1,10 @@
 #pragma OPENCL EXTENSION cl_khr_byte_addressable_store : enable
-#include "minilzo.h"
+#include "lzo_gpu.h"
 
-/* Shared LZO decompressor (renamed to lzo1x_decomp.cl)
+/* Shared LZO decompressor (lzo1x_decomp.cl)
  * This file contains the lzo1x_decompress implementation and a
- * device kernel `lzo1x_block_decompress` that calls it. It is
- * independent of compression level and can be precompiled to
- * lzo1x_decomp.bin.
+ * device kernel `lzo1x_block_decompress` that calls it.
+ * It includes vectorized memory copy optimizations.
  */
 
 /* --- minimal required macros and helpers (copied from lzo1x_1.cl) --- */
@@ -52,12 +51,11 @@ static inline void LZO_MEMOPS_COPY8(__generic void *dd, const __generic void *ss
     }
 }
 
-/* 16-byte wide copy for improved decompression throughput.
- * Uses uchar16 vector operations when available for literal and match copies.
- */
+/* new: 16-byte copy using uchar16 */
 static inline void LZO_MEMOPS_COPY16(__generic void *dd, const __generic void *ss)
 {
     if (lzo_ptr_aligned(dd,16) && lzo_ptr_aligned(ss,16)) {
+        /* copy in two 8-byte stores if compiler doesn't support 16-byte atomics */
         if (sizeof(unsigned long) >= 8) {
             *((__generic ulong*)dd) = *((__generic const ulong*)ss);
             *((__generic ulong*)((__generic uchar*)dd + 8)) = *((__generic const ulong*)((__generic const uchar*)ss + 8));
@@ -68,6 +66,7 @@ static inline void LZO_MEMOPS_COPY16(__generic void *dd, const __generic void *s
             vstore8(b,8,(__generic uchar*)dd);
         }
     } else {
+        /* use vector ops when possible */
         uchar16 v = vload16(0, (__generic const uchar*)ss);
         vstore16(v,0,(__generic uchar*)dd);
     }
@@ -79,24 +78,18 @@ static inline void LZO_MEMOPS_COPYN(__generic void *dd, const __generic void *ss
     __generic const uchar *s = (__generic const uchar*)ss;
 
     if (nn == 0) return;
-
-    /* memmove semantics: handle overlapping regions safely.
-     * If source starts after dest and overlaps (s > d && s < d + nn),
-     * copy backward to avoid clobbering source data. Otherwise copy forward.
-     */
+    /* memmove semantics: if src in (d, d+nn) -> backward copy */
     if (s > d && s < d + nn) {
         __generic uchar *de = d + nn;
         __generic const uchar *se = s + nn;
-        /* backward wide-byte copy: 16 -> 8 -> 4 -> 1 byte operations */
         while (nn >= 16 && lzo_ptr_aligned((void*)(de - 16),16) && lzo_ptr_aligned((void*)(se - 16),16)) {
-            de -= 16; se -= 16; LZO_MEMOPS_COPY16(de, se); nn -= 16; }
+            de -= 16; se -= 16; LZO_MEMOPS_COPY16(de,se); nn -= 16; }
         while (nn >= 8 && lzo_ptr_aligned((void*)(de - 8),8) && lzo_ptr_aligned((void*)(se - 8),8)) {
-            de -= 8; se -= 8; LZO_MEMOPS_COPY8(de, se); nn -= 8; }
+            de -= 8; se -= 8; LZO_MEMOPS_COPY8(de,se); nn -= 8; }
         while (nn >= 4 && lzo_ptr_aligned((void*)(de - 4),4) && lzo_ptr_aligned((void*)(se - 4),4)) {
-            de -= 4; se -= 4; LZO_MEMOPS_COPY4(de, se); nn -= 4; }
+            de -= 4; se -= 4; LZO_MEMOPS_COPY4(de,se); nn -= 4; }
         while (nn) { de--; se--; *de = *se; nn--; }
     } else {
-        /* forward wide-byte copy: 16 -> 8 -> 4 -> 1 byte operations */
         while (nn >= 16 && lzo_ptr_aligned(d,16) && lzo_ptr_aligned(s,16))
         {   LZO_MEMOPS_COPY16(d,s); d+=16; s+=16; nn-=16; }
         while (nn >= 8 && lzo_ptr_aligned(d,8) && lzo_ptr_aligned(s,8))
@@ -130,24 +123,254 @@ static inline uint lzo_memops_get_le32(const __generic void *pp)
 #define UA_COPYN            LZO_MEMOPS_COPYN
 #define UA_GET_LE32         LZO_MEMOPS_GET_LE32
 
-/* Optimized match copy with fast paths for short offsets (RLE, patterns)
- * This function handles overlapping copies safely and uses vector operations
- * for better throughput when offset allows.
- */
-static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos, uint len)
-{
-    /* 标量内核：简单逐字节复制作为正确性参考 */
-    while (len--) {
-        *op++ = *m_pos++;
-    }
-}
-
 /* common helper macros used by decompressor */
 #define pd(a,b)             ((lzo_uint) ((a)-(b)))
 
 /* markers and offsets used by decompressor (same across levels) */
 #define M2_MAX_OFFSET   0x0800
 #define M4_MARKER       16
+
+/* 优化的匹配拷贝函数 - 用于解压中的COPY指令 (向量化优化) */
+static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos, uint len)
+{
+    /* 向量化匹配拷贝 (ROI: ⭐⭐⭐⭐)
+     * 优化策略:
+     * 1. 使用uchar16/uchar8向量拷贝长匹配
+     * 2. 处理重叠拷贝 (offset < 16)
+     * 3. RLE模式检测和优化
+     * 4. 尾部使用标量拷贝
+     */
+
+    uint offset = op - m_pos;
+    __generic const uchar *end_src = m_pos + len;
+    int overlap = (m_pos < op && end_src > op);
+
+    /* 处理 overlap 场景，保留 memmove 语义：只为安全的小 pattern 使用 fast-path，
+     * 其余情况退回到 scalar copy 以避免破坏源数据。
+     */
+    if (overlap) {
+        if (offset == 1) {
+            uchar c = *m_pos;
+            uchar16 fill16 = (uchar16)(c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c);
+            uchar8 fill8 = (uchar8)(c,c,c,c,c,c,c,c);
+            while (len >= 16) { vstore16(fill16, 0, op); op += 16; len -= 16; }
+            while (len >= 8) { vstore8(fill8, 0, op); op += 8; len -= 8; }
+            while (len--) *op++ = c;
+            return;
+        }
+        if (offset == 2 && len >= 8) {
+            uchar p0 = m_pos[0], p1 = m_pos[1];
+            uchar8 pat8 = (uchar8)(p0,p1,p0,p1,p0,p1,p0,p1);
+            while (len >= 8) { vstore8(pat8, 0, op); op += 8; m_pos += 8; len -= 8; }
+            while (len >= 2) { *op++ = p0; *op++ = p1; len -= 2; }
+            if (len) *op++ = p0; return;
+        }
+        if (offset == 3 && len >= 3) {
+            /* overlapping 3-byte repeating pattern: use memmove-like loop to preserve semantics */
+            while (len >= 3) {
+                *op++ = *m_pos++;
+                *op++ = *m_pos++;
+                *op++ = *m_pos++;
+                len -= 3;
+            }
+            if (len == 2) { *op++ = *m_pos++; *op++ = *m_pos++; }
+            else if (len == 1) { *op++ = *m_pos++; }
+            return;
+        }
+        if (offset == 4 && len >= 8) {
+            uchar p0 = m_pos[0], p1 = m_pos[1], p2 = m_pos[2], p3 = m_pos[3];
+            uchar16 pat16 = (uchar16)(p0,p1,p2,p3,p0,p1,p2,p3,p0,p1,p2,p3,p0,p1,p2,p3);
+            uchar8 pat8 = (uchar8)(p0,p1,p2,p3,p0,p1,p2,p3);
+            while (len >= 16) { vstore16(pat16, 0, op); op += 16; len -= 16; }
+            while (len >= 8) { vstore8(pat8, 0, op); op += 8; len -= 8; }
+            while (len >= 4) { *op++ = p0; *op++ = p1; *op++ = p2; *op++ = p3; len -= 4; }
+            /* 尾部处理：剩余 0-3 字节 */
+            if (len >= 1) *op++ = p0;
+            if (len >= 2) *op++ = p1;
+            if (len >= 3) *op++ = p2;
+            return;
+        }
+        if (offset == 6 && len >= 8) {
+            /* For overlapping offset==6, vectorized 8-byte copies are unsafe because
+             * 8 is not a multiple of 6; fall back to memmove-safe generic copy.
+             */
+            UA_COPYN(op, m_pos, len);
+            return;
+        }
+        if (offset == 8 && len >= 8) {
+            /* overlapping 8-byte repeating pattern: 8-byte chunk copies are safe */
+            while (len >= 8) {
+                uchar8 v = vload8(0, m_pos);
+                vstore8(v, 0, op);
+                op += 8; m_pos += 8; len -= 8;
+            }
+            while (len--) *op++ = *m_pos++;
+            return;
+        }
+        if (offset == 16 && len >= 16) {
+            /* overlapping 16-byte repeating pattern: 16-byte chunk copies are safe */
+            while (len >= 16) {
+                uchar16 v = vload16(0, m_pos);
+                vstore16(v, 0, op);
+                op += 16; m_pos += 16; len -= 16;
+            }
+            if (len >= 8) { uchar8 v = vload8(0, m_pos); vstore8(v, 0, op); op += 8; m_pos += 8; len -= 8; }
+            if (len >= 4) { uchar4 v = vload4(0, m_pos); vstore4(v, 0, op); op += 4; m_pos += 4; len -= 4; }
+            while (len--) *op++ = *m_pos++;
+            return;
+        }
+        /* Other overlapping cases: fallback to scalar UA_COPYN (memmove-safe) */
+        UA_COPYN(op, m_pos, len);
+        return;
+    }
+
+    /* 长距离匹配：可以安全使用向量拷贝 */
+    if (offset >= 16) {
+        /* 循环展开 + ILP 优化：交错 load/store 减少依赖链 */
+        while (len >= 64) {
+            uchar16 v0 = vload16(0, m_pos);
+            uchar16 v1 = vload16(0, m_pos + 16);
+            vstore16(v0, 0, op);          // 立即使用 v0，释放寄存器
+            uchar16 v2 = vload16(0, m_pos + 32);
+            vstore16(v1, 0, op + 16);     // 立即使用 v1
+            uchar16 v3 = vload16(0, m_pos + 48);
+            vstore16(v2, 0, op + 32);     // 立即使用 v2
+            vstore16(v3, 0, op + 48);     // 使用 v3
+            op += 64; m_pos += 64; len -= 64;
+        }
+
+        /* 16字节向量拷贝 */
+        while (len >= 16) {
+            uchar16 v = vload16(0, m_pos);
+            vstore16(v, 0, op);
+            op += 16; m_pos += 16; len -= 16;
+        }
+
+        /* 8字节向量拷贝 */
+        if (len >= 8) {
+            uchar8 v = vload8(0, m_pos);
+            vstore8(v, 0, op);
+            op += 8; m_pos += 8; len -= 8;
+        }
+
+        /* 4字节向量拷贝 */
+        if (len >= 4) {
+            uchar4 v = vload4(0, m_pos);
+            vstore4(v, 0, op);
+            op += 4; m_pos += 4; len -= 4;
+        }
+    }
+    /* 中距离匹配：可以使用8字节向量 */
+    else if (offset >= 8) {
+        /* 8字节向量拷贝 */
+        while (len >= 8) {
+            uchar8 v = vload8(0, m_pos);
+            vstore8(v, 0, op);
+            op += 8; m_pos += 8; len -= 8;
+        }
+
+        /* 4字节向量拷贝 */
+        if (len >= 4) {
+            uchar4 v = vload4(0, m_pos);
+            vstore4(v, 0, op);
+            op += 4; m_pos += 4; len -= 4;
+        }
+    }
+    /* 短距离匹配：不会 overlap（本分支在合并前已判断过 overlap） */
+    else if (offset > 0) {
+        /* RLE模式检测：offset=1时是字节重复 */
+        if (offset == 1) {
+            uchar c = *m_pos;
+            /* 向量化填充 */
+            uchar16 fill16 = (uchar16)(c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c);
+            uchar8 fill8 = (uchar8)(c,c,c,c,c,c,c,c);
+
+            while (len >= 16) {
+                vstore16(fill16, 0, op);
+                op += 16; len -= 16;
+            }
+            while (len >= 8) {
+                vstore8(fill8, 0, op);
+                op += 8; len -= 8;
+            }
+            while (len--) *op++ = c;
+            return;
+        }
+
+        /* offset=2: 重复2字节模式 */
+        if (offset == 2 && len >= 8) {
+            uchar p0 = m_pos[0]; uchar p1 = m_pos[1];
+            uchar8 pat8 = (uchar8)(p0, p1, p0, p1, p0, p1, p0, p1);
+            while (len >= 8) {
+                vstore8(pat8, 0, op);
+                op += 8; m_pos += 8; len -= 8;
+            }
+            /* 尾部处理 */
+            while (len >= 2) { *op++ = p0; *op++ = p1; len -= 2; }
+            if (len >= 1) *op++ = p0;
+            return;
+        }
+        /* offset=3: 重复3字节模式 */
+        else if (offset == 3 && len >= 6) {
+            uchar c0 = m_pos[0], c1 = m_pos[1], c2 = m_pos[2];
+            while (len >= 3) {
+                op[0] = c0; op[1] = c1; op[2] = c2;
+                op += 3; len -= 3;
+            }
+            /* 尾部处理 */
+            if (len >= 1) *op++ = c0;
+            if (len >= 2) *op++ = c1;
+            return;
+        }
+        /* offset=4: 重复4字节模式 */
+        else if (offset == 4 && len >= 8) {
+            uchar p0 = m_pos[0], p1 = m_pos[1], p2 = m_pos[2], p3 = m_pos[3];
+            uchar16 pat16 = (uchar16)(p0,p1,p2,p3,p0,p1,p2,p3,p0,p1,p2,p3,p0,p1,p2,p3);
+            uchar8 pat8 = (uchar8)(p0, p1, p2, p3, p0, p1, p2, p3);
+            while (len >= 16) { vstore16(pat16, 0, op); op += 16; len -= 16; }
+            while (len >= 8) {
+                vstore8(pat8, 0, op);
+                op += 8; len -= 8;
+            }
+            while (len >= 4) { *op++ = p0; *op++ = p1; *op++ = p2; *op++ = p3; len -= 4; }
+            /* 尾部处理：剩余 0-3 字节 */
+            if (len >= 1) *op++ = p0;
+            if (len >= 2) *op++ = p1;
+            if (len >= 3) *op++ = p2;
+            return;
+        }
+        /* offset=6: repeat 6-byte pattern - use 8-byte vector loads/stores
+         * (reading 8 bytes from m_pos for repeated pattern is safe and faster)
+         */
+        else if (offset == 6 && len >= 8) {
+            uchar p0 = m_pos[0], p1 = m_pos[1], p2 = m_pos[2], p3 = m_pos[3], p4 = m_pos[4], p5 = m_pos[5];
+            uchar8 pat8 = (uchar8)(p0, p1, p2, p3, p4, p5, p0, p1);
+            while (len >= 8) {
+                vstore8(pat8, 0, op);
+                op += 8; m_pos += 8; len -= 8;
+            }
+            /* 尾部处理 */
+            while (len >= 6) {
+                op[0] = p0; op[1] = p1; op[2] = p2; op[3] = p3; op[4] = p4; op[5] = p5;
+                op += 6; len -= 6;
+            }
+            if (len >= 1) *op++ = p0;
+            if (len >= 2) *op++ = p1;
+            if (len >= 3) *op++ = p2;
+            if (len >= 4) *op++ = p3;
+            if (len >= 5) *op++ = p4;
+            return;
+        }
+        /* offset=5,7: 无法安全使用向量拷贝，使用标量拷贝 */
+        else {
+            while (len--) *op++ = *m_pos++;
+            return;
+        }
+    }
+
+    /* 尾部逐字节拷贝 */
+    while (len--) *op++ = *m_pos++;
+}
 
 /* Original LZO decompressor (same as used in per-level files) */
 static lzo_uint
@@ -192,7 +415,7 @@ lzo1x_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint  in_len,
             }
             t += 15 + *ip++;
         }
-        /* copy 3 initial bytes + t more bytes (total 3 + t) */
+        /* copy 3 initial bytes + t more bytes */
         {
             uint copy_len = (uint)(3 + t);
             UA_COPYN(op, ip, copy_len);
@@ -267,11 +490,9 @@ lzo1x_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint  in_len,
                 goto match_done;
             }
         copy_match:
-            {
-                uint copy_len = (uint)(2 + t);
-                COPY_MATCH(op, m_pos, copy_len);
-                op += copy_len; m_pos += copy_len;
-            }
+            /* 使用优化的向量化拷贝 */
+            COPY_MATCH(op, m_pos, t + 2);
+            op += t + 2;
 
         match_done:
             t = ip[-2] & 3;

@@ -10,10 +10,10 @@
 
 #define LZO_DEFAULT_STDIO_BUF_MB 4
 #define LZO_DEFAULT_COALESCE_OUTPUT 1
-#define LZO_DEFAULT_COALESCE_MAX_MB 512
+#define LZO_DEFAULT_COALESCE_MAX_MB 256
 #define LZO_DEFAULT_COALESCE_CHUNK_MB 16
 /* default value for multi-threaded I/O threads when enabled */
-#define LZO_DEFAULT_MT_IO_THREADS 1
+#define LZO_DEFAULT_MT_IO_THREADS 2
 
 /* Convenience helper to parse int env vars with a default value */
 static inline int lzo_env_get_int(const char* name, int default_val) {

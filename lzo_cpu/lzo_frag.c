@@ -25,12 +25,13 @@
 #endif
 
 #include <lzo/lzo1x.h>
+#include <lzo/lzo1y.h>
 #include "lzo_levels.h"
 
 #define MAGIC_TAG            0x4C5A       /* 'L''Z' */
 #define DEFAULT_THREAD_COUNT 1
 #define MIN_BLOCK_SIZE       (64u * 1024u)
-#define MAX_BLOCK_SIZE       (1024u * 1024u)
+#define MAX_BLOCK_SIZE       (512u * 1024u)
 #define LZO_WORK_MEM_SIZE    LZO1X_1_MEM_COMPRESS
 
 typedef struct {
@@ -48,25 +49,51 @@ typedef struct {
  */
 static const char *g_alg_spec = NULL;
 typedef enum {
-    ALG_NONE = 0,
-    ALG_1X,
-    ALG_1K,
-    ALG_1L,
-    ALG_1O,
+    ALG_1X = 0,
+    ALG_1Y = 1,
 } alg_t;
 
-static alg_t g_alg = ALG_NONE;
+typedef enum {
+    VAR_1 = 1,
+    VAR_1K = 2,
+    VAR_1L = 3,
+    VAR_1O = 4,
+} variant_t;
 
-static alg_t alg_from_spec(const char *s);
+static alg_t g_alg = ALG_1X;
+static variant_t g_variant = VAR_1;
+
+static alg_t alg_from_string(const char *s) {
+    if (!s) return ALG_1X;
+    if (strcasecmp(s, "1x") == 0 || strcasecmp(s, "lzo1x") == 0) return ALG_1X;
+    if (strcasecmp(s, "1y") == 0 || strcasecmp(s, "lzo1y") == 0) return ALG_1Y;
+    return ALG_1X;
+}
+
+static variant_t variant_from_string(const char *s) {
+    if (!s) return VAR_1;
+    if (strcasecmp(s, "1") == 0) return VAR_1;
+    if (strcasecmp(s, "1k") == 0) return VAR_1K;
+    if (strcasecmp(s, "1l") == 0) return VAR_1L;
+    if (strcasecmp(s, "1o") == 0) return VAR_1O;
+    return VAR_1;
+}
+
+static const char *alg_to_str(alg_t a) {
+    switch (a) {
+        case ALG_1X: return "1x";
+        case ALG_1Y: return "1y";
+        default: return "unknown";
+    }
+}
 static const char *alg_to_str(alg_t a);
-static alg_t alg_from_level(int level);
-
 
 typedef struct {
     chunk_t *chunks;
     size_t chunk_count;
     _Atomic size_t next_index;
     alg_t compression_alg;
+    variant_t variant;
     _Atomic int status;
     pthread_mutex_t lock;
 } compress_job_t;
@@ -77,6 +104,7 @@ typedef struct {
     _Atomic size_t next_index;
     _Atomic int status;
     pthread_mutex_t lock;
+    alg_t alg;
 } decompress_job_t;
 
 #define HEAP_ALLOC(var, size) \
@@ -87,34 +115,9 @@ typedef struct {
  * are labels like "1x", "1k", "1o", "1l".
  */
 /* Definitions for algorithm helpers (moved above) */
-static alg_t alg_from_spec(const char *s) {
-    if (!s) return ALG_NONE;
-    if (strcasecmp(s, "1") == 0 || strcasecmp(s, "1x") == 0) return ALG_1X;
-    if (strcasecmp(s, "1k") == 0) return ALG_1K;
-    if (strcasecmp(s, "1l") == 0) return ALG_1L;
-    if (strcasecmp(s, "1o") == 0) return ALG_1O;
-    return ALG_NONE;
-}
 
-static const char *alg_to_str(alg_t a) {
-    switch (a) {
-        case ALG_1X: return "1";
-        case ALG_1K: return "1k";
-        case ALG_1L: return "1l";
-        case ALG_1O: return "1o";
-        default: return "unknown";
-    }
-}
 
-static alg_t alg_from_level(int level) {
-    switch (level) {
-        case 1: return ALG_1L; /* numeric 1 -> 1l (legacy mapping) */
-        case 2: return ALG_1K;
-        case 4: return ALG_1O;
-        case 3:
-        default: return ALG_1X;
-    }
-}
+
 
 static uint16_t read_u16(const unsigned char *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -156,7 +159,21 @@ static void format_ms_or_us(char *buf, size_t buflen, double ms) {
     }
 }
 
+static size_t g_cli_fixed_block_bytes = 0;
+
 static size_t choose_block_size(size_t total_bytes, int threads) {
+    if (g_cli_fixed_block_bytes > 0) {
+        size_t blk = g_cli_fixed_block_bytes;
+        if (blk < MIN_BLOCK_SIZE) blk = MIN_BLOCK_SIZE;
+        if (blk > MAX_BLOCK_SIZE) blk = MAX_BLOCK_SIZE;
+        return blk;
+    }
+
+    /* Dynamic block size selection */
+    if (total_bytes < 1024 * 1024) {
+        return 64 * 1024; /* 64KB for small files */
+    }
+
     if (threads < 1) threads = 1;
     size_t blk = (threads > 0) ? (total_bytes + (size_t)threads - 1u) / (size_t)threads : total_bytes;
     if (blk < MIN_BLOCK_SIZE) blk = MIN_BLOCK_SIZE;
@@ -287,56 +304,27 @@ static int write_entire(const char *path, const unsigned char *buf, size_t len) 
 static int compress_block_level(const unsigned char *in, size_t in_size,
                                 unsigned char **out, size_t *out_size,
                                 alg_t compression_alg, void *wrkmem_in) {
-    size_t cap = in_size + in_size / 16u + 64u + 3u;
-    *out = (unsigned char *)malloc(cap);
-    if (!*out) return LZO_E_OUT_OF_MEMORY;
-    lzo_align_t *wrkmem_ptr = NULL;
-    /* if caller provided wrkmem, use it; otherwise allocate on stack */
-    if (wrkmem_in) {
-        wrkmem_ptr = (lzo_align_t *)wrkmem_in;
-    } else {
-        HEAP_ALLOC(_wrkmem_local, LZO_WORK_MEM_SIZE);
-        wrkmem_ptr = _wrkmem_local;
-    }
-
-    lzo_uint dst_len = (lzo_uint)cap;
-    int rc;
-    /* Choose implementation by algorithm enum (caller resolves g_alg/level). */
-    switch (compression_alg) {
-        case ALG_1X:
-            rc = lzo1x_1_compress(in, (lzo_uint)in_size, *out, &dst_len, wrkmem_ptr);
-            break;
-        case ALG_1K:
-            rc = lzo1x_1_12_compress(in, (lzo_uint)in_size, *out, &dst_len, wrkmem_ptr);
-            break;
-        case ALG_1O:
-            rc = lzo1x_1_15_compress(in, (lzo_uint)in_size, *out, &dst_len, wrkmem_ptr);
-            break;
-        case ALG_1L:
-            rc = lzo1x_1_11_compress(in, (lzo_uint)in_size, *out, &dst_len, wrkmem_ptr);
-            break;
-        default:
-            rc = lzo1x_1_compress(in, (lzo_uint)in_size, *out, &dst_len, wrkmem_ptr);
-            break;
-    }
-        if (rc != LZO_E_OK) {
-            free(*out);
-            *out = NULL;
-            return rc;
-        }
-    *out_size = (size_t)dst_len;
-    return LZO_E_OK;
+    /* This function is deprecated and replaced by compress_block_into */
+    return LZO_E_ERROR;
 }
 
 /* forward decl for the prealloc variant used by workers */
 static int compress_block_into(const unsigned char *in, size_t in_size,
                                unsigned char *out, size_t out_cap, size_t *out_size,
-                               alg_t compression_alg, void *wrkmem_in);
+                               alg_t compression_alg, variant_t variant, void *wrkmem_in);
 
 static int decompress_block(const unsigned char *in, size_t in_size,
-                            unsigned char *out, size_t orig_size) {
+                            unsigned char *out, size_t orig_size, alg_t alg) {
     lzo_uint dst_len = (lzo_uint)orig_size;
-    int rc = lzo1x_decompress(in, (lzo_uint)in_size, out, &dst_len, NULL);
+    int rc;
+    if (alg == ALG_1Y) {
+        rc = lzo1y_decompress_safe(in, (lzo_uint)in_size, out, &dst_len, NULL);
+    } else {
+        rc = lzo1x_decompress_safe(in, (lzo_uint)in_size, out, &dst_len, NULL);
+    }
+    if (rc != LZO_E_OK || dst_len != (lzo_uint)orig_size) {
+        fprintf(stderr, "decompress_block failed: rc=%d dst_len=%lu orig_size=%lu alg=%d\n", rc, (unsigned long)dst_len, (unsigned long)orig_size, alg);
+    }
     return (rc == LZO_E_OK && dst_len == (lzo_uint)orig_size) ? LZO_E_OK : rc;
 }
 
@@ -371,16 +359,24 @@ static void *compress_worker(void *opaque) {
         if (ck->comp) {
             /* compress into preallocated buffer */
             size_t cap = ck->in_size + ck->in_size / 16u + 64u + 3u;
-            rc = compress_block_into(ck->in, ck->in_size, ck->comp, cap, &out_len, job->compression_alg, thread_wrkmem);
+            rc = compress_block_into(ck->in, ck->in_size, ck->comp, cap, &out_len, job->compression_alg, job->variant, thread_wrkmem);
             if (rc != LZO_E_OK) {
                 atomic_store(&job->status, rc);
                 break;
             }
             ck->comp_size = out_len;
         } else {
-            unsigned char *out = NULL;
-            rc = compress_block_level(ck->in, ck->in_size, &out, &out_len, job->compression_alg, thread_wrkmem);
+            /* compress_block_level is deprecated/removed in favor of compress_block_into with malloc */
+            /* But for now let's just use compress_block_into with malloc */
+            size_t cap = ck->in_size + ck->in_size / 16u + 64u + 3u;
+            unsigned char *out = (unsigned char *)malloc(cap);
+            if (!out) {
+                atomic_store(&job->status, LZO_E_OUT_OF_MEMORY);
+                break;
+            }
+            rc = compress_block_into(ck->in, ck->in_size, out, cap, &out_len, job->compression_alg, job->variant, thread_wrkmem);
             if (rc != LZO_E_OK) {
+                free(out);
                 atomic_store(&job->status, rc);
                 break;
             }
@@ -433,7 +429,8 @@ static int compress_multi(const unsigned char *input, size_t input_size,
     job.chunk_count = chunk_count;
     atomic_store(&job.next_index, (size_t)0);
     /* prefer explicit algorithm selection; fall back to numeric mapping */
-    job.compression_alg = (g_alg != ALG_NONE) ? g_alg : alg_from_level(level);
+    job.compression_alg = g_alg;
+    job.variant = g_variant;
     atomic_store(&job.status, LZO_E_OK);
     pthread_mutex_init(&job.lock, NULL);
 
@@ -492,7 +489,7 @@ static void *decompress_worker(void *opaque) {
         if (atomic_load(&job->status) != LZO_E_OK) break;
 
         chunk_t *ck = &job->chunks[idx];
-        int rc = decompress_block(ck->comp, ck->comp_size, ck->out, ck->in_size);
+        int rc = decompress_block(ck->comp, ck->comp_size, ck->out, ck->in_size, job->alg);
         if (rc != LZO_E_OK) {
             atomic_store(&job->status, rc);
             break;
@@ -502,7 +499,7 @@ static void *decompress_worker(void *opaque) {
 }
 
 static int decompress_multi(chunk_t *chunks, size_t chunk_count,
-                            int threads, double *elapsed_ms) {
+                            int threads, alg_t alg, double *elapsed_ms) {
     if (threads < 1) threads = 1;
     if (chunk_count == 0) {
         if (elapsed_ms) *elapsed_ms = 0.0;
@@ -512,6 +509,7 @@ static int decompress_multi(chunk_t *chunks, size_t chunk_count,
     decompress_job_t job;
     job.chunks = chunks;
     job.chunk_count = chunk_count;
+    job.alg = alg;
     atomic_store(&job.next_index, (size_t)0);
     atomic_store(&job.status, LZO_E_OK);
     pthread_mutex_init(&job.lock, NULL);
@@ -560,8 +558,16 @@ static void run_benchmark(const unsigned char *data, size_t size,
     const clockid_t clk = CLOCK_MONOTONIC;
 #endif
     clock_gettime(clk, &t0);
-    alg_t use_alg = (g_alg != ALG_NONE) ? g_alg : alg_from_level(level);
-    int rc = compress_block_level(data, size, &single_comp, &single_comp_len, use_alg, NULL);
+    alg_t use_alg = g_alg;
+    variant_t use_var = g_variant;
+
+    size_t cap = size + size / 16u + 64u + 3u;
+    single_comp = (unsigned char *)malloc(cap);
+    if (!single_comp) {
+        fprintf(stderr, "malloc failed\n");
+        return;
+    }
+    int rc = compress_block_into(data, size, single_comp, cap, &single_comp_len, use_alg, use_var, NULL);
     clock_gettime(clk, &t1);
     if (rc != LZO_E_OK) {
         fprintf(stderr, "single-block compress failed: %d\n", rc);
@@ -576,7 +582,7 @@ static void run_benchmark(const unsigned char *data, size_t size,
         return;
     }
     clock_gettime(clk, &t0);
-    rc = decompress_block(single_comp, single_comp_len, single_out, size);
+    rc = decompress_block(single_comp, single_comp_len, single_out, size, use_alg);
     clock_gettime(clk, &t1);
     double single_decomp_ms = diff_ms_ts(&t0, &t1);
     {
@@ -629,7 +635,7 @@ static void run_benchmark(const unsigned char *data, size_t size,
         chunks[i].out = multi_out + chunks[i].offset;
 
     double multi_decomp_ms = 0.0;
-    rc = decompress_multi(chunks, chunk_count, threads, &multi_decomp_ms);
+    rc = decompress_multi(chunks, chunk_count, threads, use_alg, &multi_decomp_ms);
     {
         char s[32];
         format_ms_or_us(s, sizeof(s), multi_decomp_ms);
@@ -677,12 +683,14 @@ static int compress_file(const char *input_path, const char *output_path,
         return 1;
     }
 
+    alg_t used_alg = g_alg;
+
     struct timespec t_prepare_start, t_prepare_end;
     struct timespec t_write_start, t_write_end;
     double write_ms = 0.0;
     clock_gettime(CLOCK_MONOTONIC, &t_prepare_start);
 
-    size_t header_size = 2u + 4u + 4u + 4u + chunk_count * 4u;
+    size_t header_size = 2u + 4u + 4u + 4u + 4u + chunk_count * 4u;
     size_t total_size = header_size + total_comp;
     unsigned char *out_buf = (unsigned char *)malloc(total_size ? total_size : 1u);
     if (!out_buf) {
@@ -697,6 +705,7 @@ static int compress_file(const char *input_path, const char *output_path,
     write_u32(out_buf + cursor, (uint32_t)input_size); cursor += 4u;
     write_u32(out_buf + cursor, (uint32_t)block_size); cursor += 4u;
     write_u32(out_buf + cursor, (uint32_t)chunk_count); cursor += 4u;
+    write_u32(out_buf + cursor, (uint32_t)used_alg); cursor += 4u;
     for (size_t i = 0; i < chunk_count; ++i) {
         write_u32(out_buf + cursor, (uint32_t)chunks[i].comp_size);
         cursor += 4u;
@@ -719,7 +728,7 @@ static int compress_file(const char *input_path, const char *output_path,
         for (size_t i = 0; i < chunk_count; ++i)
             chunks[i].out = multi_out + chunks[i].offset;
         double multi_decomp_ms = 0.0;
-        int rc = decompress_multi(chunks, chunk_count, threads, &multi_decomp_ms);
+        int rc = decompress_multi(chunks, chunk_count, threads, used_alg, &multi_decomp_ms);
         if (rc != LZO_E_OK) {
             fprintf(stderr, "verify decompress failed: %d\n", rc);
             free(multi_out);
@@ -764,7 +773,7 @@ static int compress_file(const char *input_path, const char *output_path,
     }
 
     {
-        alg_t used_alg = (g_alg != ALG_NONE) ? g_alg : alg_from_level(level);
+        alg_t used_alg = g_alg;
 
         // Calculate prepare time (time between compression and write)
         clock_gettime(CLOCK_MONOTONIC, &t_prepare_end);
@@ -859,6 +868,9 @@ static int decompress_file(const char *input_path, const char *output_path,
     uint32_t orig_sz = read_u32(comp + cursor); cursor += 4u;
     uint32_t blk_sz = read_u32(comp + cursor); cursor += 4u;
     uint32_t nblk = read_u32(comp + cursor); cursor += 4u;
+    /* Read algorithm type */
+    uint32_t alg_val = read_u32(comp + cursor); cursor += 4u;
+    g_alg = (alg_t)alg_val;
 
     size_t lengths_bytes = (size_t)nblk * 4u;
     if (cursor + lengths_bytes > comp_size) {
@@ -922,7 +934,7 @@ static int decompress_file(const char *input_path, const char *output_path,
     }
 
     double decomp_ms = 0.0;
-    int rc = decompress_multi(chunks, nblk, threads, &decomp_ms);
+    int rc = decompress_multi(chunks, nblk, threads, g_alg, &decomp_ms);
     if (rc != LZO_E_OK) {
         fprintf(stderr, "decompress failed: %d\n", rc);
         free(output);
@@ -1005,6 +1017,18 @@ static int decompress_file(const char *input_path, const char *output_path,
     return 0;
 }
 
+static size_t parse_size_bytes(const char *s) {
+    if (!s || !*s) return 0;
+    char *end;
+    double val = strtod(s, &end);
+    if (end == s) return 0;
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end == '\0') return (size_t)val;
+    if (strcasecmp(end, "k") == 0 || strcasecmp(end, "kb") == 0) return (size_t)(val * 1024);
+    if (strcasecmp(end, "m") == 0 || strcasecmp(end, "mb") == 0) return (size_t)(val * 1024 * 1024);
+    return (size_t)val;
+}
+
 static int parse_int(const char *s, int *out) {
     if (!s || !out) return -1;
     char *end = NULL;
@@ -1022,8 +1046,8 @@ static void print_usage(const char *prog) {
             "  -d              Decompress instead of compress\n"
             "  -t <threads>    Worker thread count (default %d)\n"
             "  --verify        Verify round-trip instead of writing outputs\n"
-            "  -l <alg>        Select algorithm variant.\n"
-            "                  Allowed values: 1, 1k, 1l, 1o. Not valid with -d.\n"
+            "  -a <alg>        Select algorithm (1x, 1y). Default 1x.\n"
+            "  -l <level>      Select level/variant for 1x (1, 1k, 1l, 1o). Default 1.\n"
             "  -o <path>       Output path (- for stdout). If omitted a default is generated from input\n"
             "  --benchmark     Run benchmark metrics after operation\n"
             "  -h, --help      Show this help\n"
@@ -1081,8 +1105,20 @@ int main(int argc, char **argv) {
             mode_decompress = 1;
         } else if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
             verbose = 1;
-        } else if (strcmp(arg, "--bench") == 0 || strcmp(arg, "-B") == 0) {
+        } else if (strcmp(arg, "--bench") == 0) {
             bench_mode = 1;
+        } else if (strcmp(arg, "-B") == 0 || strcmp(arg, "--block-size") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "-B requires an argument\n");
+                print_usage(argv[0]);
+                free(auto_output);
+                return 1;
+            }
+            g_cli_fixed_block_bytes = parse_size_bytes(argv[++i]);
+            if (g_cli_fixed_block_bytes == 0) {
+                 fprintf(stderr, "invalid block size\n");
+                 return 1;
+            }
         } else if (strcmp(arg, "-t") == 0 || strcmp(arg, "--threads") == 0) {
             if (i + 1 >= argc || parse_int(argv[i + 1], &threads) != 0) {
                 fprintf(stderr, "invalid thread count\n");
@@ -1103,6 +1139,15 @@ int main(int argc, char **argv) {
                 return 1;
             }
             output = argv[++i];
+        } else if (strcmp(arg, "-a") == 0 || strcmp(arg, "--alg") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "-a requires an argument\n");
+                print_usage(argv[0]);
+                free(auto_output);
+                return 1;
+            }
+            const char *alg_str = argv[++i];
+            g_alg = alg_from_string(alg_str);
         } else if (strcmp(arg, "-l") == 0 || strcmp(arg, "-L") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "-l requires an argument\n");
@@ -1117,17 +1162,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
             kernel_spec = argv[++i];
-            /* validate allowed labels */
-            if (!(strcasecmp(kernel_spec, "1") == 0 || strcasecmp(kernel_spec, "1k") == 0 ||
-                  strcasecmp(kernel_spec, "1l") == 0 || strcasecmp(kernel_spec, "1o") == 0)) {
-                fprintf(stderr, "-l accepts only: 1, 1k, 1l, 1o\n");
-                print_usage(argv[0]);
-                free(auto_output);
-                return 1;
-            }
-            /* set global algorithm label immediately */
-            g_alg_spec = kernel_spec;
-            g_alg = alg_from_spec(g_alg_spec);
+            g_variant = variant_from_string(kernel_spec);
         } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
             print_usage(argv[0]);
             free(auto_output);
@@ -1155,6 +1190,11 @@ int main(int argc, char **argv) {
         print_usage(argv[0]);
         free(auto_output);
         return 1;
+    }
+
+    /* Enforce variant restrictions */
+    if (g_alg == ALG_1Y) {
+        g_variant = VAR_1;
     }
 
     if (!output) {
@@ -1194,22 +1234,17 @@ int main(int argc, char **argv) {
     }
 
     int rc;
-    /* If a kernel/algorithm specifier was provided, map it to a compression level.
-    * -l is intended to select algorithm variant (e.g. 1x, 1k, 1o, 1l) and can
-    * be used instead of numeric flags. If mapping fails, we leave numeric level.
-     */
     /* Only set a default algorithm label when compressing; do not set/print
      * a default when in decompress mode, otherwise decompress runs without
      * an explicit -L will still print a misleading default label. */
-    if (!kernel_spec && !mode_decompress) {
-        kernel_spec = "1"; /* default algorithm label */
-        g_alg_spec = kernel_spec;
-    }
-    if (g_alg_spec) {
-        g_alg = alg_from_spec(g_alg_spec);
-        if (!mode_decompress) {
-            fprintf(stderr, "Using algorithm label: %s\n", g_alg_spec);
-        }
+
+    if (!mode_decompress) {
+        fprintf(stderr, "Using algorithm: %s, variant: %s\n",
+            alg_to_str(g_alg),
+            (g_variant == VAR_1) ? "1" :
+            (g_variant == VAR_1K) ? "1k" :
+            (g_variant == VAR_1L) ? "1l" :
+            (g_variant == VAR_1O) ? "1o" : "unknown");
     }
 
     if (mode_decompress) {
@@ -1231,15 +1266,21 @@ int main(int argc, char **argv) {
                 const clockid_t clk = CLOCK_MONOTONIC;
 #endif
                 clock_gettime(clk, &t0);
-                alg_t use_alg = (g_alg != ALG_NONE) ? g_alg : alg_from_level(level);
-                int r = compress_block_level(input_buf, input_size, &comp, &comp_len, use_alg, NULL);
+                alg_t use_alg = g_alg;
+                variant_t use_var = g_variant;
+                size_t cap = input_size + input_size / 16u + 64u + 3u;
+                comp = (unsigned char *)malloc(cap);
+                int r = LZO_E_OUT_OF_MEMORY;
+                if (comp) {
+                    r = compress_block_into(input_buf, input_size, comp, cap, &comp_len, use_alg, use_var, NULL);
+                }
                 clock_gettime(clk, &t1);
                 if (r == LZO_E_OK) {
                     double comp_ms = diff_ms_ts(&t0, &t1);
                     unsigned char *out = malloc(input_size ? input_size : 1u);
                     struct timespec dt0, dt1;
                     clock_gettime(clk, &dt0);
-                    r = decompress_block(comp, comp_len, out, input_size);
+                    r = decompress_block(comp, comp_len, out, input_size, use_alg);
                     clock_gettime(clk, &dt1);
                     double decomp_ms = diff_ms_ts(&dt0, &dt1);
                     double comp_mb_s = input_size ? (input_size / 1048576.0) / (comp_ms / 1000.0) : 0.0;
@@ -1264,7 +1305,7 @@ int main(int argc, char **argv) {
  */
 static int compress_block_into(const unsigned char *in, size_t in_size,
                                unsigned char *out, size_t out_cap, size_t *out_size,
-                               alg_t compression_alg, void *wrkmem_in) {
+                               alg_t compression_alg, variant_t variant, void *wrkmem_in) {
     if (!out || out_cap == 0) return LZO_E_OUT_OF_MEMORY;
     lzo_align_t *wrkmem_ptr = NULL;
     if (wrkmem_in) {
@@ -1278,16 +1319,17 @@ static int compress_block_into(const unsigned char *in, size_t in_size,
     int rc;
     switch (compression_alg) {
         case ALG_1X:
-            rc = lzo1x_1_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);
+            if (variant == VAR_1K)
+                rc = lzo1x_1_12_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);
+            else if (variant == VAR_1L)
+                rc = lzo1x_1_11_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);
+            else if (variant == VAR_1O)
+                rc = lzo1x_1_15_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);
+            else
+                rc = lzo1x_1_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);
             break;
-        case ALG_1K:
-            rc = lzo1x_1_12_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);
-            break;
-        case ALG_1O:
-            rc = lzo1x_1_15_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);
-            break;
-        case ALG_1L:
-            rc = lzo1x_1_11_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);
+        case ALG_1Y:
+            rc = lzo1y_1_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);
             break;
         default:
             rc = lzo1x_1_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);

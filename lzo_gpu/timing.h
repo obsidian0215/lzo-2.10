@@ -42,7 +42,6 @@ typedef struct {
     unsigned long global_size;   /* global work size used for kernel */
     unsigned long local_size;    /* local work size used for kernel */
     char kernel_name[32];        /* null-terminated kernel name used */
-    unsigned int kernel_vectorized; /* boolean: 1 if vectorized kernel used */
 } timing_t;
 
 /* Helper: print a timing value given in microseconds, choosing a human-friendly

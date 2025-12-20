@@ -12,7 +12,7 @@
 - 最佳（延迟）: daemon + zero+mt — mean_ms_no_ocl ≈ 40.62 ms (~43% 优化)
 - IO 改善（daemon 聚合）: zero: mean_io_ms ≈ 5.444 ms；zero+mt: ≈ 3.966 ms；std: ≈ 11.004 ms；std+mt: ≈ 8.161 ms
 
-结论：Zero-Copy + Multi-threaded I/O（MT_IO）+ Daemon 是减小服务端感知延迟的最佳组合；在 dGPU（PCIe）环境下，std+mt_async 在上传瓶颈情况下能带来边际改进。
+结论：Zero-Copy + Multi-threaded I/O（MT_IO）+ Daemon 是减小服务端感知延迟的最佳组合；在 dGPU（PCIe）环境下，标准拷贝 + 多线程（std+mt）在上传瓶颈情况下可带来改进。
 
 ---
 
@@ -32,11 +32,11 @@
 
 - 原理：批量加载（16/8/4 字节）并向量化 memcpy/拷贝路径，优化短距离/短拷贝模式，减少指令数与内存访问次数。
 
-- 实现：`lzo_gpu/lzo1x_decomp_vec.cl` / `lzo_gpu/daemon_decompress.c` 支持向量化解压，且通过环境变量 `LZO_DECOMP_VEC=1` 选择向量化内核（默认为1）。
+- 实现：`lzo_gpu/lzo1x_decomp.cl` / `lzo_gpu/daemon_decompress.c` 已集成向量化解压逻辑，默认启用。
 
 - 实验结果：代表性 `lzo1x_1l` 解压吞吐约 6973 MB/s（microbench），显著高于 scalar 路径（典型提升 2~4x，受硬件/驱动影响）。
 
-- 结论：`LZO_DECOMP_VEC=1`（向量化）作为默认启动路径，若在目标平台上触发错误或不稳定，可回退到 scalar 版本；向量化对解压吞吐效果最佳。
+- 结论：向量化路径已作为默认实现，对解压吞吐效果最佳。
 
 ### 轻量哈希（Lightweight XOR Hash）
 
@@ -52,7 +52,7 @@
 
 - 原理：根据数据熵自适应选择块大小，平衡块大小（减小块数）与 GPU 并行度之间的权衡，从而在高熵数据下提高并行度、在低熵数据下保持良好压缩率。
 
-- 实现：在主机端（`lzo_gpu/lzo_host.c`）实现熵采样与基于阈值调整的分块器；通过 OCC_FACTOR / 块大小的动态调整实现。
+- 实现：在主机端（`lzo_gpu/lzo_gpu_standalone.c`）实现熵采样与基于阈值调整的分块器；通过 OCC_FACTOR / 块大小的动态调整实现。
 
 - 实验结果：在 1.8GB 真实文本数据上，64KB -> 2470 MB/s（压缩），80KB -> 2449 MB/s，相比 Phase 6.1 （2396 MB/s）提升约 +2.2%；512KB 时吞吐降至 2229 MB/s，压缩率基本持平（+1%）。
 
@@ -73,23 +73,16 @@
 ### Zero-copy（Pinned host memory）
 
 - 原理：通过 CL_MEM_ALLOC_HOST_PTR 分配映射到 device 的 pinned host memory，再使用 `clEnqueueMapBuffer`/`fread` 直接把文件内容读入映射缓冲区，避免 host→device memcpy。
-- 实现：主机端实现位于 `lzo_gpu/lzo_host.c` 与守护端 `lzo_gpu/daemon_compress.c`；关键环境变量/选项：`LZO_STANDARD_COPY=0`（默认为 zero-copy）与 `CL_MEM_ALLOC_HOST_PTR`。
+- 实现：主机端实现位于 `lzo_gpu/lzo_gpu_standalone.c` 与守护端 `lzo_gpu/daemon_compress.c`；关键环境变量/选项：`LZO_STANDARD_COPY=0`（默认为 zero-copy）与 `CL_MEM_ALLOC_HOST_PTR`。
 -- 实验结果：在 daemon 模式的聚合数据（n=3078, runs=6），zero mean_io_ms ≈ 5.444 ms，相较于 std 的 mean_io_ms ≈ 11.004 ms，IO 时间减少约 ~50%。
 - 结论：Zero-copy 在 iGPU/共享内存平台上收益显著：默认启用 zero-copy；在 PCIe 场景下需使用 std/async（见下）以规避可能的驱动 DMA 行为。
 
 ### 多线程 I/O（MT_IO）
 
 - 原理：把文件读取分片并分配到多个 pread 线程并行读取入映射缓冲区，减小单个读取延迟并提升并行吞吐。
-- 实现：主机端通过 `LZO_MT_IO=1` 与 `LZO_MT_IO_THREADS=<n>` 环境变量控制，相关实现位于 `lzo_gpu/lzo_host.c`，守护端同步兼容。
+- 实现：主机端通过 `LZO_MT_IO=1` 与 `LZO_MT_IO_THREADS=<n>` 环境变量控制，相关实现位于 `lzo_gpu/lzo_gpu_standalone.c`，守护端同步兼容。
 -- 实验结果：daemon 模式下聚合数据（n=3078, runs=6）显示，zero → zero+mt 的 mean_io_ms 从 5.444 ms 降至 3.966 ms（约 27% 改善）；同样，daemon std → std+mt 从 11.004 ms 降至 8.161 ms（约 26% 改善）。
 - 结论：MT_IO 在 I/O 瓶颈场景/大文件场景提升明显，建议与 zero-copy 组合使用；线程数应通过 `LZO_MT_IO_THREADS` 在目标硬件上调优。
-
-### 异步上传（Standard-copy + async）
-
-- 原理：在标准拷贝路径下使用 `clEnqueueWriteBuffer(CL_FALSE)` 非阻塞提交上传，并由单独 reaper 线程等待上传完成与释放 host buffers，从而实现上传重叠并减少阻塞。
-- 实现：实现位于 `lzo_gpu/lzo_host.c` (async_upload_ctx + reaper)，与守护进程 `lzo_gpu/daemon_compress.c` 共享实现。启用方式：`LZO_STANDARD_COPY=1 LZO_ASYNC_UPLOAD=1`。
--- 实验结果：在聚合数据（n=3078, runs=6）中，daemon std+mt_async mean_ms_no_ocl ≈ 44.694 ms，略优于 daemon std+mt ≈ 44.734 ms；standalone 的 std+mt_async=65.426 ms 优于 std+mt=67.354 ms（约 2.9% 改善），表明在 PCIe 上传为瓶颈时可见获益。
-- 结论：异步上传在 dGPU/PCIe 场景下有价值（可减小上传等待），但在 iGPU/zero-copy 场景收益有限或无益；建议仅在 PCIe 上传受限时启用。
 
 ### 守护进程（Daemon）
 

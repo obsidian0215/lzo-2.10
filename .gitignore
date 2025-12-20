@@ -16,6 +16,7 @@
 *.csv
 *.log
 *.lzo
+*.clbin
 
 # preprocessed/source-generated files
 *.i
@@ -72,7 +73,5 @@ minilzo_cpu/
 lzo_hybrid/
 lzo_gpu_client
 lzo_gpu_daemon
-*_original.cl
-*_opt.cl
-# end
 lzo_gpu/tools/benchmark_bandwidth
+# end
