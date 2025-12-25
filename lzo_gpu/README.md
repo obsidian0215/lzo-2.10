@@ -75,7 +75,6 @@ MT I/O
 
 OpenCL & misc
 - `LZO_OPENCL_DEVICE=CPU|GPU` — device preference (may be ignored by daemon)
-- `LZO_DEBUG=1` — enable debug prints/timings
 
 ### Full environment variable table (name / allowed values / default / supported)
 
@@ -85,7 +84,6 @@ OpenCL & misc
 | LZO_MT_IO | 0 / 1 | 0 | standalone, client->daemon request | Enables multi-threaded pread + parallel uploads. Worker thread fallback to single-threaded fread on error. |
 | LZO_MT_IO_THREADS | integer (1-32) | 4 when LZO_MT_IO=1; otherwise N/A | standalone, client->daemon request | Number of I/O worker threads. Ignored unless LZO_MT_IO=1. |
 | LZO_OPENCL_DEVICE | CPU / GPU | GPU | standalone, daemon | Device preference — daemon may ignore depending on its configuration and available devices. |
-| LZO_DEBUG | 0 / 1 | 0 | standalone, daemon, client | Enable verbose debug output and timing traces. |
 
 ### Asynchronous uploads (LZO_ASYNC_UPLOAD)
 
@@ -125,7 +123,7 @@ Note: Asynchronous uploads (LZO_ASYNC_UPLOAD) have been removed from the codebas
 
 ## Notes for maintainers
 - The standalone and daemon implementations share the same design: use pinned host buffers when possible, allow zero-copy for iGPUs, allow standard-copy uploads for dGPUs, and optionally parallelize file I/O.
-- Check `lzo_gpu_standalone.c` and `daemon_compress.c` for the latest implementation details and test coverage.
+- Check `lzo_gpu_standalone.c` and `lzo_gpu_core.c` for the latest implementation details and test coverage. The previous `daemon_compress.c`/`daemon_decompress.c` implementations have been consolidated into `lzo_gpu_core.c` and are archived as `.bak` files.
 
 ---
 The repository includes a consolidated Python runner `tools/bench.py` which re-runs the `/tmp/sample_*` benchmarks across the standard modes and prints a concise comparison table. Run it from the project root:
@@ -202,7 +200,7 @@ Force a fixed block size to reproduce or explore block-splitting impacts (KB):
 
 ### Common diagnostics
 
-- Enable debug traces to inspect timings: `export LZO_DEBUG=1` — this prints time breakdowns for each stage.
+- Enable debug traces to inspect timings: use the standalone or client `--debug` flag — this prints time breakdowns for each stage.
 - If daemon is not applying preferences, confirm `lzo_gpu_client` is sending options (check client help) and daemon's logs for accepted/ignored options.
 
 ## Next steps / further optimizations (ideas)

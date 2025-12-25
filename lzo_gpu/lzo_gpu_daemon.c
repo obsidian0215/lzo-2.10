@@ -28,16 +28,11 @@
 #include <dirent.h>
 #include "lzo_defaults.h"
 #include "lzo_gpu_utils.h"
+#include "lzo_gpu_core.h"
 #include <stddef.h>
 #include <libgen.h>
 
-/* 声明daemon_decompress.c中的函数 */
-extern int daemon_decompress(
-    cl_context ctx, cl_command_queue queue, cl_device_id device,
-    cl_kernel kernel, const char* input_path, const char* output_path,
-    int local_size,
-    unsigned long* time_us_out, size_t* output_size_out, timing_t* t_out
-);
+/* Decompress is implemented in lzo_gpu_core: use lzo_decompress_core() */
 
 #define SOCKET_PATH "/tmp/lzo_gpu_daemon.sock"
 #define PID_FILE "/tmp/lzo_gpu_daemon.pid"
@@ -57,6 +52,12 @@ typedef struct {
     /* Bits: 0=10, 1=11, 2=12, 3=13, 4=14 */
     cl_program programs[2][5];
     cl_kernel kernels_comp[2][5];
+    /* Optimized instrumented variants cache (unroll/vector tests) */
+    cl_program programs_opt[2][5];
+    cl_kernel kernels_comp_opt[2][5];
+    /* Debug-instrumented variants cache (per-algorithm x bits) */
+    cl_program programs_debug[2][5];
+    cl_kernel kernels_comp_debug[2][5];
 
     /* 解压缩kernels (每个算法一个) */
     cl_program prog_decomp[2];
@@ -125,24 +126,6 @@ static const char *daemon_socket_path(void)
     return SOCKET_PATH;
 }
 
-/* 外部压缩函数声明 - signature must match daemon_compress.c
- * Note: local_size param appears AFTER coalesce/stdio overrides in the
- * implementation. Keep this prototype in a single place to avoid duplicates.
- */
-extern int daemon_compress(
-    cl_context ctx, cl_command_queue queue, cl_device_id device,
-    cl_kernel kernel,
-    const char* input_path, const char* output_path,
-    int level,
-    int alg_id,
-    /* options (from client request) */
-    int standard_copy, int mt_io, int mt_threads, int fixed_block_kb,
-    /* per-request coalesce/stdio overrides */
-    int coalesce_output, int coalesce_chunk_mb, int coalesce_max_mb, int stdio_buf_mb,
-    int local_size,
-    unsigned long* time_us, size_t* output_size,
-    timing_t* t_out
-);
 /* 请求协议 */
 typedef struct {
     char operation;      // 'C'=compress, 'D'=decompress
@@ -162,6 +145,10 @@ typedef struct {
     int coalesce_chunk_mb;/* -1 unspecified; positive = chunk size in MB */
     int coalesce_max_mb;  /* -1 unspecified; positive = max MB threshold for single coalesce */
     int stdio_buf_mb;     /* -1 unspecified; positive = MB for stdio buffer */
+    /* Opt kernel flag (from client) */
+    int kernel_opt;       /* 0/1: request optimized instrumented kernel */
+    /* Per-request debug flag (0/1): request kernel instrumentation and verbose diagnostics */
+    int debug;
 } request_t;
 
 typedef struct {
@@ -220,6 +207,10 @@ int init_opencl_resources(void)
     // 4. 初始化Kernel数组 (按需编译)
     memset(g_state.programs, 0, sizeof(g_state.programs));
     memset(g_state.kernels_comp, 0, sizeof(g_state.kernels_comp));
+    memset(g_state.programs_opt, 0, sizeof(g_state.programs_opt));
+    memset(g_state.kernels_comp_opt, 0, sizeof(g_state.kernels_comp_opt));
+    memset(g_state.programs_debug, 0, sizeof(g_state.programs_debug));
+    memset(g_state.kernels_comp_debug, 0, sizeof(g_state.kernels_comp_debug));
     memset(g_state.prog_decomp, 0, sizeof(g_state.prog_decomp));
     memset(g_state.kernel_decomp, 0, sizeof(g_state.kernel_decomp));
 
@@ -240,14 +231,221 @@ int init_opencl_resources(void)
 }
 
 /* 获取或编译压缩Kernel */
-static cl_kernel get_compress_kernel(int alg, int bits)
+static cl_kernel get_compress_kernel(int alg, int bits, int kernel_opt, int kernel_debug)
 {
     if (alg < 0 || alg > 1 || bits < 10 || bits > 14) return NULL;
     int bit_idx = bits - 10;
 
-    if (g_state.kernels_comp[alg][bit_idx]) return g_state.kernels_comp[alg][bit_idx];
-
     const char* alg_names[] = {"lzo1x", "lzo1y"};
+    cl_int err;
+
+    /* Helper macro-ish: build opts */
+    char build_opts[128];
+    snprintf(build_opts, sizeof(build_opts), "-cl-std=CL2.0 -I. -D D_BITS=%d", bits);
+
+    /* If kernel_debug requested, attempt to load/compile debug wrapper variant (<alg>_debug) */
+    if (kernel_debug) {
+        if (g_state.kernels_comp_debug[alg][bit_idx]) return g_state.kernels_comp_debug[alg][bit_idx];
+        /* Try bits-specific debug binary first: <alg>_debug_<bits>.clbin */
+        {
+            char bin_name[80]; size_t bin_sz; unsigned char* bin = NULL;
+            snprintf(bin_name, sizeof(bin_name), "%s_debug_%d.clbin", alg_names[alg], bits);
+            bin = (unsigned char*)lzo_read_file(bin_name, &bin_sz);
+            if (bin) {
+                printf("[DAEMON] 加载预编译Kernel: %s\n", bin_name);
+                cl_int binary_status;
+                cl_program p = clCreateProgramWithBinary(g_state.context, 1, &g_state.device,
+                                                        &bin_sz, (const unsigned char**)&bin, &binary_status, &err);
+                free(bin);
+                if (err == CL_SUCCESS && binary_status == CL_SUCCESS) {
+                    err = clBuildProgram(p, 1, &g_state.device, "-cl-std=CL2.0", NULL, NULL);
+                    if (err == CL_SUCCESS) {
+                        char kernel_name[64]; snprintf(kernel_name, sizeof(kernel_name), "%s_block_compress_debug", alg_names[alg]);
+                        g_state.programs_debug[alg][bit_idx] = p;
+                        g_state.kernels_comp_debug[alg][bit_idx] = clCreateKernel(p, kernel_name, &err);
+                        if (err == CL_SUCCESS) return g_state.kernels_comp_debug[alg][bit_idx];
+                        if (g_state.programs_debug[alg][bit_idx]) { clReleaseProgram(g_state.programs_debug[alg][bit_idx]); g_state.programs_debug[alg][bit_idx] = NULL; }
+                    } else {
+                        clReleaseProgram(p);
+                    }
+                }
+            }
+        }
+        /* Try generic debug binary <alg>_debug.clbin */
+        {
+            char bin_name[80]; size_t bin_sz; unsigned char* bin = NULL;
+            snprintf(bin_name, sizeof(bin_name), "%s_debug.clbin", alg_names[alg]);
+            bin = (unsigned char*)lzo_read_file(bin_name, &bin_sz);
+            if (bin) {
+                printf("[DAEMON] 加载预编译Kernel: %s\n", bin_name);
+                cl_int binary_status;
+                cl_program p = clCreateProgramWithBinary(g_state.context, 1, &g_state.device,
+                                                        &bin_sz, (const unsigned char**)&bin, &binary_status, &err);
+                free(bin);
+                if (err == CL_SUCCESS && binary_status == CL_SUCCESS) {
+                    err = clBuildProgram(p, 1, &g_state.device, "-cl-std=CL2.0", NULL, NULL);
+                    if (err == CL_SUCCESS) {
+                        char kernel_name[64]; snprintf(kernel_name, sizeof(kernel_name), "%s_block_compress_debug", alg_names[alg]);
+                        g_state.programs_debug[alg][bit_idx] = p;
+                        g_state.kernels_comp_debug[alg][bit_idx] = clCreateKernel(p, kernel_name, &err);
+                        if (err == CL_SUCCESS) return g_state.kernels_comp_debug[alg][bit_idx];
+                        if (g_state.programs_debug[alg][bit_idx]) { clReleaseProgram(g_state.programs_debug[alg][bit_idx]); g_state.programs_debug[alg][bit_idx] = NULL; }
+                    } else {
+                        clReleaseProgram(p);
+                    }
+                }
+            }
+        }
+        /* Fallback: compile base source with debug instrumentation enabled */
+        {
+            char src_file[64]; snprintf(src_file, sizeof(src_file), "%s.cl", alg_names[alg]);
+            printf("[DAEMON] 尝试编译 debug 变体: %s (D_BITS=%d + LZO_GPU_DEBUG)...\n", src_file, bits);
+            size_t src_len; char* src = lzo_read_file(src_file, &src_len);
+            if (src) {
+                g_state.programs_debug[alg][bit_idx] = clCreateProgramWithSource(g_state.context, 1, (const char**)&src, &src_len, &err);
+                free(src);
+                if (err == CL_SUCCESS) {
+                    char build_opts_with_inc[256]; snprintf(build_opts_with_inc, sizeof(build_opts_with_inc), "%s -D LZO_GPU_DEBUG", build_opts);
+                    err = clBuildProgram(g_state.programs_debug[alg][bit_idx], 1, &g_state.device, build_opts_with_inc, NULL, NULL);
+                    if (err == CL_SUCCESS) {
+                        char kernel_name[64]; snprintf(kernel_name, sizeof(kernel_name), "%s_block_compress_debug", alg_names[alg]);
+                        g_state.kernels_comp_debug[alg][bit_idx] = clCreateKernel(g_state.programs_debug[alg][bit_idx], kernel_name, &err);
+                        if (err == CL_SUCCESS) return g_state.kernels_comp_debug[alg][bit_idx];
+                        if (g_state.programs_debug[alg][bit_idx]) { clReleaseProgram(g_state.programs_debug[alg][bit_idx]); g_state.programs_debug[alg][bit_idx] = NULL; }
+                    } else {
+                        size_t log_sz; clGetProgramBuildInfo(g_state.programs_debug[alg][bit_idx], g_state.device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
+                        if (log_sz > 0) { char* log = malloc(log_sz + 1); clGetProgramBuildInfo(g_state.programs_debug[alg][bit_idx], g_state.device, CL_PROGRAM_BUILD_LOG, log_sz, log, NULL); log[log_sz] = '\0'; fprintf(stderr, "%s\n", log); free(log); }
+                        clReleaseProgram(g_state.programs_debug[alg][bit_idx]); g_state.programs_debug[alg][bit_idx] = NULL;
+                    }
+                }
+            }
+        }
+        /* If we couldn't load/compile debug variant, fall through to default behavior */
+    }
+
+    /* If optimized variant requested */
+    if (kernel_opt) {
+        if (g_state.kernels_comp_opt[alg][bit_idx]) return g_state.kernels_comp_opt[alg][bit_idx];
+
+        char bin_name[80];
+        size_t bin_sz;
+        unsigned char* bin = NULL;
+
+        /* Prefer debug+opt only when caller explicitly requests kernel_debug */
+        if (kernel_debug) {
+            snprintf(bin_name, sizeof(bin_name), "%s_debug_opt_%d.clbin", alg_names[alg], bits);
+            bin = (unsigned char*)lzo_read_file(bin_name, &bin_sz);
+            if (bin) {
+                printf("[DAEMON] 加载预编译Kernel: %s\n", bin_name);
+                cl_int binary_status;
+                g_state.programs_opt[alg][bit_idx] = clCreateProgramWithBinary(g_state.context, 1, &g_state.device,
+                                                            &bin_sz, (const unsigned char**)&bin, &binary_status, &err);
+                free(bin);
+                if (err == CL_SUCCESS && binary_status == CL_SUCCESS) {
+                    goto kernel_opt_create_debug;
+                }
+                if (g_state.programs_opt[alg][bit_idx]) { clReleaseProgram(g_state.programs_opt[alg][bit_idx]); g_state.programs_opt[alg][bit_idx] = NULL; }
+            }
+        }
+
+        /* Try non-debug opt precompiled binary */
+        snprintf(bin_name, sizeof(bin_name), "%s_opt_%d.clbin", alg_names[alg], bits);
+        bin = (unsigned char*)lzo_read_file(bin_name, &bin_sz);
+        if (bin) {
+            printf("[DAEMON] 加载预编译Kernel: %s\n", bin_name);
+            cl_int binary_status;
+            g_state.programs_opt[alg][bit_idx] = clCreateProgramWithBinary(g_state.context, 1, &g_state.device,
+                                                        &bin_sz, (const unsigned char**)&bin, &binary_status, &err);
+            free(bin);
+            if (err == CL_SUCCESS && binary_status == CL_SUCCESS) {
+                goto kernel_opt_create;
+            }
+            if (g_state.programs_opt[alg][bit_idx]) { clReleaseProgram(g_state.programs_opt[alg][bit_idx]); g_state.programs_opt[alg][bit_idx] = NULL; }
+        }
+
+        /* If kernel_debug requested, attempt to compile debug+opt from base source */
+        if (kernel_debug) {
+            char src_file[64]; snprintf(src_file, sizeof(src_file), "%s.cl", alg_names[alg]);
+            printf("[DAEMON] 尝试编译 debug+opt 变体: %s (D_BITS=%d + LZO_USE_UNROLL2 + LZO_GPU_DEBUG)...\n", src_file, bits);
+            size_t src_len;
+            char* src = lzo_read_file(src_file, &src_len);
+            if (src) {
+                /* Compute include dir to help OpenCL compilers find includes */
+                char resolved_src[PATH_MAX] = {0};
+                char include_opt[256] = "";
+                if (lzo_find_file_path(src_file, resolved_src, sizeof(resolved_src)) == 0) {
+                    char *slash = strrchr(resolved_src, '/');
+                    if (slash) { *slash = '\0'; snprintf(include_opt, sizeof(include_opt), " -I%s", resolved_src); }
+                }
+                g_state.programs_opt[alg][bit_idx] = clCreateProgramWithSource(g_state.context, 1, (const char**)&src, &src_len, &err);
+                free(src);
+                if (err == CL_SUCCESS) {
+                    char build_opts_with_inc[256];
+                    snprintf(build_opts_with_inc, sizeof(build_opts_with_inc), "%s%s -D LZO_USE_UNROLL2 -D LZO_GPU_DEBUG", build_opts, include_opt);
+                    err = clBuildProgram(g_state.programs_opt[alg][bit_idx], 1, &g_state.device, build_opts_with_inc, NULL, NULL);
+                    if (err == CL_SUCCESS) goto kernel_opt_create_debug;
+                    /* capture log for debug */
+                    size_t log_sz; clGetProgramBuildInfo(g_state.programs_opt[alg][bit_idx], g_state.device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
+                    if (log_sz > 0) { char* log = malloc(log_sz + 1); clGetProgramBuildInfo(g_state.programs_opt[alg][bit_idx], g_state.device, CL_PROGRAM_BUILD_LOG, log_sz, log, NULL); log[log_sz] = '\0'; fprintf(stderr, "%s\n", log); free(log); }
+                    clReleaseProgram(g_state.programs_opt[alg][bit_idx]); g_state.programs_opt[alg][bit_idx] = NULL;
+                }
+            }
+        }
+
+        /* Fallback: compile base source with LZO_USE_UNROLL2 (non-debug) */
+        {
+            char src_file[64]; snprintf(src_file, sizeof(src_file), "%s.cl", alg_names[alg]);
+            printf("[DAEMON] 尝试编译 opt 变体: %s (D_BITS=%d + LZO_USE_UNROLL2)...\n", src_file, bits);
+            size_t src_len;
+            char* src = lzo_read_file(src_file, &src_len);
+            if (src) {
+                char resolved_src[PATH_MAX] = {0};
+                char include_opt[256] = "";
+                if (lzo_find_file_path(src_file, resolved_src, sizeof(resolved_src)) == 0) {
+                    char *slash = strrchr(resolved_src, '/');
+                    if (slash) { *slash = '\0'; snprintf(include_opt, sizeof(include_opt), " -I%s", resolved_src); }
+                }
+                g_state.programs_opt[alg][bit_idx] = clCreateProgramWithSource(g_state.context, 1, (const char**)&src, &src_len, &err);
+                free(src);
+                if (err == CL_SUCCESS) {
+                    char build_opts_with_inc[256];
+                    snprintf(build_opts_with_inc, sizeof(build_opts_with_inc), "%s%s -D LZO_USE_UNROLL2", build_opts, include_opt);
+                    err = clBuildProgram(g_state.programs_opt[alg][bit_idx], 1, &g_state.device, build_opts_with_inc, NULL, NULL);
+                    if (err == CL_SUCCESS) goto kernel_opt_create;
+                    size_t log_sz; clGetProgramBuildInfo(g_state.programs_opt[alg][bit_idx], g_state.device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
+                    if (log_sz > 0) { char* log = malloc(log_sz + 1); clGetProgramBuildInfo(g_state.programs_opt[alg][bit_idx], g_state.device, CL_PROGRAM_BUILD_LOG, log_sz, log, NULL); log[log_sz] = '\0'; fprintf(stderr, "%s\n", log); free(log); }
+                    clReleaseProgram(g_state.programs_opt[alg][bit_idx]); g_state.programs_opt[alg][bit_idx] = NULL;
+                }
+            }
+        }
+        return NULL;
+
+kernel_opt_create:
+        {
+            char kernel_name[64];
+            snprintf(kernel_name, sizeof(kernel_name), "%s_block_compress", alg_names[alg]);
+            g_state.kernels_comp_opt[alg][bit_idx] = clCreateKernel(g_state.programs_opt[alg][bit_idx], kernel_name, &err);
+            if (err == CL_SUCCESS) return g_state.kernels_comp_opt[alg][bit_idx];
+            if (g_state.programs_opt[alg][bit_idx]) { clReleaseProgram(g_state.programs_opt[alg][bit_idx]); g_state.programs_opt[alg][bit_idx] = NULL; }
+            return NULL;
+        }
+
+kernel_opt_create_debug:
+        {
+            char kernel_name[64];
+            /* debug kernel symbol name is same for both debug & debug+opt variants */
+            snprintf(kernel_name, sizeof(kernel_name), "%s_block_compress_debug", alg_names[alg]);
+            g_state.kernels_comp_opt[alg][bit_idx] = clCreateKernel(g_state.programs_opt[alg][bit_idx], kernel_name, &err);
+            if (err == CL_SUCCESS) return g_state.kernels_comp_opt[alg][bit_idx];
+            if (g_state.programs_opt[alg][bit_idx]) { clReleaseProgram(g_state.programs_opt[alg][bit_idx]); g_state.programs_opt[alg][bit_idx] = NULL; }
+            return NULL;
+        }
+    }
+
+
+
+try_default:
+    if (g_state.kernels_comp[alg][bit_idx]) return g_state.kernels_comp[alg][bit_idx];
 
     /* Try to load precompiled binary first */
     char bin_name[64];
@@ -255,7 +453,6 @@ static cl_kernel get_compress_kernel(int alg, int bits)
     size_t bin_sz;
     unsigned char* bin = (unsigned char*)lzo_read_file(bin_name, &bin_sz);
 
-    cl_int err;
     if (bin) {
         printf("[DAEMON] 加载预编译Kernel: %s\n", bin_name);
         cl_int binary_status;
@@ -293,10 +490,17 @@ static cl_kernel get_compress_kernel(int alg, int bits)
 
     if (err != CL_SUCCESS) return NULL;
 
-    char build_opts[64];
-    snprintf(build_opts, sizeof(build_opts), "-cl-std=CL2.0 -I. -D D_BITS=%d", bits);
+    /* Compute include dir to help OpenCL compilers find includes */
+    char resolved_src2[PATH_MAX] = {0};
+    char include_opt2[256] = "";
+    if (lzo_find_file_path(src_file, resolved_src2, sizeof(resolved_src2)) == 0) {
+        char *slash = strrchr(resolved_src2, '/');
+        if (slash) { *slash = '\0'; snprintf(include_opt2, sizeof(include_opt2), " -I%s", resolved_src2); }
+    }
+    char build_opts_with_inc2[128];
+    snprintf(build_opts_with_inc2, sizeof(build_opts_with_inc2), "-cl-std=CL2.0 -I.%s -D D_BITS=%d", include_opt2, bits);
 
-    err = clBuildProgram(g_state.programs[alg][bit_idx], 1, &g_state.device, build_opts, NULL, NULL);
+    err = clBuildProgram(g_state.programs[alg][bit_idx], 1, &g_state.device, build_opts_with_inc2, NULL, NULL);
     if (err != CL_SUCCESS) {
         size_t log_sz;
         clGetProgramBuildInfo(g_state.programs[alg][bit_idx], g_state.device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
@@ -381,14 +585,6 @@ kernel_create:
     return g_state.kernel_decomp[alg];
 }
 
-/* 根据压缩级别选择kernel (Legacy wrapper) */
-static cl_kernel select_kernel_by_level(int level)
-{
-    // This function is deprecated but kept for compilation if needed.
-    // New logic uses get_compress_kernel directly.
-    return NULL;
-}
-
 /*
  * 处理压缩请求 (复用已初始化的资源)
  */
@@ -397,12 +593,12 @@ int handle_compress_request(request_t* req, response_t* resp)
     printf("[DAEMON] 处理压缩请求: %s -> %s (level=%d)\n",
            req->input_path, req->output_path, req->level);
     /* Diagnostic: print key request parameters to ensure they were received */
-        fprintf(stderr, "[DAEMON] Request opts: standard_copy=%d mt_io=%d mt_threads=%d fixed_block_kb=%d local_size=%d coalesce_output=%d coalesce_chunk_mb=%d coalesce_max_mb=%d stdio_buf_mb=%d\n",
+        fprintf(stderr, "[DAEMON] Request opts: standard_copy=%d mt_io=%d mt_threads=%d fixed_block_kb=%d local_size=%d coalesce_output=%d coalesce_chunk_mb=%d coalesce_max_mb=%d stdio_buf_mb=%d kernel_opt=%d\n",
             req->standard_copy, req->mt_io, req->mt_threads, req->fixed_block_kb, req->local_size,
-            req->coalesce_output, req->coalesce_chunk_mb, req->coalesce_max_mb, req->stdio_buf_mb);
+            req->coalesce_output, req->coalesce_chunk_mb, req->coalesce_max_mb, req->stdio_buf_mb, req->kernel_opt);
 
     // 根据alg和level选择合适的kernel
-    cl_kernel kernel = get_compress_kernel(req->alg, req->level);
+    cl_kernel kernel = get_compress_kernel(req->alg, req->level, req->kernel_opt, req->debug);
     const char* alg_names[] = {"lzo1x", "lzo1y"};
 
     if (!kernel) {
@@ -417,21 +613,31 @@ int handle_compress_request(request_t* req, response_t* resp)
     size_t output_size = 0;
     timing_t t = {0};
 
+    /* Create parameter object from request */
+    lzo_compress_params_t params = {
+        .level = req->level,
+        .alg_id = req->alg,
+        .standard_copy = req->standard_copy,
+        .mt_io = req->mt_io,
+        .mt_threads = req->mt_threads,
+        .fixed_block_kb = req->fixed_block_kb,
+        .coalesce_output = req->coalesce_output,
+        .coalesce_chunk_mb = req->coalesce_chunk_mb,
+        .coalesce_max_mb = req->coalesce_max_mb,
+        .stdio_buf_mb = req->stdio_buf_mb,
+        .local_size_param = req->local_size,
+        .debug = req->debug
+    };
+
     // 调用压缩函数,复用OpenCL资源(context/queue/kernel)
-    int ret = daemon_compress(
+    int ret = lzo_compress_core(
         g_state.context,
         g_state.queue,
         g_state.device,
         kernel,
         req->input_path,
         req->output_path,
-        req->level,
-        req->alg,
-        /* options */
-        req->standard_copy, req->mt_io, req->mt_threads, req->fixed_block_kb,
-        /* per-request coalesce/stdio overrides */
-        req->coalesce_output, req->coalesce_chunk_mb, req->coalesce_max_mb, req->stdio_buf_mb,
-        req->local_size,
+        &params,
         &time_us,
         &output_size,
         /* single timing struct */
@@ -451,10 +657,12 @@ int handle_compress_request(request_t* req, response_t* resp)
         }
         resp->time_us = effective_time_us;
         resp->timing = t;
-        /* annotate kernel name into the timing struct so clients can print it */
+        /* annotate kernel name into the timing struct so clients can print it (include variant) */
         if (sizeof(resp->timing.kernel_name) > 0) {
+            char suffix[32] = "";
+            if (req->kernel_opt) strncpy(suffix, "_opt", sizeof(suffix)-1);
             memset(resp->timing.kernel_name, 0, sizeof(resp->timing.kernel_name));
-            snprintf(resp->timing.kernel_name, sizeof(resp->timing.kernel_name)-1, "%s_%d", alg_names[req->alg], req->level);
+            snprintf(resp->timing.kernel_name, sizeof(resp->timing.kernel_name)-1, "%s_%d%s", alg_names[req->alg], req->level, suffix);
         }
         snprintf(resp->message, sizeof(resp->message),
                 "Success (saved ~%lums init)", g_state.init_time_ms);
@@ -512,14 +720,15 @@ int handle_decompress_request(request_t* req, response_t* resp)
 
     printf("[DAEMON]    - 使用解压kernel: %s_decomp\n", alg_names[req->alg]);
 
-    int ret = daemon_decompress(
+    int ret = lzo_decompress_core(
         g_state.context,
         g_state.queue,
         g_state.device,
         kernel,
         req->input_path,
         req->output_path,
-        req->local_size,
+        req->standard_copy,
+        req->local_size, req->debug,
         &time_us,
         &output_size,
         &t
@@ -559,9 +768,7 @@ void cleanup_opencl_resources(void)
 {
     printf("[DAEMON] 清理OpenCL资源...\n");
 
-    /* 清理buffer缓存 */
-    extern void cleanup_compress_buffer_cache(void);
-    extern void cleanup_decompress_buffer_cache(void);
+    /* 清理buffer缓存 (core 提供) */
     cleanup_compress_buffer_cache();
     cleanup_decompress_buffer_cache();
 
@@ -574,6 +781,10 @@ void cleanup_opencl_resources(void)
         for (int j = 0; j < 5; j++) {
             if (g_state.kernels_comp[i][j]) clReleaseKernel(g_state.kernels_comp[i][j]);
             if (g_state.programs[i][j]) clReleaseProgram(g_state.programs[i][j]);
+            if (g_state.kernels_comp_opt[i][j]) clReleaseKernel(g_state.kernels_comp_opt[i][j]);
+            if (g_state.programs_opt[i][j]) clReleaseProgram(g_state.programs_opt[i][j]);
+            if (g_state.kernels_comp_debug[i][j]) clReleaseKernel(g_state.kernels_comp_debug[i][j]);
+            if (g_state.programs_debug[i][j]) clReleaseProgram(g_state.programs_debug[i][j]);
         }
         // 清理解压缩kernel和program
         if (g_state.kernel_decomp[i]) clReleaseKernel(g_state.kernel_decomp[i]);
@@ -878,7 +1089,7 @@ void run_server(void)
 
         // 接收请求
         ssize_t n = recv(client_sock, &req, sizeof(req), 0);
-        if (getenv("LZO_DEBUG")) {
+        if (req.debug) {
             fprintf(stderr, "[DAEMON] recv returned n=%zd sizeof(req)=%zu\n", n, sizeof(req)); fflush(stderr);
             fprintf(stderr, "[DAEMON] offsetof: fixed_block_kb=%zu local_size=%zu\n",
                 offsetof(request_t, fixed_block_kb), offsetof(request_t, local_size)); fflush(stderr);
@@ -889,7 +1100,7 @@ void run_server(void)
             continue;
         }
         /* debug: dump the values of key fields to stderr and flush */
-        if (getenv("LZO_DEBUG")) { fprintf(stderr, "[DAEMON] Received raw request: op=%c fixed_block_kb=%d local_size=%d mt_io=%d\n", req.operation, req.fixed_block_kb, req.local_size, req.mt_io); fflush(stderr); }
+        if (req.debug) { fprintf(stderr, "[DAEMON] Received raw request: op=%c fixed_block_kb=%d local_size=%d mt_io=%d\n", req.operation, req.fixed_block_kb, req.local_size, req.mt_io); fflush(stderr); }
 
          // 处理请求
         memset(&resp, 0, sizeof(resp));
@@ -957,7 +1168,6 @@ int main(int argc, char** argv)
             fprintf(stdout, "\nEnvironment variables (daemon-level defaults):\n");
             fprintf(stdout, "  LZO_OPENCL_DEVICE=CPU|GPU  Select OpenCL device preference for daemon (env-level)\n");
             fprintf(stdout, "  LZO_DECOMP_CACHE_MB=N      Decompress buffer cache threshold in MB (daemon-level)\n");
-            fprintf(stdout, "  LZO_DEBUG=1                Debug output and timing traces\n");
             fprintf(stdout, "\nPer-request client options: clients may request behavior (eg. MT I/O, coalesce, stdio buf), but daemon will only honor per-request values at runtime if configured to do so. See client help.\n");
             return 0;
         }

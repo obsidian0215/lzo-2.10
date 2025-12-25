@@ -27,6 +27,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RESULTS_DIR="$REPO_DIR/exp_results/param_scan"
 CSV_FILE="${CSV_FILE:-$RESULTS_DIR/param_scan_${TIMESTAMP}.csv}"
 REPORT_FILE="${REPORT_FILE:-$RESULTS_DIR/param_scan_report_${TIMESTAMP}.txt}"
+PARAM_SCAN_DEBUG=${PARAM_SCAN_DEBUG:-0}
 
 # 测试配置
 ALGORITHMS=("1x" "1y")
@@ -239,28 +240,43 @@ test_gpu_daemon() {
                                             fi
 
                                             local verified
-                                            verified=$(verify_output "$sample" "$tmp_out")
+                                            verified=$(verify_output "$sample" "$tmp_out" | tr -d '\r')
 
                                             stop_daemon
 
                                             # parse and write CSV
                                             IFS=',' read -r c_tp c_ktp c_tt c_kt c_rt c_wt c_ut c_dt c_ratio_frac c_ratio_pct c_kernel_name c_global c_local c_buf_in c_buf_out c_buf_len c_block_calc c_dl_len c_dl_bulk c_dl_total <<< "$comp_perf"
-                                            echo "$sample_name,$sample_size_mb,Daemon,$config_ext,compress,$alg,$lvl,$blk_kb,NA,$mt_threads,$mt_io,$copy_mode,$coalesce,$stdio_buf,$c_ratio_frac,$c_ratio_pct,$c_tt,$c_kt,$c_rt,$c_wt,$c_ut,$c_dt,${c_kernel_name:-},${c_global:-},${c_local:-},${c_buf_in:-},${c_buf_out:-},${c_buf_len:-},${c_block_calc:-},${c_dl_len:-},${c_dl_bulk:-},${c_dl_total:-},$c_tp,$c_ktp,$verified" >> "$CSV_FILE"
+                                            echo "$sample_name,$sample_size_mb,Daemon,$config_ext,compress,$alg,$blk_kb,NA,$mt_threads,$mt_io,$copy_mode,$coalesce,$stdio_buf,$c_ratio_frac,$c_ratio_pct,$c_tt,$c_kt,$c_rt,$c_wt,$c_ut,$c_dt,${c_kernel_name:-},${c_global:-},${c_local:-},${c_buf_in:-},${c_buf_out:-},${c_buf_len:-},${c_block_calc:-},${c_dl_len:-},${c_dl_bulk:-},${c_dl_total:-},$c_tp,$c_ktp,$verified" >> "$CSV_FILE"
 
                                             IFS=',' read -r d_tp d_ktp d_tt d_kt d_rt d_wt d_ut d_dt d_ratio_frac d_ratio_pct d_kernel_name d_global d_local d_buf_in d_buf_out d_buf_len d_block_calc d_dl_len d_dl_bulk d_dl_total <<< "$decomp_perf"
-                                            echo "$sample_name,$sample_size_mb,Daemon,$config_ext,decompress,$alg,$lvl,$blk_kb,NA,$mt_threads,$mt_io,$copy_mode,$coalesce,$stdio_buf,$d_ratio_frac,$d_ratio_pct,$d_tt,$d_kt,$d_rt,$d_wt,$d_ut,$d_dt,${d_kernel_name:-},${d_global:-},${d_local:-},${d_buf_in:-},${d_buf_out:-},${d_buf_len:-},${d_block_calc:-},${d_dl_len:-},${d_dl_bulk:-},${d_dl_total:-},$d_tp,$d_ktp,$verified" >> "$CSV_FILE"
+                                            echo "$sample_name,$sample_size_mb,Daemon,$config_ext,decompress,$alg,$blk_kb,NA,$mt_threads,$mt_io,$copy_mode,$coalesce,$stdio_buf,$d_ratio_frac,$d_ratio_pct,$d_tt,$d_kt,$d_rt,$d_wt,$d_ut,$d_dt,${d_kernel_name:-},${d_global:-},${d_local:-},${d_buf_in:-},${d_buf_out:-},${d_buf_len:-},${d_block_calc:-},${d_dl_len:-},${d_dl_bulk:-},${d_dl_total:-},$d_tp,$d_ktp,$verified" >> "$CSV_FILE"
 
                                             local status="✓"
                                             local status_color="$GREEN"
                                             if [ "$verified" != "YES" ]; then
                                                 status="✗"
                                                 status_color="$RED"
+                                                # Always remove compressed and decompressed binary artifacts to avoid storage growth
+                                                rm -f "$tmp_lzo" "$tmp_out"
+
+                                                # Always preserve text logs for failures (comp/decomp stdout/stderr and perf)
                                                 local fail_dir="$RESULTS_DIR/failures/${sample_name}/${config_ext}"
                                                 mkdir -p "$fail_dir"
-                                                [ -f "$tmp_lzo" ] && mv "$tmp_lzo" "$fail_dir/failed.lzo"
-                                                [ -f "$tmp_out" ] && mv "$tmp_out" "$fail_dir/failed.out"
+                                                printf "=== COMP OUT (%s) ===\n%s\n\n=== PERF ===\n%s\n" "$config_ext" "$comp_out" "$comp_perf" > "$fail_dir/comp_raw.txt"
+                                                printf "=== DECOMP OUT (%s) ===\n%s\n\n=== PERF ===\n%s\n" "$config_ext" "$decomp_out" "$decomp_perf" > "$fail_dir/decomp_raw.txt"
+
+                                                # Also preserve any stdout/stderr capture files if present
+                                                [ -f "$tmp_out" ] && cp -f "$tmp_out" "$fail_dir/failed.out" 2>/dev/null || true
                                             else
+                                                # Success: cleanup binary artifacts
                                                 rm -f "$tmp_lzo" "$tmp_out"
+                                                # In debug mode, preserve textual logs for successful runs
+                                                if [ "${PARAM_SCAN_DEBUG:-0}" = "1" ]; then
+                                                    local ok_dir="$RESULTS_DIR/debug_success/${sample_name}/${config_ext}"
+                                                    mkdir -p "$ok_dir"
+                                                    printf "=== COMP OUT (%s) ===\n%s\n\n=== PERF ===\n%s\n" "$config_ext" "$comp_out" "$comp_perf" > "$ok_dir/comp_raw.txt"
+                                                    printf "=== DECOMP OUT (%s) ===\n%s\n\n=== PERF ===\n%s\n" "$config_ext" "$decomp_out" "$decomp_perf" > "$ok_dir/decomp_raw.txt"
+                                                fi
                                             fi
                                             printf "  %-35s " "$config_ext"
                                             echo -en "${status_color}${status}${NC} "
@@ -431,7 +447,7 @@ test_cpu() {
             local decomp_out=$("$LZO_CPU" -t "$threads" -d "$tmp_lzo" -o "$tmp_out" 2>&1)
             local decomp_perf=$(extract_perf "$decomp_out")
 
-            local verified=$(verify_output "$sample" "$tmp_out")
+            local verified=$(verify_output "$sample" "$tmp_out" | tr -d '\r')
 
             # 解析压缩性能
             IFS=',' read -r c_tp c_ktp c_tt c_kt c_rt c_wt c_ut c_dt c_ratio_frac c_ratio_pct c_kernel_name c_global c_local c_buf_in c_buf_out c_buf_len c_block_calc c_dl_len c_dl_bulk c_dl_total <<< "$comp_perf"
@@ -447,11 +463,17 @@ test_cpu() {
             if [ "$verified" != "YES" ]; then
                 status="✗"
                 status_color="$RED"
-                local fail_dir="$RESULTS_DIR/failures/${sample_name}/${config}"
-                mkdir -p "$fail_dir"
-                [ -f "$tmp_lzo" ] && mv "$tmp_lzo" "$fail_dir/failed.lzo"
-                [ -f "$tmp_out" ] && mv "$tmp_out" "$fail_dir/failed.out"
+                if [ "${PARAM_SCAN_DEBUG:-0}" = "1" ]; then
+                    local fail_dir="$RESULTS_DIR/failures/${sample_name}/${config}"
+                    mkdir -p "$fail_dir"
+                    [ -f "$tmp_lzo" ] && mv "$tmp_lzo" "$fail_dir/failed.lzo"
+                    [ -f "$tmp_out" ] && mv "$tmp_out" "$fail_dir/failed.out"
+                else
+                    # Not debugging: delete temp artifacts to avoid storage growth
+                    rm -f "$tmp_lzo" "$tmp_out"
+                fi
             else
+                # Success: cleanup temp artifacts
                 rm -f "$tmp_lzo" "$tmp_out"
             fi
             printf "  %-20s " "$config"
@@ -565,7 +587,7 @@ local io_mode="zerocopy"; [ "$copy_mode" = "1" ] && io_mode="stdcopy"
                                             local d_dl_total="${DPERF_ARR[19]}"
 
                                             local verified
-                                            verified=$(verify_output "$sample" "$tmp_out")
+                                            verified=$(verify_output "$sample" "$tmp_out" | tr -d '\r')
 
                                             # Write CSV lines including mt_threads
                                             echo "$sample_name,$sample_size_mb,GPU,$config_ext,compress,$alg,$blk_kb,NA,$mt_threads,$mt_io,$copy_mode,$coalesce,$stdio_buf,$c_ratio_frac,$c_ratio_pct,$c_tt,$c_kt,$c_rt,$c_wt,$c_ut,$c_dt,${c_kernel_name:-},${c_global:-},${c_local:-},${c_buf_in:-},${c_buf_out:-},${c_buf_len:-},${c_block_calc:-},${c_dl_len:-},${c_dl_bulk:-},${c_dl_total:-},$c_tp,$c_ktp,$verified" >> "$CSV_FILE"
@@ -577,11 +599,17 @@ local io_mode="zerocopy"; [ "$copy_mode" = "1" ] && io_mode="stdcopy"
                                             if [ "$verified" != "YES" ]; then
                                                 status="✗"
                                                 status_color="$RED"
-                                                local fail_dir="$RESULTS_DIR/failures/${sample_name}/${config_ext}"
-                                                mkdir -p "$fail_dir"
-                                                [ -f "$tmp_lzo" ] && mv "$tmp_lzo" "$fail_dir/failed.lzo"
-                                                [ -f "$tmp_out" ] && mv "$tmp_out" "$fail_dir/failed.out"
+                                                if [ "${PARAM_SCAN_DEBUG:-0}" = "1" ]; then
+                                                    local fail_dir="$RESULTS_DIR/failures/${sample_name}/${config_ext}"
+                                                    mkdir -p "$fail_dir"
+                                                    [ -f "$tmp_lzo" ] && mv "$tmp_lzo" "$fail_dir/failed.lzo"
+                                                    [ -f "$tmp_out" ] && mv "$tmp_out" "$fail_dir/failed.out"
+                                                else
+                                                    # Not debugging: delete temp artifacts to avoid storage growth
+                                                    rm -f "$tmp_lzo" "$tmp_out"
+                                                fi
                                             else
+                                                # Success: cleanup temp artifacts
                                                 rm -f "$tmp_lzo" "$tmp_out"
                                             fi
                                             printf "  %-45s " "$config_ext"
@@ -616,6 +644,18 @@ generate_report() {
         echo "MT IO: ${MT_IO_OPTIONS[*]} (0=off, 1=on)"
         echo "Copy modes: ${COPY_MODES[*]} (0=zerocopy, 1=stdcopy)"
         echo ""
+
+        # Validate CSV shape (header NF must match every data row).
+        if [ -f "$CSV_FILE" ]; then
+            header_nf=$(head -n1 "$CSV_FILE" | awk -F, '{print NF}')
+            mismatch_count=$(awk -F, -v nf="$header_nf" 'NR>1 && NF!=nf {print NR ":" NF}' "$CSV_FILE" | wc -l)
+            if [ "$mismatch_count" -gt 0 ]; then
+                echo "ERROR: Found $mismatch_count CSV rows with incorrect field count (expected $header_nf). Please fix the generator; sanitization is not permitted." >&2
+                echo "Example mismatched rows:" >&2
+                awk -F, -v nf="$header_nf" 'NR>1 && NF!=nf {print "Row "NR" has "NF" fields; content: "$0; exit 0}' "$CSV_FILE" >&2
+                exit 1
+            fi
+        fi
 
         # Map CSV header names to column indices so AWK can use the right fields even when rows vary
         IDX_TP=$(head -n1 "$CSV_FILE" | awk -F, '{for(i=1;i<=NF;i++) if ($i=="total_throughput_mbps") print i}')

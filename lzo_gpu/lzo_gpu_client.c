@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include "timing.h"
 #include "lzo_defaults.h"
+#include "lzo_gpu_utils.h"
 #include <getopt.h>
 #include <limits.h>
 #include <stddef.h>
@@ -83,6 +84,10 @@ typedef struct {
     int coalesce_chunk_mb; /* -1 unspecified; positive value overrides default chunk size */
     int coalesce_max_mb;   /* -1 unspecified; positive value overrides default max MB to coalesce in one write */
     int stdio_buf_mb;      /* -1 unspecified; positive value overrides stdio buffer size in MB */
+    /* Opt kernel flag (client -> daemon request) */
+    int kernel_opt;    /* 0/1: request optimized instrumented kernel (unrolled vector) */
+    /* Per-request debug flag: 0/1 (client requests kernel instrumentation and verbose diagnostics) */
+    int debug;
 } request_t;
 
 typedef struct {
@@ -107,13 +112,14 @@ static void fill_request_env_flags(request_t* req) {
      */
     s = getenv("LZO_STANDARD_COPY"); req->standard_copy = (s && atoi(s) == 1) ? 1 : 0;
     s = getenv("LZO_MT_IO"); req->mt_io = (s && atoi(s) == 1) ? 1 : 0;
-    s = getenv("LZO_MT_IO_THREADS"); req->mt_threads = s ? atoi(s) : LZO_DEFAULT_MT_IO_THREADS;
-    if (req->mt_threads < 1) req->mt_threads = 1; if (req->mt_threads > 32) req->mt_threads = 32;
+    s = getenv("LZO_MT_IO_THREADS"); req->mt_threads = s ? CLAMP(atoi(s), LZO_MIN_MT_IO_THREADS, LZO_MAX_MT_IO_THREADS) : LZO_DEFAULT_MT_IO_THREADS;
     /* coalesce/stdio flags: support env overrides only if CLI didn't set them. */
     if (req->coalesce_output == -1) { s = getenv("LZO_COALESCE_OUTPUT"); if (s) req->coalesce_output = atoi(s) ? 1 : 0; }
     if (req->coalesce_chunk_mb == -1) { s = getenv("LZO_COALESCE_CHUNK_MB"); if (s) req->coalesce_chunk_mb = atoi(s); }
     if (req->coalesce_max_mb == -1) { s = getenv("LZO_COALESCE_MAX_MB"); if (s) req->coalesce_max_mb = atoi(s); }
     if (req->stdio_buf_mb == -1) { s = getenv("LZO_STDIO_BUF_MB"); if (s) req->stdio_buf_mb = atoi(s); }
+    /* kernel variant env flags (optional) */
+    s = getenv("LZO_KERNEL_OPT"); if (s && atoi(s) == 1) req->kernel_opt = 1; // kernel debug is not supported for daemon clients
 }
 
 /* Simple CLI parsing for per-request flags. These CLI flags override env vars. */
@@ -130,6 +136,8 @@ static void parse_client_cli_opts(int argc, char** argv, request_t* req) {
         if (strcmp(a, "--block-size") == 0 && i + 1 < argc) { argv[i] = "--"; req->fixed_block_kb = parse_size_kb(argv[++i]); argv[i] = "--"; continue; }
         if (strncmp(a, "--local=", 8) == 0) { req->local_size = atoi(a + 8); argv[i] = "--"; continue; }
         if (strcmp(a, "--local") == 0 && i + 1 < argc) { argv[i] = "--"; req->local_size = atoi(argv[++i]); argv[i] = "--"; continue; }
+        if (strcmp(a, "--kernel-opt") == 0) { req->kernel_opt = 1; argv[i] = "--"; continue; }
+        if (strcmp(a, "--debug") == 0) { req->debug = 1; argv[i] = "--"; continue; }
     }
 }
 
@@ -145,6 +153,10 @@ static void set_request_defaults(request_t* req) {
     req->coalesce_chunk_mb = -1;
     req->coalesce_max_mb = -1;
     req->stdio_buf_mb = -1;
+    /* kernel variant flags */
+    req->kernel_opt = 0;
+    /* per-request debug (0/1) */
+    req->debug = 0;
     /* profile_writes removed */
 }
 
@@ -333,11 +345,11 @@ int compress_with_daemon(const char* input, const char* output, int alg, int lev
     set_request_defaults(&req);
     memcpy(&req, &g_cli_req_flags, sizeof(req));
                     /* Diagnostic: print final request fields to stderr to confirm CLI parsing */
-                    if (getenv("LZO_DEBUG")) {
-                    fprintf(stderr, "[CLIENT] Request opts: fixed_block_kb=%d local_size=%d standard_copy=%d mt_io=%d mt_threads=%d sizeof(req)=%zu\n",
-                        req.fixed_block_kb, req.local_size, req.standard_copy, req.mt_io, req.mt_threads, sizeof(req));
-                    fprintf(stderr, "[CLIENT] offsetof: fixed_block_kb=%zu local_size=%zu\n",
-                        offsetof(request_t, fixed_block_kb), offsetof(request_t, local_size));
+                    if (req.debug) {
+                    fprintf(stderr, "[CLIENT] Request opts: fixed_block_kb=%d local_size=%d standard_copy=%d mt_io=%d mt_threads=%d kernel_opt=%d debug=%d sizeof(req)=%zu\n",
+                        req.fixed_block_kb, req.local_size, req.standard_copy, req.mt_io, req.mt_threads, req.kernel_opt, req.debug, sizeof(req));
+                    fprintf(stderr, "[CLIENT] offsetof: fixed_block_kb=%zu local_size=%zu kernel_opt=%zu debug=%zu\n",
+                        offsetof(request_t, fixed_block_kb), offsetof(request_t, local_size), offsetof(request_t, kernel_opt), offsetof(request_t, debug));
                     }
     req.operation = 'C';
     strncpy(req.input_path, input, sizeof(req.input_path) - 1);
@@ -435,13 +447,14 @@ static void show_help(const char* prog) {
     fprintf(stderr, "  -B N, --block-size N          Fixed block size; accepts units (B/KB/MB), e.g., -B 64KB.\n");
     fprintf(stderr, "  --local N                     Local work-group size for kernel (1, 8, 64). Compression kernels require local=1 and will be forced.\n");
     fprintf(stderr, "  -d, --decompress              Decompress mode.\n");
-    fprintf(stderr, "  -o, --output <file>           Output file.\n\n");
+    fprintf(stderr, "  -o, --output <file>           Output file.\n");
+    fprintf(stderr, "  --debug                       Enable debug instrumentation and verbose diagnostics (per-request).\n\n");
     fprintf(stderr, "示例:\n");
     fprintf(stderr, "  %s input.txt -o output.lzo\n", prog);
     fprintf(stderr, "  %s -l 1k input.txt -o output.lzo\n", prog);
     fprintf(stderr, "  %s -d input.lzo -o output.txt\n\n", prog);
     fprintf(stderr, "Environment variables (defaults used by client if CLI options not present):\n");
-    fprintf(stderr, "  LZO_STANDARD_COPY=0|1       Default copy mode (0=zero-copy, 1=standard copy).\n");
+    fprintf(stderr, "  LZO_STANDARD_COPY=0|1       Default copy mode (0=zero-copy, 1=standard copy). Applies to both compression and decompression.\n");
     fprintf(stderr, "  LZO_MT_IO=0|1               Enable multi-threaded I/O by default.\n");
     fprintf(stderr, "  LZO_MT_IO_THREADS=N         Default number of I/O threads (1-32).\n");
     fprintf(stderr, "  LZO_COALESCE_OUTPUT=0|1     Enable output coalescing by default.\n");

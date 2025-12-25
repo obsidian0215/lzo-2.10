@@ -41,6 +41,7 @@ typedef struct {
     size_t comp_size;
     size_t offset;
     unsigned char *out;
+    uint64_t proc_ns; /* per-chunk processing time in nanoseconds (filled when --debug-metrics enabled) */
 } chunk_t;
 
 /* Global algorithm specifier set from -L. When non-NULL it overrides numeric
@@ -48,6 +49,7 @@ typedef struct {
  * are labels like "1x", "1k", "1o", "1l".
  */
 static const char *g_alg_spec = NULL;
+static int cpu_debug_metrics_enabled = 0; /* set by --debug-metrics */
 typedef enum {
     ALG_1X = 0,
     ALG_1Y = 1,
@@ -359,7 +361,19 @@ static void *compress_worker(void *opaque) {
         if (ck->comp) {
             /* compress into preallocated buffer */
             size_t cap = ck->in_size + ck->in_size / 16u + 64u + 3u;
+            struct timespec _t0, _t1;
+#ifdef CLOCK_MONOTONIC_RAW
+            clock_gettime(CLOCK_MONOTONIC_RAW, &_t0);
+#else
+            clock_gettime(CLOCK_MONOTONIC, &_t0);
+#endif
             rc = compress_block_into(ck->in, ck->in_size, ck->comp, cap, &out_len, job->compression_alg, job->variant, thread_wrkmem);
+#ifdef CLOCK_MONOTONIC_RAW
+            clock_gettime(CLOCK_MONOTONIC_RAW, &_t1);
+#else
+            clock_gettime(CLOCK_MONOTONIC, &_t1);
+#endif
+            ck->proc_ns = (uint64_t)(_t1.tv_sec - _t0.tv_sec) * 1000000000ULL + (uint64_t)(_t1.tv_nsec - _t0.tv_nsec);
             if (rc != LZO_E_OK) {
                 atomic_store(&job->status, rc);
                 break;
@@ -374,7 +388,19 @@ static void *compress_worker(void *opaque) {
                 atomic_store(&job->status, LZO_E_OUT_OF_MEMORY);
                 break;
             }
+            struct timespec _t0, _t1;
+#ifdef CLOCK_MONOTONIC_RAW
+            clock_gettime(CLOCK_MONOTONIC_RAW, &_t0);
+#else
+            clock_gettime(CLOCK_MONOTONIC, &_t0);
+#endif
             rc = compress_block_into(ck->in, ck->in_size, out, cap, &out_len, job->compression_alg, job->variant, thread_wrkmem);
+#ifdef CLOCK_MONOTONIC_RAW
+            clock_gettime(CLOCK_MONOTONIC_RAW, &_t1);
+#else
+            clock_gettime(CLOCK_MONOTONIC, &_t1);
+#endif
+            ck->proc_ns = (uint64_t)(_t1.tv_sec - _t0.tv_sec) * 1000000000ULL + (uint64_t)(_t1.tv_nsec - _t0.tv_nsec);
             if (rc != LZO_E_OK) {
                 free(out);
                 atomic_store(&job->status, rc);
@@ -477,6 +503,14 @@ static int compress_multi(const unsigned char *input, size_t input_size,
     if (chunks_out) *chunks_out = chunks;
     else free_compression_chunks(chunks, chunk_count);
     if (chunk_count_out) *chunk_count_out = chunk_count;
+
+    if (cpu_debug_metrics_enabled) {
+        fprintf(stderr, "LZO_CPU_DEBUG per-chunk metrics (nblk=%zu):\n", chunk_count);
+        for (size_t i = 0; i < chunk_count; ++i) {
+            double ms = (double)chunks[i].proc_ns / 1e6;
+            fprintf(stderr, "LZO_CPU_DEBUG BLOCK %4zu IN %6zu OUT %6zu CPU_MS %.3f\n", i, chunks[i].in_size, chunks[i].comp_size, ms);
+        }
+    }
 
     return LZO_E_OK;
 }
@@ -1050,6 +1084,7 @@ static void print_usage(const char *prog) {
             "  -l <level>      Select level/variant for 1x (1, 1k, 1l, 1o). Default 1.\n"
             "  -o <path>       Output path (- for stdout). If omitted a default is generated from input\n"
             "  --benchmark     Run benchmark metrics after operation\n"
+            "  --debug-metrics Enable per-block CPU timing/metrics (debug only)\n"
             "  -h, --help      Show this help\n"
             "  Use '-' for stdin/stdout. Output defaults to input with .lzo (compress)\n"
             "  or stripped .lzo extension (decompress).\n",
@@ -1131,6 +1166,8 @@ int main(int argc, char **argv) {
             do_bench = 1;
         } else if (strcmp(arg, "--verify") == 0) {
             verify_only = 1;
+        } else if (strcmp(arg, "--debug-metrics") == 0) {
+            cpu_debug_metrics_enabled = 1;
         } else if (strcmp(arg, "-o") == 0 || strcmp(arg, "--output") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "-o requires an argument\n");

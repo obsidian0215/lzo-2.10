@@ -36,7 +36,6 @@ Commands:
 
     Environment Variables:
       LZO_COMP_LEVELS     Comma-separated compression levels (default: 1,1k,1l,1o)
-      LZO_DEBUG           Set to 1 to enable debug output
 
   parse <indir> <out>   Parse profile logs (uses tools/parse_profile_logs.py)
   analyze               Run basic analysis (aggregates summary.csv and analysis CSVs)
@@ -102,6 +101,8 @@ case "$cmd" in
           shift; REPEATS="${1:-5}"; shift || true ;;
         -o|--output)
           shift; PARAM_SCAN_OUT_DIR="${1:-}"; shift || true ;;
+        --debug)
+          PARAM_SCAN_DEBUG=1; shift || true ;;
         -h|--help)
           PARAM_SCAN_HELP=1; shift || true ;;
         *) shift ;;
@@ -121,7 +122,6 @@ Options:
 
 Environment Variables (comma-separated):
   LZO_COMP_LEVELS     Compression levels to test (default: 1,1k,1l,1o)
-  LZO_DEBUG           Enable debug output (set to 1)
 
 Examples:
   # Basic scan with defaults
@@ -168,9 +168,9 @@ EOF
       exit 1
     fi
 
-    # Optional debug flag
+    # Optional debug flag (set via --debug param to this script)
     LZO_DEBUG_FLAG=""
-    if [ "${LZO_DEBUG:-0}" = "1" ]; then
+    if [ "${PARAM_SCAN_DEBUG:-0}" = "1" ]; then
       LZO_DEBUG_FLAG="--debug"
     fi
 

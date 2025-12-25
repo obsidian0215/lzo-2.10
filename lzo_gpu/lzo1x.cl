@@ -10,6 +10,16 @@
 #define D_BITS 14
 #endif
 
+/* Debug instrumentation: enable via -D LZO_GPU_DEBUG.
+ * When enabled, debug emits extended fields (IN, OUT, FLAG, LOOKUPS, HITS, MATCH_BYTES, UPDATES):
+ * 7 fields per block by default. To override, define DBG_FIELDS externally.
+ */
+#ifdef LZO_GPU_DEBUG
+#ifndef DBG_FIELDS
+#define DBG_FIELDS 7
+#endif
+#endif
+
 /* Standard macros */
 #define LZO_BYTE(x)       ((unsigned char) (x))
 
@@ -132,10 +142,17 @@ static inline ulong lzo_memops_get_le64(const __global void *pp)
 
 #define UPDATE_I(dict,drun,index,p,in)    dict[index] = DENTRY(p,in)
 
+#ifdef LZO_GPU_DEBUG
 static lzo_uint
 lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
                    LZO_ADDR_GLOBAL lzo_bytep out, lzo_uintp out_len,
-                    lzo_uint  ti, lzo_voidp wrkmem)
+                    lzo_uint ti, lzo_voidp wrkmem, __global uint *dbg_out)
+#else
+static lzo_uint
+lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
+                   LZO_ADDR_GLOBAL lzo_bytep out, lzo_uintp out_len,
+                    lzo_uint ti, lzo_voidp wrkmem)
+#endif
 {
     LZO_ADDR_GLOBAL const lzo_bytep ip;
     LZO_ADDR_GLOBAL lzo_bytep op;
@@ -147,6 +164,10 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
     op = out;
     ip = in;
     ii = ip;
+
+#ifdef LZO_GPU_DEBUG
+    uint dbg_lookups = 0, dbg_hits = 0, dbg_updates = 0, dbg_matched_bytes = 0, dbg_matches = 0;
+#endif
 
     ip += ti < 4 ? 4 - ti : 0;
     for (;;)
@@ -164,6 +185,9 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
                 break;
             dv = UA_GET_LE32(ip);
             dindex = DINDEX(dv,ip);
+#ifdef LZO_GPU_DEBUG
+            dbg_lookups++;
+#endif
             GINDEX(m_off,m_pos,dict,dindex,in);
 
             /* Prefetch next */
@@ -174,8 +198,14 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
             }
 
             UPDATE_I(dict,0,dindex,ip,in);
+#ifdef LZO_GPU_DEBUG
+            dbg_updates++;
+#endif
             if (dv != UA_GET_LE32(m_pos))
                 goto literal;
+#ifdef LZO_GPU_DEBUG
+            dbg_hits++;
+#endif
         }
 
         ii -= ti; ti = 0;
@@ -208,7 +238,76 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
         }
 
         m_len = 4;
-        /* Vectorized match check */
+        /* Vectorized match check (unrolled if requested) */
+#ifdef LZO_USE_UNROLL4
+        while (ip + m_len + 32 <= ip_end) {
+            ulong ip_val = UA_GET_LE64(ip + m_len);
+            ulong mp_val = UA_GET_LE64(m_pos + m_len);
+            if (ip_val != mp_val) {
+                ulong diff = ip_val ^ mp_val;
+                m_len += (ctz(diff) >> 3);
+                goto m_len_done;
+            }
+            ip_val = UA_GET_LE64(ip + m_len + 8);
+            mp_val = UA_GET_LE64(m_pos + m_len + 8);
+            if (ip_val != mp_val) {
+                ulong diff = ip_val ^ mp_val;
+                m_len += 8 + (ctz(diff) >> 3);
+                goto m_len_done;
+            }
+            ip_val = UA_GET_LE64(ip + m_len + 16);
+            mp_val = UA_GET_LE64(m_pos + m_len + 16);
+            if (ip_val != mp_val) {
+                ulong diff = ip_val ^ mp_val;
+                m_len += 16 + (ctz(diff) >> 3);
+                goto m_len_done;
+            }
+            ip_val = UA_GET_LE64(ip + m_len + 24);
+            mp_val = UA_GET_LE64(m_pos + m_len + 24);
+            if (ip_val != mp_val) {
+                ulong diff = ip_val ^ mp_val;
+                m_len += 24 + (ctz(diff) >> 3);
+                goto m_len_done;
+            }
+            m_len += 32;
+        }
+        while (ip + m_len + 16 <= ip_end) {
+            ulong ip_val = UA_GET_LE64(ip + m_len);
+            ulong mp_val = UA_GET_LE64(m_pos + m_len);
+
+            if (ip_val != mp_val) {
+                ulong diff = ip_val ^ mp_val;
+                m_len += (ctz(diff) >> 3);
+                goto m_len_done;
+            }
+            ip_val = UA_GET_LE64(ip + m_len + 8);
+            mp_val = UA_GET_LE64(m_pos + m_len + 8);
+            if (ip_val != mp_val) {
+                ulong diff = ip_val ^ mp_val;
+                m_len += 8 + (ctz(diff) >> 3);
+                goto m_len_done;
+            }
+            m_len += 16;
+        }
+#elif defined(LZO_USE_UNROLL2)
+        while (ip + m_len + 16 <= ip_end) {
+            ulong ip_val = UA_GET_LE64(ip + m_len);
+            ulong mp_val = UA_GET_LE64(m_pos + m_len);
+
+            if (ip_val != mp_val) {
+                ulong diff = ip_val ^ mp_val;
+                m_len += (ctz(diff) >> 3);
+                goto m_len_done;
+            }
+            ip_val = UA_GET_LE64(ip + m_len + 8);
+            mp_val = UA_GET_LE64(m_pos + m_len + 8);
+            if (ip_val != mp_val) {
+                ulong diff = ip_val ^ mp_val;
+                m_len += 8 + (ctz(diff) >> 3);
+                goto m_len_done;
+            }
+            m_len += 16;
+        }
         while (ip + m_len + 8 <= ip_end) {
             ulong ip_val = UA_GET_LE64(ip + m_len);
             ulong mp_val = UA_GET_LE64(m_pos + m_len);
@@ -220,6 +319,19 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
             }
             m_len += 8;
         }
+#else
+        while (ip + m_len + 8 <= ip_end) {
+            ulong ip_val = UA_GET_LE64(ip + m_len);
+            ulong mp_val = UA_GET_LE64(m_pos + m_len);
+
+            if (ip_val != mp_val) {
+                ulong diff = ip_val ^ mp_val;
+                m_len += (ctz(diff) >> 3);
+                goto m_len_done;
+            }
+            m_len += 8;
+        }
+#endif
 
         if (ip[m_len] == m_pos[m_len]) {
             do {
@@ -242,6 +354,10 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
             } while (ip[m_len] == m_pos[m_len]);
         }
 m_len_done:
+#ifdef LZO_GPU_DEBUG
+        dbg_matched_bytes += m_len;
+        dbg_matches++;
+#endif
         m_off = pd(ip,m_pos);
         ip += m_len;
         ii = ip;
@@ -292,6 +408,14 @@ m_len_done:
     }
 
     *out_len = pd(op, out);
+#ifdef LZO_GPU_DEBUG
+    if (dbg_out) {
+        dbg_out[3] = dbg_lookups;
+        dbg_out[4] = dbg_hits;
+        dbg_out[5] = dbg_matched_bytes;
+        dbg_out[6] = dbg_updates;
+    }
+#endif
     return pd(in_end,ii-ti);
 }
 
@@ -300,9 +424,15 @@ static inline void dict_clear(lzo_dict_t* d) {
     for (uint i = 0; i < D_SIZE; ++i) d[i] = 0;
 }
 
+#ifdef LZO_GPU_DEBUG
+static inline int do_compress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint  in_len,
+    LZO_ADDR_GLOBAL lzo_bytep out, lzo_uintp out_len,
+    lzo_uint  ti, lzo_voidp wrkmem, __global uint *dbg_out)
+#else
 static inline int do_compress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint  in_len,
     LZO_ADDR_GLOBAL lzo_bytep out, lzo_uintp out_len,
     lzo_uint  ti, lzo_voidp wrkmem)
+#endif
 {
     __global const uchar* ip = in;
     __global uchar* op = out;
@@ -318,7 +448,11 @@ static inline int do_compress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint  in_l
             break;
 
         dict_clear(wrkmem);
+#ifdef LZO_GPU_DEBUG
+        t = lzo1x_compress_core(ip, ll, op, out_len, t, wrkmem, dbg_out);
+#else
         t = lzo1x_compress_core(ip, ll, op, out_len, t, wrkmem);
+#endif
         ip += ll;
         op += *out_len;
         l -= ll;
@@ -352,6 +486,7 @@ static inline int do_compress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint  in_l
     return 0;
 }
 
+#ifndef LZO_GPU_DEBUG
 __kernel void lzo1x_block_compress(__global const uchar *in ,
                                    __global       uchar *out,
                                    __global       uint  *out_len,
@@ -377,3 +512,36 @@ __kernel void lzo1x_block_compress(__global const uchar *in ,
     do_compress(ip, in_len, op, &olen, 0, dict);
     out_len[gid] = olen;
 }
+#else
+__kernel void lzo1x_block_compress_debug(__global const uchar *in ,
+                                        __global       uchar *out,
+                                        __global       uint  *out_len,
+                                        const uint  in_sz,
+                                        const uint  blk_size,
+                                        const uint  worst_blk,
+                                        __global uint *dbg)
+{
+    const uint gid = get_global_id(0);
+    const uint in_off = gid * blk_size;
+    __global const uchar* ip = in + in_off;
+    __global uchar* op = out + gid * worst_blk;
+
+    __local lzo_dict_t dict[1<<D_BITS];
+
+    uint in_len = (in_off + blk_size <= in_sz) ? blk_size : (in_sz - in_off);
+    if (in_len == 0) {
+        out_len[gid] = 0;
+        for (int f = 0; f < DBG_FIELDS; ++f) dbg[gid*DBG_FIELDS + f] = 0;
+        dbg[gid*DBG_FIELDS + 2] = 1;
+        return;
+    }
+
+    lzo_uint olen = 0;
+    do_compress(ip, in_len, op, &olen, 0, dict, dbg + gid * DBG_FIELDS);
+    out_len[gid] = olen;
+
+    dbg[gid*DBG_FIELDS + 0] = in_len;
+    dbg[gid*DBG_FIELDS + 1] = olen;
+    dbg[gid*DBG_FIELDS + 2] = (olen == 0) ? 1 : 0;
+}
+#endif
