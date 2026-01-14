@@ -16,7 +16,8 @@
 *.csv
 *.log
 *.lzo
-*.clbin
+*.clbin*
+*.baseline
 
 # preprocessed/source-generated files
 *.i

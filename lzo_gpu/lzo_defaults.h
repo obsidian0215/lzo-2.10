@@ -10,28 +10,17 @@
 
 #include <stdlib.h>  /* for getenv, atoi */
 
-#define LZO_DEFAULT_STDIO_BUF_MB 4
-#define LZO_DEFAULT_COALESCE_OUTPUT 1
-#define LZO_DEFAULT_COALESCE_MAX_MB 256
-#define LZO_DEFAULT_COALESCE_CHUNK_MB 16
 #define DEFAULT_DECOMP_CACHE_MB 256
 
-/* Multi-threaded I/O configuration (based on performance testing) */
-#define LZO_DEFAULT_MT_IO_THREADS 4   /* Default: 4 threads (good balance) */
-#define LZO_MIN_MT_IO_THREADS 1       /* Minimum: 1 thread */
-#define LZO_MAX_MT_IO_THREADS 8       /* Maximum: 8 threads (tested optimal range 4-6) */
-#define LZO_MT_IO_SIZE_THRESHOLD (16 * 1024 * 1024)  /* 16MB: Use MT-IO for files larger than this */
-
-/* Write coalescing configuration */
-#define LZO_WRITE_CHUNK_DEFAULT_MB 16  /* Default chunk size for partial coalescing */
-#define LZO_WRITE_CHUNK_MIN_MB 1       /* Minimum chunk size */
+/* Compression configuration */
+#define LZO_DEFAULT_COMP_LEVEL 14
 
 /* Block size and GPU parallelism configuration */
-#define LZO_OCC_FACTOR_DEFAULT 256
-#define LZO_ALIGN_BYTES_DEFAULT 1024  /* 1KB alignment for block sizes */
-#define LZO_MIN_BLOCK_BYTES_DEFAULT (1 * 1024)   /* 1KB minimum */
-#define LZO_MAX_BLOCK_BYTES_DEFAULT (64 * 1024)  /* 64KB maximum */
-#define LZO_MAX_NBLOCKS_DEFAULT (16 * 1024)  /* Maximum blocks per job */
+#define LZO_OCC_FACTOR_DEFAULT 128
+#define LZO_ALIGN_BYTES_DEFAULT 4096  /* 4KB alignment for block sizes for memory efficiency */
+#define LZO_MIN_BLOCK_BYTES_DEFAULT (4 * 1024)   /* 1KB minimum */
+#define LZO_MAX_BLOCK_BYTES_DEFAULT (128 * 1024)  /* 128KB maximum (increased from 64KB) */
+#define LZO_MAX_NBLOCKS_DEFAULT (8 * 1024)  /* Maximum blocks per job */
 
 /* Entropy calculation configuration */
 #define LZO_ADAPTIVE_SAMPLE_SIZE (64 * 1024)  /* 64KB sample for entropy */
@@ -40,7 +29,8 @@
 #define LZO_ADAPTIVE_ENTROPY_ENABLED 0  /* 0=size-only (fast), 1=entropy-aware */
 
 /* OpenCL configuration */
-#define LZO_LOCAL_SIZE_DEFAULT 1  /* Compression kernels require local_size=1 */
+/* Default work-group size. Set to 1 for high occupancy with serial compression kernels. */
+#define LZO_LOCAL_SIZE_DEFAULT 1
 
 /* Memory alignment */
 #ifndef ALIGN_BYTES

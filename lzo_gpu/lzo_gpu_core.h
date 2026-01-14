@@ -8,6 +8,35 @@
 extern "C" {
 #endif
 
+/* Workspace for thread-safe buffer caching */
+typedef struct {
+    /* Compression buffers */
+    cl_mem d_in;
+    cl_mem d_out;
+    cl_mem d_len;
+    cl_mem d_dict;
+    size_t in_size;
+    size_t out_size;
+    size_t len_size;
+    size_t dict_size;
+
+    /* Decompression buffers */
+    cl_mem d_comp;
+    cl_mem d_off;
+    cl_mem d_decomp_out;
+    cl_mem d_out_lens;
+    size_t comp_size;
+    size_t off_size;
+    size_t decomp_out_size;
+    size_t lens_size;
+} lzo_gpu_workspace_t;
+
+void lzo_gpu_workspace_init(lzo_gpu_workspace_t* ws);
+void lzo_gpu_workspace_free(lzo_gpu_workspace_t* ws);
+
+/* Global verbosity control */
+extern int g_verbose;
+
 /* Parameter object to reduce lzo_compress_core argument count from 18 to 6 */
 typedef struct {
     /* Algorithm and quality settings */
@@ -16,15 +45,7 @@ typedef struct {
 
     /* I/O and memory settings */
     int standard_copy;      /* 0=zero-copy (map), 1=standard copy */
-    int mt_io;              /* Enable multi-threaded I/O */
-    int mt_threads;         /* Number of MT-IO threads */
     int fixed_block_kb;     /* Fixed block size in KB (0=adaptive) */
-
-    /* Output coalescing settings */
-    int coalesce_output;    /* Enable output coalescing */
-    int coalesce_chunk_mb;  /* Chunk size for chunked coalesce (MB) */
-    int coalesce_max_mb;    /* Max size for full coalesce (MB) */
-    int stdio_buf_mb;       /* stdio buffer size (MB) */
 
     /* Debug and profiling */
     int local_size_param;   /* OpenCL local work-group size */
@@ -39,24 +60,7 @@ int lzo_compress_core(
     const char* input_path,
     const char* output_path,
     const lzo_compress_params_t* params,
-    unsigned long* time_us_out,
-    size_t* output_size_out,
-    timing_t* t_out
-);
-
-/* Legacy function signature - kept for backward compatibility during transition */
-int lzo_compress_core_legacy(
-    cl_context ctx,
-    cl_command_queue queue,
-    cl_device_id device,
-    cl_kernel kernel,
-    const char* input_path,
-    const char* output_path,
-    int level,
-    int alg_id,
-    int standard_copy, int mt_io, int mt_threads, int fixed_block_kb,
-    int coalesce_output, int coalesce_chunk_mb, int coalesce_max_mb, int stdio_buf_mb,
-    int local_size_param, int debug,
+    lzo_gpu_workspace_t* ws,      /* Thread-safe workspace */
     unsigned long* time_us_out,
     size_t* output_size_out,
     timing_t* t_out
@@ -69,16 +73,13 @@ int lzo_decompress_core(
     cl_kernel kernel,
     const char* input_path,
     const char* output_path,
+    lzo_gpu_workspace_t* ws,      /* Thread-safe workspace */
     int standard_copy,
     int local_size_param, int debug,
     unsigned long* time_us_out,
     size_t* output_size_out,
     timing_t* t_out
 );
-
-/* Cleanup exported so daemon can call on exit */
-void cleanup_compress_buffer_cache(void);
-void cleanup_decompress_buffer_cache(void);
 
 #ifdef __cplusplus
 }

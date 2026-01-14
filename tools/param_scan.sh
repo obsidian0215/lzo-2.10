@@ -1,975 +1,692 @@
 #!/bin/bash
-# LZO GPU/CPU 完整参数扫描测试脚本
-# 测试各种 blocksize, localsize, 算法, IO优化选项等
+set -e
 
-# set -e removed to allow continuing after failures
-
+# ========================================
 # 颜色定义
+# ========================================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
+YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# 路径配置
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-LZO_CPU="$REPO_DIR/lzo_cpu/lzo_cpu"
-LZO_GPU="$REPO_DIR/lzo_gpu/lzo_gpu"
-LZO_GPU_DIR="$REPO_DIR/lzo_gpu"
-LZO_GPU_DAEMON="$REPO_DIR/lzo_gpu/lzo_gpu_daemon"
-LZO_GPU_CLIENT="$REPO_DIR/lzo_gpu/lzo_gpu_client"
-SAMPLES_DIR="${SAMPLES_DIR:-/root/samples}"
-
-# 结果文件
+# ========================================
+# 配置参数
+# ========================================
+RESULTS_DIR="/root/lzo-2.10/exp_results/param_scan"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RESULTS_DIR="$REPO_DIR/exp_results/param_scan"
+mkdir -p "$RESULTS_DIR"
+
+SAMPLES_DIR="${SAMPLES_DIR:-/root/samples}"
 CSV_FILE="${CSV_FILE:-$RESULTS_DIR/param_scan_${TIMESTAMP}.csv}"
-REPORT_FILE="${REPORT_FILE:-$RESULTS_DIR/param_scan_report_${TIMESTAMP}.txt}"
-PARAM_SCAN_DEBUG=${PARAM_SCAN_DEBUG:-0}
 
-# 测试配置
-ALGORITHMS=("1x" "1y")
-LEVELS=(10 11 12 14)
-BLOCK_SIZES=(8 16 32 64)  # KB
-LOCAL_SIZES=(1)
-CPU_THREADS=(1 2 4)
-COPY_MODES=(0)  # 0=zero-copy, 1=standard copy
-STDIO_BUF_OPTIONS=(4)  # stdio buffer sizes in MB
-MT_IO_OPTIONS=(0 1)  # multi-threaded IO
-MT_IO_THREADS_OPTIONS=(2) # MT_IO thread counts
-COALESCE_OPTIONS=(1)  # enable/disable output coalescing
+# Configuration Matrix (Arrays) - Use string for env-friendly overrides
+ALGORITHMS=(${ALGORITHMS:-1x 1y})
+LEVEL_NAMES=(${LEVEL_NAMES:-1k 1l 1 1o}) # for lzo_cpu: '1k' = level 11, '1l' = level 12, '1' = level 14, '1o' = level 15
+# GPU uses numeric dictionary bit sizes (10-18). Specify GPU_LEVELS if you want to test different -L values.
+GPU_LEVELS=(${GPU_LEVELS:-11 12 14 15})
+BLOCK_SIZES=(${BLOCK_SIZES:-8 16 32 64}) # in KB
+LOCAL_SIZES=(${LOCAL_SIZES:-1 4 8})
+CPU_THREADS=(${CPU_THREADS:-1 2 4})
 
-# Helper: start a daemon for param_scan runs
-start_daemon() {
-    local daemon_env_ext="$1"
-    local env_vars="${daemon_env_ext:-}"
-    # Extract socket path in the requested daemon env (default: /tmp/lzo_gpu_daemon.sock)
-    local sock
-    sock=$(echo "$env_vars" | grep -oP 'LZO_DAEMON_SOCKET=\K[^ ]+' || true)
-    if [ -z "$sock" ]; then
-        sock="/tmp/lzo_gpu_daemon.sock"
-    fi
+LZO_GPU_DIR="/root/lzo-2.10/lzo_gpu"
+LZO_GPU="./lzo_gpu"
+LZO_CPU="/root/lzo-2.10/lzo_cpu/lzo_cpu"
 
-    # Create unique pid/log paths for this socket
-    local base
-    base=$(basename "$sock" .sock)
-    local pidfile="/tmp/${base}.$$.pid"
-    local logfile="/tmp/${base}.$$.log"
-
-    # Kill any existing daemons before starting test-specific daemon
-    stop_daemon 2>/dev/null || true
-
-    # Start a new daemon in the background and capture its PID
-    local cwd
-    cwd=$(pwd)
-    cd "$LZO_GPU_DIR"
-    if [ -n "$env_vars" ]; then
-        # Use eval / env to set environment variables for child process
-        # shellcheck disable=SC2086
-        eval env $env_vars LZO_DAEMON_PID="$pidfile" LZO_DAEMON_LOG="$logfile" "$LZO_GPU_DAEMON" > "$logfile" 2>&1 &
-    else
-        "$LZO_GPU_DAEMON" > "$logfile" 2>&1 &
-    fi
-    local pid=$!
-    cd "$cwd"
-    # Save the pid and aux info for stop_daemon and for clients
-    DAEMON_PID=$pid
-    SCAN_DAEMON_PID=$pid
-    SCAN_DAEMON_PIDFILE=$pidfile
-    SCAN_DAEMON_LOGFILE=$logfile
-    SCAN_DAEMON_SOCKET=$sock
-    SCAN_DAEMON_OWNED=1
-    echo "Started new daemon (pid=$pid, socket=$SCAN_DAEMON_SOCKET)"
-
-    # Wait for the process to start and socket to be created AND accept a connection
-    for i in {1..30}; do
-        if [ -S "$sock" ]; then
-            # Try to actually connect to the unix socket to verify the server is listening
-            # Use python3 to attempt a simple AF_UNIX connect (safe & small)
-            if python3 - <<PYTEST "$sock" >/dev/null 2>&1
-import socket,sys
-try:
-  s=socket.socket(socket.AF_UNIX)
-  s.settimeout(0.5)
-  s.connect(sys.argv[1])
-  s.close()
-  sys.exit(0)
-except Exception:
-  sys.exit(1)
-PYTEST
-            then
-                # short pause to let daemon stabilize
-                sleep 0.2
-                return 0
-            fi
-        fi
-        # If process died, break early
-        if ! ps -p "$pid" >/dev/null 2>&1; then
-            break
-        fi
-        sleep 0.2
-    done
-    # If we get here, starting daemon likely failed
-    # If daemon failed to create socket, dump daemon log for debugging and fail
-    echo "Failed to start daemon (socket=${sock})" >&2
-    if [ -f "$logfile" ]; then
-        echo "--- Daemon log tail ($logfile) ---" >&2
-        tail -n 200 "$logfile" >&2 || true
-        echo "--- End Daemon log tail ---" >&2
-    fi
-    # If a log file exists, show last 200 lines to help debugging
-    return 1
-}
-
-# Helper: stop a daemon started by start_daemon
-stop_daemon() {
-    # If we have a SCAN_DAEMON_PID, kill it
-    local pid="${SCAN_DAEMON_PID:-}"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
-        local t=0
-        while kill -0 "$pid" 2>/dev/null && [ $t -lt 50 ]; do
-            sleep 0.05
-            t=$((t + 1))
-        done
-        if kill -0 "$pid" 2>/dev/null; then
-            kill -KILL "$pid" 2>/dev/null || true
-        fi
-    fi
-
-    # Also attempt to kill any lzo_gpu_daemon process to ensure clean state
-    pkill -f "lzo_gpu_daemon" 2>/dev/null || true
-
-    # Cleanup artifacts
-    if [ -n "${SCAN_DAEMON_PIDFILE:-}" ]; then rm -f "${SCAN_DAEMON_PIDFILE}" >/dev/null 2>&1 || true; fi
-    if [ -n "${SCAN_DAEMON_LOGFILE:-}" ]; then rm -f "${SCAN_DAEMON_LOGFILE}" >/dev/null 2>&1 || true; fi
-    local sock="${SCAN_DAEMON_SOCKET:-/tmp/lzo_gpu_daemon.sock}"
-    if [ -S "$sock" ]; then
-        rm -f "$sock" >/dev/null 2>&1 || true
-    fi
-    unset SCAN_DAEMON_PID
-    unset SCAN_DAEMON_PIDFILE
-    unset SCAN_DAEMON_LOGFILE
-    unset SCAN_DAEMON_SOCKET
-    unset SCAN_DAEMON_OWNED
-}
-
-
-test_gpu_daemon() {
-    local sample="$1"
-    local sample_name=$(basename "$sample")
-    local sample_size_mb=$(echo "scale=2; $(stat -Lc%s "$sample") / 1048576" | bc)
-
-    echo -e "\n${CYAN}=== GPU Daemon Tests: $sample_name ===${NC}"
-
-    for alg in "${ALGORITHMS[@]}"; do
-        for lvl in "${LEVELS[@]}"; do
-            for blk_kb in "${BLOCK_SIZES[@]}"; do
-                    for lsz in "${LOCAL_SIZES[@]}"; do
-                        for mt_io in "${MT_IO_OPTIONS[@]}"; do
-                            for copy_mode in "${COPY_MODES[@]}"; do
-                                for mt_threads in "${MT_IO_THREADS_OPTIONS[@]}"; do
-                                    local config="daemon_${alg}_${lvl}_${blk_kb}k"
-                                    local tmp_lzo="/tmp/pscan_${sample_name}.lzo"
-                                    local tmp_out="/tmp/pscan_${sample_name}.out"
-
-                                    # start daemon with minimal daemon-level env. Keep per-request overrides as client env vars
-                                    local uniq_sock
-                                    # Use default daemon socket unless overridden by environment.
-                                    uniq_sock="${LZO_DAEMON_SOCKET:-/tmp/lzo_gpu_daemon.sock}"
-                                    local daemon_env="LZO_DAEMON_SOCKET=${uniq_sock}"
-                                    if [ "${blk_kb}" -lt 64 ]; then
-                                        daemon_env="$daemon_env LZO_MIN_BLOCK_SIZE=${blk_kb}KB"
-                                    fi
-
-                                    for coalesce in "${COALESCE_OPTIONS[@]}"; do
-                                        for stdio_buf in "${STDIO_BUF_OPTIONS[@]}"; do
-                                            local daemon_env_ext="$daemon_env"
-                                            local config_ext="${config}_mt${mt_threads}_co${coalesce}_sbuf${stdio_buf}"
-                                            if ! start_daemon "$daemon_env_ext"; then
-                                                echo -e "  ${RED}Daemon start failed for $config (coalesce=$coalesce,sbuf=$stdio_buf)${NC}"
-                                                continue
-                                            fi
-
-                                            # client per-request env vars - use the actual socket used by the daemon (SCAN_DAEMON_SOCKET)
-                                            local socket_used="${SCAN_DAEMON_SOCKET:-${uniq_sock}}"
-                                            local env_vars="LZO_DAEMON_SOCKET=${socket_used} LZO_MT_IO=${mt_io} LZO_STANDARD_COPY=${copy_mode} LZO_COALESCE_OUTPUT=${coalesce} LZO_STDIO_BUF_MB=${stdio_buf}"
-                                            if [ "${mt_io}" -eq 1 ]; then
-                                                env_vars="$env_vars LZO_MT_IO_THREADS=${mt_threads}"
-                                            else
-                                                mt_threads="NA"
-                                            fi
-                                            if [ "${blk_kb}" -lt 64 ]; then
-                                                env_vars="$env_vars LZO_MIN_BLOCK_SIZE=${blk_kb}KB"
-                                            fi
-
-                                            local cli_args_comp="-a ${alg} -l ${lvl} -B ${blk_kb}KB --local 1"
-                                            local cli_args_decomp="-a ${alg} -l ${lvl} -B ${blk_kb}KB --local ${lsz}"
-
-                                            # run compression via client
-                                            local comp_out
-                                            comp_out=$(cd "$LZO_GPU_DIR" && env $env_vars "$LZO_GPU_CLIENT" ${cli_args_comp} "$sample" -o "$tmp_lzo" 2>&1)
-                                            local comp_perf
-                                            comp_perf=$(extract_perf "$comp_out")
-
-                                            # Sanity-check: ensure perf extractor produced expected number of comma-separated fields
-                                            local expected_fields=20
-                                            local comp_fields
-                                            comp_fields=$(awk -F, '{print NF}' <<< "$comp_perf")
-                                            if [ "$comp_fields" -ne "$expected_fields" ]; then
-                                                echo "  ${YELLOW}[WARN] Unexpected comp_perf field count: $comp_fields != $expected_fields (${config_ext})${NC}" >&2
-                                                mkdir -p "$RESULTS_DIR/debug" >/dev/null 2>&1 || true
-                                                printf "=== COMP OUT (%s) ===\n%s\n\n=== PERF ===\n%s\n" "$config_ext" "$comp_out" "$comp_perf" > "$RESULTS_DIR/debug/${sample_name}_${config_ext}_comp_raw.txt"
-                                            fi
-
-                                            # run decompression via client
-                                            local decomp_out
-                                            decomp_out=$(cd "$LZO_GPU_DIR" && env $env_vars "$LZO_GPU_CLIENT" ${cli_args_decomp} -d "$tmp_lzo" -o "$tmp_out" 2>&1)
-                                            local decomp_perf
-                                            decomp_perf=$(extract_perf "$decomp_out")
-
-                                            # Sanity-check decomp perf fields as well
-                                            local decomp_fields
-                                            decomp_fields=$(awk -F, '{print NF}' <<< "$decomp_perf")
-                                            if [ "$decomp_fields" -ne "$expected_fields" ]; then
-                                                echo "  ${YELLOW}[WARN] Unexpected decomp_perf field count: $decomp_fields != $expected_fields (${config_ext})${NC}" >&2
-                                                mkdir -p "$RESULTS_DIR/debug" >/dev/null 2>&1 || true
-                                                printf "=== DECOMP OUT (%s) ===\n%s\n\n=== PERF ===\n%s\n" "$config_ext" "$decomp_out" "$decomp_perf" > "$RESULTS_DIR/debug/${sample_name}_${config_ext}_decomp_raw.txt"
-                                            fi
-
-                                            local verified
-                                            verified=$(verify_output "$sample" "$tmp_out" | tr -d '\r')
-
-                                            stop_daemon
-
-                                            # parse and write CSV
-                                            IFS=',' read -r c_tp c_ktp c_tt c_kt c_rt c_wt c_ut c_dt c_ratio_frac c_ratio_pct c_kernel_name c_global c_local c_buf_in c_buf_out c_buf_len c_block_calc c_dl_len c_dl_bulk c_dl_total <<< "$comp_perf"
-                                            echo "$sample_name,$sample_size_mb,Daemon,$config_ext,compress,$alg,$blk_kb,NA,$mt_threads,$mt_io,$copy_mode,$coalesce,$stdio_buf,$c_ratio_frac,$c_ratio_pct,$c_tt,$c_kt,$c_rt,$c_wt,$c_ut,$c_dt,${c_kernel_name:-},${c_global:-},${c_local:-},${c_buf_in:-},${c_buf_out:-},${c_buf_len:-},${c_block_calc:-},${c_dl_len:-},${c_dl_bulk:-},${c_dl_total:-},$c_tp,$c_ktp,$verified" >> "$CSV_FILE"
-
-                                            IFS=',' read -r d_tp d_ktp d_tt d_kt d_rt d_wt d_ut d_dt d_ratio_frac d_ratio_pct d_kernel_name d_global d_local d_buf_in d_buf_out d_buf_len d_block_calc d_dl_len d_dl_bulk d_dl_total <<< "$decomp_perf"
-                                            echo "$sample_name,$sample_size_mb,Daemon,$config_ext,decompress,$alg,$blk_kb,NA,$mt_threads,$mt_io,$copy_mode,$coalesce,$stdio_buf,$d_ratio_frac,$d_ratio_pct,$d_tt,$d_kt,$d_rt,$d_wt,$d_ut,$d_dt,${d_kernel_name:-},${d_global:-},${d_local:-},${d_buf_in:-},${d_buf_out:-},${d_buf_len:-},${d_block_calc:-},${d_dl_len:-},${d_dl_bulk:-},${d_dl_total:-},$d_tp,$d_ktp,$verified" >> "$CSV_FILE"
-
-                                            local status="✓"
-                                            local status_color="$GREEN"
-                                            if [ "$verified" != "YES" ]; then
-                                                status="✗"
-                                                status_color="$RED"
-                                                # Always remove compressed and decompressed binary artifacts to avoid storage growth
-                                                rm -f "$tmp_lzo" "$tmp_out"
-
-                                                # Always preserve text logs for failures (comp/decomp stdout/stderr and perf)
-                                                local fail_dir="$RESULTS_DIR/failures/${sample_name}/${config_ext}"
-                                                mkdir -p "$fail_dir"
-                                                printf "=== COMP OUT (%s) ===\n%s\n\n=== PERF ===\n%s\n" "$config_ext" "$comp_out" "$comp_perf" > "$fail_dir/comp_raw.txt"
-                                                printf "=== DECOMP OUT (%s) ===\n%s\n\n=== PERF ===\n%s\n" "$config_ext" "$decomp_out" "$decomp_perf" > "$fail_dir/decomp_raw.txt"
-
-                                                # Also preserve any stdout/stderr capture files if present
-                                                [ -f "$tmp_out" ] && cp -f "$tmp_out" "$fail_dir/failed.out" 2>/dev/null || true
-                                            else
-                                                # Success: cleanup binary artifacts
-                                                rm -f "$tmp_lzo" "$tmp_out"
-                                                # In debug mode, preserve textual logs for successful runs
-                                                if [ "${PARAM_SCAN_DEBUG:-0}" = "1" ]; then
-                                                    local ok_dir="$RESULTS_DIR/debug_success/${sample_name}/${config_ext}"
-                                                    mkdir -p "$ok_dir"
-                                                    printf "=== COMP OUT (%s) ===\n%s\n\n=== PERF ===\n%s\n" "$config_ext" "$comp_out" "$comp_perf" > "$ok_dir/comp_raw.txt"
-                                                    printf "=== DECOMP OUT (%s) ===\n%s\n\n=== PERF ===\n%s\n" "$config_ext" "$decomp_out" "$decomp_perf" > "$ok_dir/decomp_raw.txt"
-                                                fi
-                                            fi
-                                            printf "  %-35s " "$config_ext"
-                                            echo -en "${status_color}${status}${NC} "
-                                            printf "COMP:%6.1f (k:%7.1f) [R: %s (%s%%)] | DECOMP:%6.1f (k:%7.1f)\n" "${c_tp:-0}" "${c_ktp:-0}" "${c_ratio_frac:-NA}" "${c_ratio_pct:-NA}" "${d_tp:-0}" "${d_ktp:-0}"
-                                        done
-                                    done
-                                done
-                            done
-                        done
-                    done
-                done
-            done
-        done
-}
-cleanup() {
-    stop_daemon
-    rm -f /tmp/pscan_*.lzo /tmp/pscan_*.out
-}
-trap cleanup EXIT
-
-# 提取性能数据
+# ========================================
+# 核心工具函数
+# ========================================
 extract_perf() {
     local output="$1"
-    local total_tp=$(echo "$output" | grep -oP 'Throughput\s*:\s*\K[\d.]+' | head -1)
-    local kernel_tp=$(echo "$output" | grep -oP 'kernel\s*:\s*\K[\d.]+' | head -1)
-    local total_time=$(echo "$output" | grep -oP 'TOTAL\s*:\s*\K[\d.]+' | head -1)
-    local kernel_time=$(echo "$output" | grep -oP 'Kernel Exec\s*:\s*\K[\d.]+' | head -1)
+    get_val() { echo "$output" | grep -oP "$1" | head -1 | awk '{print ($1==""?0:$1)}'; }
 
-    # Read & write times: standalone uses 'File Read', daemon may not. Use fallback.
-    local read_time=$(echo "$output" | grep -oP '1\.[ ]*File Read\s*:\s*\K[\d.]+' | head -1)
-    if [ -z "$read_time" ]; then
-        read_time=$(echo "$output" | grep -oP '1\.[ ]*Buffer Alloc\s*:\s*\K[\d.]+' | head -1)
-    fi
-    local write_time=$(echo "$output" | grep -oP '[0-9]+\.[ ]*File Write\s*:\s*\K[\d.]+' | head -1)
+    local total_tp=$(get_val 'Throughput\s*:\s*\K[0-9.]+')
+    local kernel_tp=$(get_val 'kernel\s*:\s*\K[0-9.]+')
+    local total_time=$(get_val 'TOTAL\s*:\s*\K[0-9.]+')
+    local kernel_time=$(get_val '(Kernel Exec|Compress|Decompress)\s*:\s*\K[0-9.]+')
+    local d_total=$(get_val 'daemon\s*:\s*\K[0-9.]+')
+    local t_read=$(get_val 'File Read\s*:\s*\K[0-9.]+')
+    local t_write=$(get_val 'File Write\s*:\s*\K[0-9.]+')
+    local ratio_pct=$(echo "$output" | grep -oP '(Compression ratio\s*:\s*|\[)\K[0-9.]+' | head -1 | awk '{print ($1==""?0:$1)}')
 
-    # Upload/download times: look for several variants
-    local upload_time=$(echo "$output" | grep -oP 'Data Upload\s*:\s*\K[\d.]+' | head -1)
-    if [ -z "$upload_time" ]; then
-        upload_time=$(echo "$output" | grep -oP 'Data Upload.*\(total\)\s*:\s*\K[\d.]+' | head -1)
+    local t_io=$(echo "$t_read + $t_write" | bc 2>/dev/null || echo 0)
+    local t_mem=0
+    if (( $(echo "$d_total > 0" | bc -l 2>/dev/null || echo 0) )); then
+        t_mem=$(echo "$d_total - $kernel_time" | bc 2>/dev/null || echo 0)
+    else
+        local t_alloc=$(get_val 'Buffer Alloc[^:]*:\s*\K[0-9.]+')
+        local t_up=$(get_val 'Upload\s*:\s*\K[0-9.]+')
+        local t_dl=$(get_val 'Download\s*:\s*\K[0-9.]+')
+        t_mem=$(echo "$t_alloc + $t_up + $t_dl" | bc 2>/dev/null || echo 0)
     fi
-    # Download time: try several numeric patterns in order. Avoid alternation that can
-    # accidentally match literal labels like 'Download (len)' which would break CSV layout.
-    local download_time=""
-    download_time=$(echo "$output" | grep -oP 'Data Download\s*:\s*\K[0-9.]+' | head -1)
-    if [ -z "$download_time" ]; then
-        download_time=$(echo "$output" | grep -oP 'Download Total\s*:\s*\K[0-9.]+' | head -1)
-    fi
-    if [ -z "$download_time" ]; then
-        download_time=$(echo "$output" | grep -oP 'Download \(bulk\)\s*:\s*\K[0-9.]+' | head -1)
-    fi
-    if [ -z "$download_time" ]; then
-        download_time=$(echo "$output" | grep -oP 'Download \(len\)\s*:\s*\K[0-9.]+' | head -1)
-    fi
-    if [ -z "$download_time" ]; then
-        download_time=$(echo "$output" | grep -oP 'Download\s*:\s*\K[0-9.]+' | head -1)
-    fi
-
-    # compression ratio - parse both fraction (e.g., 4.70:1 or '4.70 : 1') and percent (e.g., 21.28%)
-    local ratio_frac=""
-    local ratio_pct=""
-    # Grab the first Compression ratio line (case-insensitive) if present
-    local ratio_line=$(echo "$output" | grep -m1 -i 'Compression ratio' || true)
-    if [ -n "$ratio_line" ]; then
-        # parse fraction like '4.70:1' or '4.70 : 1' and normalize (remove spaces)
-        ratio_frac=$(echo "$ratio_line" | grep -oP '[0-9.]+\s*:\s*[0-9.]+' | head -1 | tr -d ' ' || true)
-        # parse percent anywhere on the line (e.g., '21.28%')
-        ratio_pct=$(echo "$ratio_line" | grep -oP '[0-9.]+(?=%)' | head -1 || true)
-    fi
-    # fallback: try to capture percent from the 'Compressed ... (xx%)' style line if not present
-    if [ -z "$ratio_pct" ]; then
-        ratio_pct=$(echo "$output" | grep -oP 'Compressed .*\(\s*\K[0-9.]+(?=%)' | head -1 || true)
-    fi
-    # if we couldn't find a fraction but have percent, derive fraction as 100/percent
-    if [ -z "$ratio_frac" ] && [ -n "$ratio_pct" ]; then
-        if awk "BEGIN {exit !($ratio_pct+0 > 0)}"; then
-            local computed_frac=$(awk "BEGIN {printf \"%.2f\", 100.0 / $ratio_pct}")
-            ratio_frac="${computed_frac}:1"
-        fi
-    fi
-    # final fallback: try a simpler numeric fallback on the "Compression ratio" line
-    if [ -z "$ratio_frac" ]; then
-        ratio_frac=$(echo "$output" | grep -oP 'Compression ratio\s*:\s*\K[0-9.]+' | head -1 || true)
-        if [ -n "$ratio_frac" ]; then
-            ratio_frac="${ratio_frac}:1"
-        fi
-    fi
-    # expansion ratio fallback for percent if still empty
-    if [ -z "$ratio_pct" ]; then
-        ratio_pct=$(echo "$output" | grep -oP 'Expansion ratio.*:\s*\K[0-9.]+' | head -1 || true)
-    fi
-
-    # kernel metadata: kernel name, workgroups
-    local kernel_name=$(echo "$output" | grep -oP '^\s*Kernel\s*:\s*\K[^\s]+' | head -1)
-    if [ -z "$kernel_name" ]; then
-        kernel_name=$(echo "$output" | grep -oP '^Kernel\s*:\s*\K[^\s]+' | head -1)
-    fi
-    # Work groups
-    local global_size=$(echo "$output" | grep -oP 'Work groups\s*:\s*global=\K[\d]+' | head -1)
-    local local_size=$(echo "$output" | grep -oP 'Work groups\s*:\s*.*local=\K[\d]+' | head -1)
-
-    # buffer allocs: in/out/len
-    local buffer_in=$(echo "$output" | grep -oP 'Buffer Alloc \(in\)\s*:\s*\K[0-9.]+' | head -1)
-    local buffer_out=$(echo "$output" | grep -oP 'Buffer Alloc \(out\)\s*:\s*\K[0-9.]+' | head -1)
-    local buffer_len=$(echo "$output" | grep -oP 'Buffer Alloc \(len\)\s*:\s*\K[0-9.]+' | head -1)
-    # fallback: single 'Buffer Alloc' generic timing
-    if [ -z "$buffer_in" ]; then buffer_in=$(echo "$output" | grep -oP 'Buffer Alloc\s*:\s*\K[0-9.]+' | head -1); fi
-    if [ -z "$buffer_out" ]; then buffer_out=$buffer_in; fi
-    if [ -z "$buffer_len" ]; then buffer_len=$buffer_in; fi
-
-    # blocking calc & download len/bulk
-    local block_calc=$(echo "$output" | grep -oP 'Blocking Calc\s*:\s*\K[0-9.]+' | head -1)
-    local dl_len=$(echo "$output" | grep -oP 'Download \(len\)\s*:\s*\K[0-9.]+' | head -1)
-    local dl_bulk=$(echo "$output" | grep -oP 'Download \(bulk\)\s*:\s*\K[0-9.]+' | head -1)
-    local dl_total=$(echo "$output" | grep -oP 'Download Total\s*:\s*\K[0-9.]+' | head -1)
-
-    # defaults
-    total_tp=${total_tp:-0}; kernel_tp=${kernel_tp:-0}; total_time=${total_time:-0}; kernel_time=${kernel_time:-0}
-    read_time=${read_time:-0}; write_time=${write_time:-0}; upload_time=${upload_time:-0}; download_time=${download_time:-0}; ratio_frac=${ratio_frac:-NA}; ratio_pct=${ratio_pct:-0}
-    kernel_name=${kernel_name:-""}; global_size=${global_size:-0}; local_size=${local_size:-0}
-    buffer_in=${buffer_in:-0}; buffer_out=${buffer_out:-0}; buffer_len=${buffer_len:-0}; block_calc=${block_calc:-0}
-    dl_len=${dl_len:-0}; dl_bulk=${dl_bulk:-0}; dl_total=${dl_total:-0}
-
-    # Output: all fields comma-separated
-    echo "${total_tp},${kernel_tp},${total_time},${kernel_time},${read_time},${write_time},${upload_time},${download_time},${ratio_frac},${ratio_pct},${kernel_name},${global_size},${local_size},${buffer_in},${buffer_out},${buffer_len},${block_calc},${dl_len},${dl_bulk},${dl_total}"
+    echo "$total_tp,$kernel_tp,$total_time,$kernel_time,$t_io,$t_mem,$ratio_pct"
 }
 
 verify_output() {
-    local orig="$1"
-    local out="$2"
-    if [ -f "$out" ]; then
-        local orig_md5=$(md5sum "$orig" | awk '{print $1}')
-        local out_md5=$(md5sum "$out" | awk '{print $1}')
-        [ "$orig_md5" = "$out_md5" ] && echo "YES" || echo "NO"
-    else
-        echo "NO"
-    fi
+    local original="$1"
+    local decompressed="$2"
+    if [ ! -f "$decompressed" ]; then echo "FAIL"; return; fi
+    if cmp -s "$original" "$decompressed"; then echo "YES"; else echo "NO"; fi
 }
 
-# ========================================
-# 初始化 CSV
-# ========================================
 init_csv() {
-    mkdir -p "$RESULTS_DIR"
-    echo "sample,size_mb,tool,config,mode,algorithm,block_kb,threads,mt_threads,mt_io,copy_mode,coalesce,stdio_buf_mb,ratio_frac,ratio_pct,total_time_ms,kernel_time_ms,read_time_ms,write_time_ms,upload_time_ms,download_time_ms,kernel_name,global_size,local_size,buffer_alloc_in_ms,buffer_alloc_out_ms,buffer_alloc_len_ms,blocking_calc_ms,download_len_ms,download_bulk_ms,download_total_ms,total_throughput_mbps,kernel_throughput_mbps,verified" > "$CSV_FILE"
+    echo "sample,size_mb,tool,mode,alg,level,block_kb,lsz,ratio_pct,mbps_total,mbps_kernel,t_total,t_kernel,t_io,t_mem,verified" > "$CSV_FILE"
 }
 
 # ========================================
-# CPU 测试
+# 启动/停止守护进程
+# ========================================
+start_daemon() {
+    local env_vars="${1:-}"
+    local sock=$(echo "$env_vars" | grep -oP 'LZO_DAEMON_SOCKET=\K[^ ]+' || echo "/tmp/lzo_gpu_daemon.sock")
+    if pgrep -f "lzo_gpu --daemon" > /dev/null; then pkill -f "lzo_gpu --daemon"; sleep 1; fi
+    (cd "$LZO_GPU_DIR" && env $env_vars "$LZO_GPU" --daemon --verbose > /tmp/lzo_daemon.log 2>&1 &)
+    for i in {1..10}; do if [ -S "$sock" ]; then return 0; fi; sleep 0.5; done
+    return 1
+}
+
+# ========================================
+# 测试逻辑
 # ========================================
 test_cpu() {
     local sample="$1"
     local sample_name=$(basename "$sample")
-    local sample_size_mb=$(echo "scale=2; $(stat -Lc%s "$sample") / 1048576" | bc)
-
+    local sz_mb=$(echo "scale=2; $(stat -Lc%s "$sample") / 1048576" | bc)
     echo -e "\n${CYAN}=== CPU Tests: $sample_name ===${NC}"
-
-    for threads in "${CPU_THREADS[@]}"; do
-        for alg in "${ALGORITHMS[@]}"; do
-            local config="cpu_t${threads}_${alg}"
-            local tmp_lzo="/tmp/pscan_${sample_name}.lzo"
-            local tmp_out="/tmp/pscan_${sample_name}.out"
-
-            # 压缩
-            local comp_out=$("$LZO_CPU" -t "$threads" -a "$alg" "$sample" -o "$tmp_lzo" 2>&1)
-            local comp_perf=$(extract_perf "$comp_out")
-
-            # 解压
-            local decomp_out=$("$LZO_CPU" -t "$threads" -d "$tmp_lzo" -o "$tmp_out" 2>&1)
-            local decomp_perf=$(extract_perf "$decomp_out")
-
-            local verified=$(verify_output "$sample" "$tmp_out" | tr -d '\r')
-
-            # 解析压缩性能
-            IFS=',' read -r c_tp c_ktp c_tt c_kt c_rt c_wt c_ut c_dt c_ratio_frac c_ratio_pct c_kernel_name c_global c_local c_buf_in c_buf_out c_buf_len c_block_calc c_dl_len c_dl_bulk c_dl_total <<< "$comp_perf"
-            # Ensure numeric fields are explicit to avoid empty fields shifting CSV columns
-            echo "$sample_name,$sample_size_mb,CPU,$config,compress,$alg,NA,$threads,NA,NA,NA,NA,NA,${c_ratio_frac:-NA},${c_ratio_pct:-0},${c_tt:-0},${c_kt:-0},${c_rt:-0},${c_wt:-0},${c_ut:-0},${c_dt:-0},${c_kernel_name:-},${c_global:-0},${c_local:-0},${c_buf_in:-0},${c_buf_out:-0},${c_buf_len:-0},${c_block_calc:-0},${c_dl_len:-0},${c_dl_bulk:-0},${c_dl_total:-0},${c_tp:-0},${c_ktp:-0},${verified:-NO}" >> "$CSV_FILE"
-
-            # 解析解压性能
-            IFS=',' read -r d_tp d_ktp d_tt d_kt d_rt d_wt d_ut d_dt d_ratio_frac d_ratio_pct d_kernel_name d_global d_local d_buf_in d_buf_out d_buf_len d_block_calc d_dl_len d_dl_bulk d_dl_total <<< "$decomp_perf"
-            echo "$sample_name,$sample_size_mb,CPU,$config,decompress,$alg,NA,$threads,NA,NA,NA,NA,NA,${d_ratio_frac:-NA},${d_ratio_pct:-0},${d_tt:-0},${d_kt:-0},${d_rt:-0},${d_wt:-0},${d_ut:-0},${d_dt:-0},${d_kernel_name:-},${d_global:-0},${d_local:-0},${d_buf_in:-0},${d_buf_out:-0},${d_buf_len:-0},${d_block_calc:-0},${d_dl_len:-0},${d_dl_bulk:-0},${d_dl_total:-0},${d_tp:-0},${d_ktp:-0},${verified:-NO}" >> "$CSV_FILE"
-
-            local status="✓"
-            local status_color="$GREEN"
-            if [ "$verified" != "YES" ]; then
-                status="✗"
-                status_color="$RED"
-                if [ "${PARAM_SCAN_DEBUG:-0}" = "1" ]; then
-                    local fail_dir="$RESULTS_DIR/failures/${sample_name}/${config}"
-                    mkdir -p "$fail_dir"
-                    [ -f "$tmp_lzo" ] && mv "$tmp_lzo" "$fail_dir/failed.lzo"
-                    [ -f "$tmp_out" ] && mv "$tmp_out" "$fail_dir/failed.out"
-                else
-                    # Not debugging: delete temp artifacts to avoid storage growth
-                    rm -f "$tmp_lzo" "$tmp_out"
-                fi
-            else
-                # Success: cleanup temp artifacts
-                rm -f "$tmp_lzo" "$tmp_out"
-            fi
-            printf "  %-20s " "$config"
-            echo -en "${status_color}${status}${NC} "
-            printf "COMP: %7.1f MB/s (k:%7.1f) [R: %s (%s%%)] | DECOMP: %7.1f MB/s (k:%7.1f)\n" "${c_tp:-0}" "${c_ktp:-0}" "${c_ratio_frac:-NA}" "${c_ratio_pct:-0}" "${d_tp:-0}" "${d_ktp:-0}"
+    for blk in "${BLOCK_SIZES[@]}"; do
+    for alg in "${ALGORITHMS[@]}"; do
+    for lvl_n in "${LEVEL_NAMES[@]}"; do
+        case "$lvl_n" in "1k") d_lvl="11" ;; "1l") d_lvl="12" ;; "1") d_lvl="14" ;; "1o") d_lvl="15" ;; *) d_lvl="$lvl_n" ;; esac
+        for thr in "${CPU_THREADS[@]}"; do
+            local cfg="cpu_${alg}_L${d_lvl}_B${blk}k_T${thr}"
+            local tmp_lzo="/tmp/pscan.lzo"; local tmp_out="/tmp/pscan.out"
+            local cout=$("$LZO_CPU" -a "$alg" -l "$lvl_n" -B "${blk}KB" -t "$thr" "$sample" -o "$tmp_lzo" 2>&1)
+            local cp=$(extract_perf "$cout")
+            local dout=$("$LZO_CPU" -a "$alg" -d -B "${blk}KB" -t "$thr" "$tmp_lzo" -o "$tmp_out" 2>&1)
+            local dp=$(extract_perf "$dout")
+            local ver=$(verify_output "$sample" "$tmp_out")
+            IFS=',' read -r c_tp c_ktp c_tt c_kt c_tio c_tmem c_ratio <<< "$cp"
+            IFS=',' read -r d_tp d_ktp d_tt d_kt d_tio d_tmem d_ratio <<< "$dp"
+            echo "$sample_name,$sz_mb,CPU,compress,$alg,$d_lvl,$blk,$thr,$c_ratio,$c_tp,$c_ktp,$c_tt,$c_kt,$c_tio,$c_tmem,$ver" >> "$CSV_FILE"
+            echo "$sample_name,$sz_mb,CPU,decompress,$alg,$d_lvl,$blk,$thr,$d_ratio,$d_tp,$d_ktp,$d_tt,$d_kt,$d_tio,$d_tmem,$ver" >> "$CSV_FILE"
+            printf "  %-35s %b COMP:%6.1f (k:%7.1f) [R: %s%%] | DECOMP:%6.1f (k:%7.1f)\n" "$cfg" "$GREEN✓$NC" "$c_tp" "$c_ktp" "$c_ratio" "$d_tp" "$d_ktp"
+            rm -f "$tmp_lzo" "$tmp_out"
         done
+    done
+    done
     done
 }
 
-# ========================================
-# GPU Standalone 测试
-# ========================================
 test_gpu_standalone() {
     local sample="$1"
     local sample_name=$(basename "$sample")
-    local sample_size_mb=$(echo "scale=2; $(stat -Lc%s "$sample") / 1048576" | bc)
-
-    echo -e "\n${CYAN}=== GPU Standalone Tests: $sample_name ===${NC}"
-
+    local sz_mb=$(echo "scale=2; $(stat -Lc%s "$sample") / 1048576" | bc)
+    echo -e "\n${CYAN}=== GPU Standalone: $sample_name ===${NC}"
+    for blk in "${BLOCK_SIZES[@]}"; do
     for alg in "${ALGORITHMS[@]}"; do
-        for lvl in "${LEVELS[@]}"; do
-            for blk_kb in "${BLOCK_SIZES[@]}"; do
-                for lsz in "${LOCAL_SIZES[@]}"; do
-                    for mt_io in "${MT_IO_OPTIONS[@]}"; do
-                        for copy_mode in "${COPY_MODES[@]}"; do
-                            for mt_threads in "${MT_IO_THREADS_OPTIONS[@]}"; do
-local io_mode="zerocopy"; [ "$copy_mode" = "1" ] && io_mode="stdcopy"
-                local mt_tag="single"; [ "$mt_io" = "1" ] && mt_tag="mt"
-                local config="gpu_${alg}_lvl${lvl}_blk${blk_kb}k_local${lsz}_${io_mode}_${mt_tag}"
-
-                                local tmp_lzo="/tmp/pscan_${sample_name}.lzo"
-                                local tmp_out="/tmp/pscan_${sample_name}.out"
-
-                                # Base env for this test - mt_io may be 0/1
-                                local env_vars="LZO_MT_IO=${mt_io} LZO_STANDARD_COPY=${copy_mode}"
-                                if [ "${mt_io}" -eq 1 ]; then
-                                    env_vars="$env_vars LZO_MT_IO_THREADS=${mt_threads}"
-                                else
-                                    # For reporting purposes, record NA when mt_io is disabled
-                                    mt_threads="NA"
-                                fi
-
-                                for coalesce in "${COALESCE_OPTIONS[@]}"; do
-                                    for stdio_buf in "${STDIO_BUF_OPTIONS[@]}"; do
-                                        local env_vars_ext="$env_vars LZO_COALESCE_OUTPUT=${coalesce} LZO_STDIO_BUF_MB=${stdio_buf}"
-                                        local config_ext="${config}_mt${mt_threads}_co${coalesce}_sbuf${stdio_buf}"
-
-                                            # If min block size smaller that default 64KB requested, allow via env override
-                                            if [ "${blk_kb}" -lt 64 ]; then
-                                                env_vars_ext="$env_vars_ext LZO_MIN_BLOCK_SIZE=${blk_kb}KB"
-                                            fi
-
-                                            # For compression, local must be 1; for decompression, use requested local
-                                            local cli_args_comp="-a ${alg} -L ${lvl} -B ${blk_kb}KB --local 1"
-                                            local cli_args_decomp="-a ${alg} -L ${lvl} -B ${blk_kb}KB --local ${lsz}"
-
-                                            # 压缩
-                                            local comp_out
-                                            comp_out=$(cd "$LZO_GPU_DIR" && env $env_vars_ext "$LZO_GPU" ${cli_args_comp} "$sample" -o "$tmp_lzo" 2>&1)
-                                            local comp_perf
-                                            comp_perf=$(extract_perf "$comp_out")
-
-                                            # parse comp_perf into array and then assign
-                                            IFS=',' read -ra CPERF_ARR <<< "$comp_perf"
-                                            local c_tp="${CPERF_ARR[0]}"
-                                            local c_ktp="${CPERF_ARR[1]}"
-                                            local c_tt="${CPERF_ARR[2]}"
-                                            local c_kt="${CPERF_ARR[3]}"
-                                            local c_rt="${CPERF_ARR[4]}"
-                                            local c_wt="${CPERF_ARR[5]}"
-                                            local c_ut="${CPERF_ARR[6]}"
-                                            local c_dt="${CPERF_ARR[7]}"
-                                            local c_ratio_frac="${CPERF_ARR[8]}"
-                                            local c_ratio_pct="${CPERF_ARR[9]}"
-                                            local c_kernel_name="${CPERF_ARR[10]}"
-                                            local c_global="${CPERF_ARR[11]}"
-                                            local c_local="${CPERF_ARR[12]}"
-                                            local c_buf_in="${CPERF_ARR[13]}"
-                                            local c_buf_out="${CPERF_ARR[14]}"
-                                            local c_buf_len="${CPERF_ARR[15]}"
-                                            local c_block_calc="${CPERF_ARR[16]}"
-                                            local c_dl_len="${CPERF_ARR[17]}"
-                                            local c_dl_bulk="${CPERF_ARR[18]}"
-                                            local c_dl_total="${CPERF_ARR[19]}"
-
-                                            # 解压
-                                            local decomp_out
-                                            decomp_out=$(cd "$LZO_GPU_DIR" && env $env_vars_ext "$LZO_GPU" ${cli_args_decomp} -d "$tmp_lzo" -o "$tmp_out" 2>&1)
-                                            local decomp_perf
-                                            decomp_perf=$(extract_perf "$decomp_out")
-                                            IFS=',' read -ra DPERF_ARR <<< "$decomp_perf"
-                                            local d_tp="${DPERF_ARR[0]}"
-                                            local d_ktp="${DPERF_ARR[1]}"
-                                            local d_tt="${DPERF_ARR[2]}"
-                                            local d_kt="${DPERF_ARR[3]}"
-                                            local d_rt="${DPERF_ARR[4]}"
-                                            local d_wt="${DPERF_ARR[5]}"
-                                            local d_ut="${DPERF_ARR[6]}"
-                                            local d_dt="${DPERF_ARR[7]}"
-                                            local d_ratio_frac="${DPERF_ARR[8]}"
-                                            local d_ratio_pct="${DPERF_ARR[9]}"
-                                            local d_kernel_name="${DPERF_ARR[10]}"
-                                            local d_global="${DPERF_ARR[11]}"
-                                            local d_local="${DPERF_ARR[12]}"
-                                            local d_buf_in="${DPERF_ARR[13]}"
-                                            local d_buf_out="${DPERF_ARR[14]}"
-                                            local d_buf_len="${DPERF_ARR[15]}"
-                                            local d_block_calc="${DPERF_ARR[16]}"
-                                            local d_dl_len="${DPERF_ARR[17]}"
-                                            local d_dl_bulk="${DPERF_ARR[18]}"
-                                            local d_dl_total="${DPERF_ARR[19]}"
-
-                                            local verified
-                                            verified=$(verify_output "$sample" "$tmp_out" | tr -d '\r')
-
-                                            # Write CSV lines including mt_threads
-                                            echo "$sample_name,$sample_size_mb,GPU,$config_ext,compress,$alg,$blk_kb,NA,$mt_threads,$mt_io,$copy_mode,$coalesce,$stdio_buf,$c_ratio_frac,$c_ratio_pct,$c_tt,$c_kt,$c_rt,$c_wt,$c_ut,$c_dt,${c_kernel_name:-},${c_global:-},${c_local:-},${c_buf_in:-},${c_buf_out:-},${c_buf_len:-},${c_block_calc:-},${c_dl_len:-},${c_dl_bulk:-},${c_dl_total:-},$c_tp,$c_ktp,$verified" >> "$CSV_FILE"
-
-                                            echo "$sample_name,$sample_size_mb,GPU,$config_ext,decompress,$alg,$blk_kb,NA,$mt_threads,$mt_io,$copy_mode,$coalesce,$stdio_buf,$d_ratio_frac,$d_ratio_pct,$d_tt,$d_kt,$d_rt,$d_wt,$d_ut,$d_dt,${d_kernel_name:-},${d_global:-},${d_local:-},${d_buf_in:-},${d_buf_out:-},${d_buf_len:-},${d_block_calc:-},${d_dl_len:-},${d_dl_bulk:-},${d_dl_total:-},$d_tp,$d_ktp,$verified" >> "$CSV_FILE"
-
-                                            local status="✓"
-                                            local status_color="$GREEN"
-                                            if [ "$verified" != "YES" ]; then
-                                                status="✗"
-                                                status_color="$RED"
-                                                if [ "${PARAM_SCAN_DEBUG:-0}" = "1" ]; then
-                                                    local fail_dir="$RESULTS_DIR/failures/${sample_name}/${config_ext}"
-                                                    mkdir -p "$fail_dir"
-                                                    [ -f "$tmp_lzo" ] && mv "$tmp_lzo" "$fail_dir/failed.lzo"
-                                                    [ -f "$tmp_out" ] && mv "$tmp_out" "$fail_dir/failed.out"
-                                                else
-                                                    # Not debugging: delete temp artifacts to avoid storage growth
-                                                    rm -f "$tmp_lzo" "$tmp_out"
-                                                fi
-                                            else
-                                                # Success: cleanup temp artifacts
-                                                rm -f "$tmp_lzo" "$tmp_out"
-                                            fi
-                                            printf "  %-45s " "$config_ext"
-                                            echo -en "${status_color}${status}${NC} "
-                                            printf "C:%6.1f K:%7.1f [R: %s (%s%%)] | D:%6.1f K:%7.1f\n" "${c_tp:-0}" "${c_ktp:-0}" "${c_ratio_frac:-NA}" "${c_ratio_pct:-NA}" "${d_tp:-0}" "${d_ktp:-0}"
-                                        done
-                                    done
-                                done
-                            done
-                        done
-                    done
-                done
-            done
+    for lvl in "${GPU_LEVELS[@]}"; do
+        for lsz in "${LOCAL_SIZES[@]}"; do
+            local cfg="gpu_${alg}_L${lvl}_B${blk}k_lsz${lsz}"
+            local tmp_lzo="/tmp/pscan.lzo"; local tmp_out="/tmp/pscan.out"
+            local cout=$(cd "$LZO_GPU_DIR" && "$LZO_GPU" --verbose -a "$alg" -L "$lvl" -B "${blk}KB" --local "$lsz" "$sample" -o "$tmp_lzo" 2>&1)
+            local cp=$(extract_perf "$cout")
+            local dout=$(cd "$LZO_GPU_DIR" && "$LZO_GPU" --verbose -d -a "$alg" -L "$lvl" -B "${blk}KB" --local "$lsz" "$tmp_lzo" -o "$tmp_out" 2>&1)
+            local dp=$(extract_perf "$dout")
+            local ver=$(verify_output "$sample" "$tmp_out")
+            IFS=',' read -r c_tp c_ktp c_tt c_kt c_tio c_tmem c_ratio <<< "$cp"
+            IFS=',' read -r d_tp d_ktp d_tt d_kt d_tio d_tmem d_ratio <<< "$dp"
+            echo "$sample_name,$sz_mb,GPU,compress,$alg,$lvl,$blk,$lsz,$c_ratio,$c_tp,$c_ktp,$c_tt,$c_kt,$c_tio,$c_tmem,$ver" >> "$CSV_FILE"
+            echo "$sample_name,$sz_mb,GPU,decompress,$alg,$lvl,$blk,$lsz,$d_ratio,$d_tp,$d_ktp,$d_tt,$d_kt,$d_tio,$d_tmem,$ver" >> "$CSV_FILE"
+            printf "  %-35s %b COMP:%6.1f (k:%7.1f) | DECOMP:%6.1f (k:%7.1f)\n" "$cfg" "$GREEN✓$NC" "$c_tp" "$c_ktp" "$d_tp" "$d_ktp"
+            rm -f "$tmp_lzo" "$tmp_out"
         done
+    done
+    done
+    done
 }
 
-# ========================================
-# 生成报告
-# ========================================
+test_gpu_daemon() {
+    local sample="$1"
+    local sample_name=$(basename "$sample")
+    local sz_mb=$(echo "scale=2; $(stat -Lc%s "$sample") / 1048576" | bc)
+    local sock="/tmp/lzo_daemon_$$.sock"
+    start_daemon "LZO_DAEMON_SOCKET=$sock" || return 1
+    echo -e "\n${CYAN}=== GPU Daemon: $sample_name ===${NC}"
+    for blk in "${BLOCK_SIZES[@]}"; do
+    for alg in "${ALGORITHMS[@]}"; do
+    for lvl in "${GPU_LEVELS[@]}"; do
+        for lsz in "${LOCAL_SIZES[@]}"; do
+            local cfg="daemon_${alg}_L${lvl}_B${blk}k_lsz${lsz}"
+            local tmp_lzo="/tmp/pscan.lzo"; local tmp_out="/tmp/pscan.out"
+            local cout=$(cd "$LZO_GPU_DIR" && env LZO_DAEMON_SOCKET=$sock "$LZO_GPU" --use-daemon --verbose -a "$alg" -L "$lvl" -B "${blk}KB" --local "$lsz" "$sample" -o "$tmp_lzo" 2>&1 || true)
+            local cp=$(extract_perf "$cout")
+            local dout=$(cd "$LZO_GPU_DIR" && env LZO_DAEMON_SOCKET=$sock "$LZO_GPU" --use-daemon --verbose -d -a "$alg" -L "$lvl" -B "${blk}KB" --local "$lsz" "$tmp_lzo" -o "$tmp_out" 2>&1 || true)
+            local dp=$(extract_perf "$dout")
+            local ver=$(verify_output "$sample" "$tmp_out")
+            IFS=',' read -r c_tp c_ktp c_tt c_kt c_tio c_tmem c_ratio <<< "$cp"
+            IFS=',' read -r d_tp d_ktp d_tt d_kt d_tio d_tmem d_ratio <<< "$dp"
+            echo "$sample_name,$sz_mb,Daemon,compress,$alg,$lvl,$blk,$lsz,$c_ratio,$c_tp,$c_ktp,$c_tt,$c_kt,$c_tio,$c_tmem,$ver" >> "$CSV_FILE"
+            echo "$sample_name,$sz_mb,Daemon,decompress,$alg,$lvl,$blk,$lsz,$d_ratio,$d_tp,$d_ktp,$d_tt,$d_kt,$d_tio,$d_tmem,$ver" >> "$CSV_FILE"
+            printf "  %-35s %b COMP:%6.1f | DECOMP:%6.1f\n" "$cfg" "$GREEN✓$NC" "$c_tp" "$d_tp"
+            rm -f "$tmp_lzo" "$tmp_out"
+        done
+    done
+    done
+    done
+    pkill -f "$sock" || true; rm -f "$sock"
+}
+
+merge_csv() {
+    local cpu_csv="$1"
+    local gpu_csv="$2"
+    local out_csv="${3:-$RESULTS_DIR/param_scan_merged_$(date +%Y%m%d_%H%M%S).csv}"
+    if [ ! -f "$cpu_csv" ]; then echo "ERROR: CPU CSV not found: $cpu_csv"; return 1; fi
+    if [ ! -f "$gpu_csv" ]; then echo "ERROR: GPU CSV not found: $gpu_csv"; return 1; fi
+    head -n 1 "$cpu_csv" > "$out_csv"
+    awk -F, 'NR>1 && toupper($3)=="CPU" {print}' "$cpu_csv" >> "$out_csv"
+    awk -F, 'NR>1 && toupper($3)!="CPU" {print}' "$gpu_csv" >> "$out_csv"
+    echo "Wrote merged CSV -> $out_csv"
+}
+
 generate_report() {
-    {
-        echo "========================================"
-        echo "   LZO Parameter Scan Report"
-        echo "   $(date)"
-        echo "========================================"
-        echo ""
+    local csv="${1:-$CSV_FILE}"
+    python3 - "$csv" <<'PY'
+import sys, csv, os, re, statistics, math
 
-        echo "=== Configuration Summary ==="
-        echo "Algorithms: ${ALGORITHMS[*]}"
-        echo "Block sizes: ${BLOCK_SIZES[*]} KB"
-        echo "CPU threads: ${CPU_THREADS[*]}"
-        echo "MT IO: ${MT_IO_OPTIONS[*]} (0=off, 1=on)"
-        echo "Copy modes: ${COPY_MODES[*]} (0=zerocopy, 1=stdcopy)"
-        echo ""
+# --- helpers ---
 
-        # Validate CSV shape (header NF must match every data row).
-        if [ -f "$CSV_FILE" ]; then
-            header_nf=$(head -n1 "$CSV_FILE" | awk -F, '{print NF}')
-            mismatch_count=$(awk -F, -v nf="$header_nf" 'NR>1 && NF!=nf {print NR ":" NF}' "$CSV_FILE" | wc -l)
-            if [ "$mismatch_count" -gt 0 ]; then
-                echo "ERROR: Found $mismatch_count CSV rows with incorrect field count (expected $header_nf). Please fix the generator; sanitization is not permitted." >&2
-                echo "Example mismatched rows:" >&2
-                awk -F, -v nf="$header_nf" 'NR>1 && NF!=nf {print "Row "NR" has "NF" fields; content: "$0; exit 0}' "$CSV_FILE" >&2
-                exit 1
-            fi
-        fi
+def to_float(s):
+    try:
+        return float(str(s).strip())
+    except:
+        try:
+            s2 = re.sub(r'[^0-9+\-.eE]', '', str(s))
+            return float(s2) if s2 else 0.0
+        except:
+            return 0.0
 
-        # Map CSV header names to column indices so AWK can use the right fields even when rows vary
-        IDX_TP=$(head -n1 "$CSV_FILE" | awk -F, '{for(i=1;i<=NF;i++) if ($i=="total_throughput_mbps") print i}')
-        IDX_KTP=$(head -n1 "$CSV_FILE" | awk -F, '{for(i=1;i<=NF;i++) if ($i=="kernel_throughput_mbps") print i}')
-        IDX_VER=$(head -n1 "$CSV_FILE" | awk -F, '{for(i=1;i<=NF;i++) if ($i=="verified") print i}')
+def to_int(s):
+    try:
+        return int(float(str(s).strip()))
+    except:
+        m = re.search(r"(\d+)", str(s))
+        return int(m.group(1)) if m else None
 
-        echo "=== Best Compression Configurations ==="
-        tail -n +2 "$CSV_FILE" | awk -F',' '
-        $5 == "compress" {
-            sample=$1; tool=$3; config=$4; tp=$(NF-2); ktp=$(NF-1)
-            key=sample"|"tool
-            if (tp+0 > best_tp[key]+0 || best_tp[key] == "") {
-                best_tp[key] = tp
-                best_ktp[key] = ktp
-                best_config[key] = config
-            }
-        }
-        END {
-            printf "%-40s | %-8s | %-45s | %12s | %12s\n", "Sample", "Tool", "Best Config", "Total MB/s", "Kernel MB/s"
-            printf "%-40s-+-%-8s-+-%-45s-+-%12s-+-%12s\n", "----------------------------------------", "--------", "---------------------------------------------", "------------", "------------"
-            for (key in best_tp) {
-                split(key, parts, "|")
-                printf "%-40s | %-8s | %-45s | %12.2f | %12.2f\n", parts[1], parts[2], best_config[key], best_tp[key], best_ktp[key]
-            }
-        }'
-        echo ""
+def median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    if n == 0:
+        return 0.0
+    if n % 2 == 1:
+        return xs[n//2]
+    return 0.5 * (xs[n//2 - 1] + xs[n//2])
 
-        echo "=== Best Decompression Configurations ==="
-        tail -n +2 "$CSV_FILE" | awk -F',' '
-        $5 == "decompress" {
-            sample=$1; tool=$3; config=$4; tp=$(NF-2); ktp=$(NF-1)
-            key=sample"|"tool
-            if (tp+0 > best_tp[key]+0 || best_tp[key] == "") {
-                best_tp[key] = tp
-                best_ktp[key] = ktp
-                best_config[key] = config
-            }
-        }
-        END {
-            printf "%-40s | %-8s | %-45s | %12s | %12s\n", "Sample", "Tool", "Best Config", "Total MB/s", "Kernel MB/s"
-            printf "%-40s-+-%-8s-+-%-45s-+-%12s-+-%12s\n", "----------------------------------------", "--------", "---------------------------------------------", "------------", "------------"
-            for (key in best_tp) {
-                split(key, parts, "|")
-                printf "%-40s | %-8s | %-45s | %12.2f | %12.2f\n", parts[1], parts[2], best_config[key], best_tp[key], best_ktp[key]
-            }
-        }'
-        echo ""
+def stddev(xs):
+    xs = list(xs)
+    if len(xs) <= 1:
+        return 0.0
+    try:
+        return statistics.stdev(xs)
+    except Exception:
+        return 0.0
 
-        echo "=== Block Size Analysis (GPU Compression) ==="
-        tail -n +2 "$CSV_FILE" | awk -F',' '
-        $3 == "GPU" && $5 == "compress" && $7 != "NA" {
-            blk=$7; tp=$(NF-2); ktp=$(NF-1)
-            count[blk]++
-            sum_tp[blk] += tp
-            sum_ktp[blk] += ktp
-        }
-        END {
-            printf "%-10s | %15s | %15s | %8s\n", "Block KB", "Avg Total MB/s", "Avg Kernel MB/s", "Tests"
-            printf "%-10s-+-%15s-+-%15s-+-%8s\n", "----------", "---------------", "---------------", "--------"
-            for (blk in count) {
-                printf "%-10s | %15.2f | %15.2f | %8d\n", blk, sum_tp[blk]/count[blk], sum_ktp[blk]/count[blk], count[blk]
-            }
-        }'
-        echo ""
+def summarize(xs, positive=False):
+    vals = [float(x) for x in xs if x is not None and (x > 0 if positive else True)]
+    n = len(vals)
+    if n == 0:
+        return {'n': 0, 'mean': 0.0, 'median': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0}
+    return {'n': n, 'mean': statistics.mean(vals), 'median': median(vals), 'std': stddev(vals), 'min': min(vals), 'max': max(vals)}
 
-        echo "=== Algorithm Analysis ==="
-        tail -n +2 "$CSV_FILE" | awk -F',' '
-        $5 == "compress" {
-            alg=$6; tool=$3; tp=$(NF-2); ktp=$(NF-1)
-            key=alg"|"tool
-            count[key]++
-            sum_tp[key] += tp
-            sum_ktp[key] += ktp
-        }
-        END {
-            printf "%-6s | %-8s | %15s | %15s | %8s\n", "Alg", "Tool", "Avg Total MB/s", "Avg Kernel MB/s", "Tests"
-            printf "%-6s-+-%-8s-+-%15s-+-%15s-+-%8s\n", "------", "--------", "---------------", "---------------", "--------"
-            for (key in count) {
-                split(key, parts, "|")
-                printf "%-6s | %-8s | %15.2f | %15.2f | %8d\n", parts[1], parts[2], sum_tp[key]/count[key], sum_ktp[key]/count[key], count[key]
-            }
-        }'
-        echo ""
+# --- read CSV ---
 
-        echo "=== IO Optimization Analysis (GPU) ==="
-        tail -n +2 "$CSV_FILE" | awk -F',' '
-        $3 == "GPU" && $5 == "compress" {
-            mt=$10; copy=$11
-            if (mt == "NA") mt = "0"
-            if (copy == "NA") copy = "0"
-            key=mt"|"copy
-            count[key]++
-            sum_tp[key] += $(NF-2)
-            sum_ktp[key] += $(NF-1)
-        }
-        END {
-            printf "%-6s | %-8s | %15s | %15s | %8s\n", "MT_IO", "CopyMode", "Avg Total MB/s", "Avg Kernel MB/s", "Tests"
-            printf "%-6s-+-%-8s-+-%15s-+-%15s-+-%8s\n", "------", "--------", "---------------", "---------------", "--------"
-            for (k in count) {
-                split(k, parts, "|")
-                mt = parts[1] == "0" ? "single" : "mt"
-                copy = parts[2] == "0" ? "zerocopy" : "stdcopy"
-                printf "%-6s | %-8s | %15.2f | %15.2f | %8d\n", mt, copy, sum_tp[k]/count[k], sum_ktp[k]/count[k], count[k]
-            }
-        }'
-        echo ""
+def read_csv(path):
+    with open(path, newline='') as f:
+        r = csv.DictReader(f)
+        rows = []
+        for row in r:
+            tool = row.get('tool','').strip().upper()
+            mode = row.get('mode','').strip().lower()
+            level = row.get('level','').strip()
+            level_int = to_int(level)
+            bk = to_int(row.get('block_kb',''))
+            lsz_raw = row.get('lsz','').strip()
+            lsz_int = to_int(lsz_raw)
+            rows.append({
+                'sample': row.get('sample','').strip(),
+                'size_mb': to_float(row.get('size_mb','0')),
+                'tool': tool,
+                'mode': mode,
+                'alg': row.get('alg','').strip(),
+                'level': level,
+                'level_int': level_int,
+                'block_kb': bk,
+                'lsz_raw': lsz_raw,
+                'lsz_int': lsz_int,
+                'ratio_pct': to_float(row.get('ratio_pct','0')),
+                'mbps_total': to_float(row.get('mbps_total','0')),
+                'mbps_kernel': to_float(row.get('mbps_kernel','0')),
+                't_total': to_float(row.get('t_total','0')),
+                't_kernel': to_float(row.get('t_kernel','0')),
+                't_io': to_float(row.get('t_io','0')),
+                't_mem': to_float(row.get('t_mem','0')),
+                'verified': row.get('verified','').strip()
+            })
+    return rows
 
-        echo "===  Analysis (Decompression) ==="
-        tail -n +2 "$CSV_FILE" | awk -F',' '
-        $5 == "decompress" && $9 != "NA" {
-            tool=$3; tp=$(NF-2); ktp=$(NF-1)
-            key=tool
-            count[key]++
-            sum_tp[key] += tp
-            sum_ktp[key] += ktp
-        }
-        END {
-            printf "%-8s | %15s | %15s | %8s\n", "Tool", "Avg Total MB/s", "Avg Kernel MB/s", "Tests"
-            printf "%-8s-+-%-8s-+-%15s-+-%15s-+-%8s\n", "--------", "--------", "---------------", "---------------", "--------"
-            for (key in count) {
-                split(key, parts, "|")
-                printf " %-8s | %15.2f | %15.2f | %8d\n", parts[2], sum_tp[key]/count[key], sum_ktp[key]/count[key], count[key]
-            }
-        }'
-        echo ""
+path = sys.argv[1]
+if not os.path.isfile(path):
+    print('ERROR: CSV not found:', path); sys.exit(2)
+rows = read_csv(path)
+results_dir = os.path.dirname(path) or '.'
+base = os.path.splitext(os.path.basename(path))[0]
 
-        echo "=== CPU Thread Scaling ==="
-        tail -n +2 "$CSV_FILE" | awk -F',' '
-        $3 == "CPU" && $5 == "compress" && $8 != "NA" {
-            threads=$8; tp=$(NF-2); ktp=$(NF-1)
-            count[threads]++
-            sum_tp[threads] += tp
-            sum_ktp[threads] += ktp
-        }
-        END {
-            printf "%-8s | %15s | %15s | %8s\n", "Threads", "Avg Total MB/s", "Avg Kernel MB/s", "Tests"
-            printf "%-8s-+-%15s-+-%15s-+-%8s\n", "--------", "---------------", "---------------", "--------"
-            for (t in count) {
-                printf "%-8d | %15.2f | %15.2f | %8d\n", t, sum_tp[t]/count[t], sum_ktp[t]/count[t], count[t]
-            }
-        }'
-        echo ""
+# capture stdout so we can save the full textual report to a file at the end
+import io
+buf = io.StringIO()
+old_stdout = sys.stdout
+class Tee:
+    def write(self, data):
+        buf.write(data)
+        old_stdout.write(data)
+    def flush(self):
+        old_stdout.flush()
+sys.stdout = Tee()
 
-        echo "=== Verification Summary ==="
-        tail -n +2 "$CSV_FILE" | awk -F',' '
-        { verified[$NF]++ }
-        END {
-            total = verified["YES"] + verified["NO"]
-            if (total > 0)
-                printf "Passed: %d / %d (%.1f%%)\n", verified["YES"], total, 100.0 * verified["YES"] / total
-            if (verified["NO"] > 0)
-                printf "FAILED: %d tests\n", verified["NO"]
-        }'
-        echo ""
+# counts
+print('='*120)
+print(' ' * 40 + 'LZO PERFORMANCE - EXTENDED SENSITIVITY REPORT')
+print('='*120)
+print(f"Input CSV: {path} | total rows: {len(rows)} | verified rows: {sum(1 for r in rows if r.get('verified','').upper()=='YES')}")
+print()
 
-        echo "=== Overall Performance Summary ==="
-        tail -n +2 "$CSV_FILE" | awk -F',' '
-        $5 == "compress" {
-            tool=$3; tp=$(NF-2); ktp=$(NF-1)
-            count[tool]++
-            sum_tp[tool] += tp
-            sum_ktp[tool] += ktp
-            if (tp+0 > max_tp[tool]+0) { max_tp[tool] = tp; max_config[tool] = $4 }
-        }
-        END {
-            printf "\n%-10s | %12s | %12s | %12s | %s\n", "Tool", "Avg MB/s", "Avg Kernel", "Max MB/s", "Best Config"
-            printf "%-10s-+-%12s-+-%12s-+-%12s-+-%s\n", "----------", "------------", "------------", "------------", "--------------------------------------------"
-            for (t in count) {
-                printf "%-10s | %12.2f | %12.2f | %12.2f | %s\n", t, sum_tp[t]/count[t], sum_ktp[t]/count[t], max_tp[t], max_config[t]
-            }
-        }'
+# --- Baselines ---
+cpu_all = [d for d in rows if d['tool']=='CPU' and d['mode']=='compress']
+gpu_all = [d for d in rows if d['tool']=='GPU' and d['mode']=='compress']
+daemon_all = [d for d in rows if d['tool']=='DAEMON' and d['mode']=='compress']
 
-    } | tee "$REPORT_FILE"
+print('[SECTION A] SYSTEM BASELINES (detailed)')
+# CPU per-thread stats
+cpu_thread_vals = sorted(set(d['lsz_int'] for d in cpu_all if d['lsz_int'] not in (None,0)))
+if cpu_thread_vals:
+    print('\nHost CPU thread breakdown:')
+    print('  T   | rows | total med/mean (std)  | kernel med/mean (std)')
+    print(' -----|------|----------------------|----------------------')
+    for t in cpu_thread_vals:
+        ds = [d for d in cpu_all if d['lsz_int']==t]
+        tot = summarize([d['mbps_total'] for d in ds], positive=True)
+        ker = summarize([d['mbps_kernel'] for d in ds], positive=True)
+        print(f"  T{t:<3} | {tot['n']:4d} | {tot['median']:6.1f}/{tot['mean']:6.1f} ({tot['std']:5.1f}) | {ker['median']:6.1f}/{ker['mean']:6.1f} ({ker['std']:5.1f})")
+else:
+    print('Host CPU Single-thread baseline not available')
 
-    echo ""
-    echo "Results saved to: $CSV_FILE"
-    echo "Report saved to: $REPORT_FILE"
+# GPU / Daemon baselines
+print('\nAggregated GPU (Standalone) and GPU Daemon baselines:')
+for name, ds in [('GPU Standalone', gpu_all), ('GPU Daemon', daemon_all)]:
+    tot = summarize([d['mbps_total'] for d in ds], positive=True)
+    ker = summarize([d['mbps_kernel'] for d in ds], positive=True)
+    print(f"  {name:<16} | rows={tot['n']:4d} | total med={tot['median']:6.1f} mean={tot['mean']:6.1f} | kernel med={ker['median']:6.1f} mean={ker['mean']:6.1f} std={ker['std']:5.1f}")
+
+# Combined kernel across GPU+Daemon
+combined_comp = [d for d in rows if d['tool'] in ('GPU','DAEMON') and d['mode']=='compress']
+combined_decomp = [d for d in rows if d['tool'] in ('GPU','DAEMON') and d['mode']=='decompress']
+comp_k = summarize([d['mbps_kernel'] for d in combined_comp], positive=True)
+dec_k = summarize([d['mbps_kernel'] for d in combined_decomp], positive=True)
+comp_ratio = summarize([d['ratio_pct'] for d in combined_comp], positive=True)
+print('\nCombined Kernel Throughput (GPU + Daemon):')
+print(f"  Compress kernel med={comp_k['median']:6.1f} mean={comp_k['mean']:6.1f} std={comp_k['std']:5.1f} rows={comp_k['n']:4d} | Ratio med={comp_ratio['median']:5.2f}%")
+print(f"  Decompress kernel med={dec_k['median']:6.1f} mean={dec_k['mean']:6.1f} std={dec_k['std']:5.1f} rows={dec_k['n']:4d}")
+print('\nNote: Kernel throughput values are combined across GPU Standalone and Daemon (same kernel). Use per-tool Total MB/s for CPU comparisons.')
+
+# per-alg
+algs = sorted(set(d['alg'] for d in rows if d['alg']))
+if algs:
+    print('\nPer-algorithm baseline (combined kernel):')
+    print('alg | rows | kernel med/mean (std) | ratio med')
+    print('----|------|----------------------|-----------')
+    for a in algs:
+        ds = [d for d in combined_comp if d['alg']==a]
+        ker = summarize([d['mbps_kernel'] for d in ds], positive=True)
+        rat = summarize([d['ratio_pct'] for d in ds], positive=True)
+        print(f" {a:<3} | {ker['n']:4d} | {ker['median']:6.1f}/{ker['mean']:6.1f} ({ker['std']:5.1f}) | {rat['median']:7.2f}%")
+
+# SECTION B: factor sensitivity (show combined kernel, ratio and per-tool totals)
+print('\n[SECTION B] FACTOR SENSITIVITY (detailed)')
+
+def factor_table(rows, f_key, f_label):
+    print(f"\nFactor: {f_label}  (combined kernel metrics; totals by tool)")
+    for mode in ('compress','decompress'):
+        all_ds = [d for d in rows if d['tool'] in ('GPU','DAEMON') and d['mode']==mode and d.get(f_key) not in (None,'',0)]
+        if not all_ds:
+            print(f"  No data for mode {mode}")
+            continue
+        overall_k = summarize([d['mbps_kernel'] for d in all_ds], positive=True)
+        overall_r = summarize([d['ratio_pct'] for d in all_ds], positive=True) if mode == 'compress' else {'median':0.0}
+        vals = sorted(set(d[f_key] for d in all_ds if d[f_key] is not None), key=lambda x: (int(x) if (isinstance(x,(str,int)) and str(x).isdigit()) else str(x)))
+        print(f"\n  Mode: {mode.upper()} -> overall kernel med={overall_k['median']:.1f} MB/s")
+        print('  VAL   | rows | k_med | k_mean | k_std | ratio_med% | totGPU_med | totDaemon_med | eff%')
+        print('  ------|------|-------|--------|-------|-----------|-----------|---------------|------')
+        kernel_meds = []
+        ratio_meds = []
+        for v in vals:
+            ds_val = [d for d in all_ds if d[f_key]==v]
+            ds_gpu = [d for d in ds_val if d['tool']=='GPU']
+            ds_daemon = [d for d in ds_val if d['tool']=='DAEMON']
+            ker = summarize([d['mbps_kernel'] for d in ds_val], positive=True)
+            rat = summarize([d['ratio_pct'] for d in ds_val], positive=True) if mode=='compress' else {'median':0.0, 'n':0, 'mean':0.0, 'std':0.0}
+            tot_gpu = summarize([d['mbps_total'] for d in ds_gpu], positive=True)
+            tot_daemon = summarize([d['mbps_total'] for d in ds_daemon], positive=True)
+            eff = (ker['median'] - overall_k['median'])/overall_k['median']*100 if overall_k['median']>0 else 0.0
+            kernel_meds.append(ker['median'])
+            if mode=='compress':
+                ratio_meds.append(rat['median'])
+            print(f"  {str(v):<5} | {ker['n']:4d} | {ker['median']:6.1f} | {ker['mean']:6.1f} | {ker['std']:6.1f} | {rat['median'] if mode=='compress' else 0.0:9.2f} | {tot_gpu['median']:9.1f} | {tot_daemon['median']:13.1f} | {eff:>+6.2f}%")
+        if kernel_meds:
+            rng = max(kernel_meds) - min(kernel_meds)
+            rng_pct = rng / overall_k['median'] * 100 if overall_k['median']>0 else 0
+            print(f"  Range across {f_label} (mode={mode}): {rng:.1f} MB/s ({rng_pct:.2f}% of overall kernel median)")
+        if mode=='compress' and ratio_meds:
+            rngr = max(ratio_meds) - min(ratio_meds)
+            rngr_pct = rngr / (overall_r['median'] if overall_r['median']>0 else 1.0) * 100
+            print(f"  Range across {f_label} (ratio): {rngr:.2f}% ({rngr_pct:.2f}% of overall ratio med)")
+
+factor_table(rows, 'block_kb', 'BlockSize')
+factor_table(rows, 'level_int', 'Level')
+factor_table(rows, 'lsz_int', 'LocalSize')
+factor_table(rows, 'alg', 'Algorithm')
+
+# SECTION C: LocalSize per-sample impact (compress + decompress + ratio)
+print('\n[SECTION C] LocalSize impact - increases and decreases (compress & decompress, ratio)')
+lsz_vals = sorted(set(d['lsz_int'] for d in rows if d['lsz_int'] not in (None,0)))
+samples = sorted(set(d['sample'] for d in rows))
+sample_impacts = []
+for s in sorted(set(d['sample'] for d in rows)):
+    ds_s_c = [d for d in rows if d['sample']==s and d['mode']=='compress' and d['tool'] in ('GPU','DAEMON')]
+    ds_s_d = [d for d in rows if d['sample']==s and d['mode']=='decompress' and d['tool'] in ('GPU','DAEMON')]
+    if not ds_s_c:
+        continue
+    per_lsz_c = {}
+    per_lsz_d = {}
+    per_lsz_r = {}
+    for l in lsz_vals:
+        vals_c = [d['mbps_kernel'] for d in ds_s_c if d['lsz_int']==l and d['mbps_kernel']>0]
+        if vals_c:
+            per_lsz_c[l] = median(vals_c)
+        vals_d = [d['mbps_kernel'] for d in ds_s_d if d['lsz_int']==l and d['mbps_kernel']>0]
+        if vals_d:
+            per_lsz_d[l] = median(vals_d)
+        vals_r = [d['ratio_pct'] for d in ds_s_c if d['lsz_int']==l and d['ratio_pct']>0]
+        if vals_r:
+            per_lsz_r[l] = median(vals_r)
+    if len(per_lsz_c) >= 2:
+        med_all = median(list(per_lsz_c.values()))
+        max_med = max(per_lsz_c.values())
+        min_med = min(per_lsz_c.values())
+        range_pct = (max_med - min_med)/med_all*100 if med_all>0 else 0.0
+        change_1_8 = None
+        if 1 in per_lsz_c and 8 in per_lsz_c and per_lsz_c[1]>0:
+            change_1_8 = (per_lsz_c[8] - per_lsz_c[1]) / per_lsz_c[1] * 100
+        sorted_items = sorted(per_lsz_c.items())
+        adj_changes = []
+        for i in range(len(sorted_items)-1):
+            a = sorted_items[i][1]; b = sorted_items[i+1][1]
+            if a>0:
+                adj_changes.append((b-a)/a*100)
+        max_adj = max(adj_changes) if adj_changes else 0.0
+        min_adj = min(adj_changes) if adj_changes else 0.0
+        d_range_pct = 0.0
+        if len(per_lsz_d) >= 2:
+            d_med_all = median(list(per_lsz_d.values()))
+            d_range_pct = (max(per_lsz_d.values()) - min(per_lsz_d.values()))/d_med_all*100 if d_med_all>0 else 0.0
+        r_range_pct = 0.0
+        if len(per_lsz_r) >= 2:
+            r_med_all = median(list(per_lsz_r.values()))
+            r_range_pct = (max(per_lsz_r.values()) - min(per_lsz_r.values()))/r_med_all*100 if r_med_all>0 else 0.0
+        sample_impacts.append({
+            'sample': s,
+            'per_lsz_c': per_lsz_c,
+            'per_lsz_d': per_lsz_d,
+            'per_lsz_r': per_lsz_r,
+            'range_pct_c': range_pct,
+            'change_1_8_c': change_1_8 if change_1_8 is not None else 0.0,
+            'max_adj_c': max_adj,
+            'min_adj_c': min_adj,
+            'range_pct_d': d_range_pct,
+            'range_pct_r': r_range_pct
+        })
+
+# increases/decreases (filter positive/negative)
+inc = sorted([x for x in sample_impacts if x['change_1_8_c'] is not None and x['change_1_8_c']>0], key=lambda z: z['change_1_8_c'], reverse=True)
+dec = sorted([x for x in sample_impacts if x['change_1_8_c'] is not None and x['change_1_8_c']<0], key=lambda z: z['change_1_8_c'])
+print('\nTop samples by LocalSize increase (1->8, compress kernel):')
+print(' sample (effect%) | per-lsz medians (lsz:med)')
+print('-------------------|--------------------------------')
+for x in inc[:10]:
+    s = x['sample']; eff = x['change_1_8_c']; med_str = ', '.join(f"{k}:{v:.1f}" for k,v in sorted(x['per_lsz_c'].items()))
+    print(f" {s:<22} | {eff:7.2f}% | {med_str}")
+
+if not inc:
+    print('  (no increasing samples detected for 1->8)')
+
+print('\nTop samples by LocalSize decrease (1->8, compress kernel):')
+print(' sample (effect%) | per-lsz medians (lsz:med)')
+print('-------------------|--------------------------------')
+for x in dec[:10]:
+    s = x['sample']; eff = x['change_1_8_c']; med_str = ', '.join(f"{k}:{v:.1f}" for k,v in sorted(x['per_lsz_c'].items()))
+    print(f" {s:<22} | {eff:7.2f}% | {med_str}")
+
+if not dec:
+    print('  (no decreasing samples detected for 1->8)')
+# Export current LocalSize 1->8 compress lists to CSV for quick inspection
+out_inc_csv = os.path.join(results_dir, f"{base}.localsize.1to8.compress.increases.csv")
+with open(out_inc_csv, 'w', newline='') as cf:
+    w = csv.writer(cf)
+    w.writerow(['sample','change_pct','per_lsz','per_lsz_ratio'])
+    for x in inc:
+        vals_s = ';'.join(f"{k}:{v:.1f}" for k,v in sorted(x['per_lsz_c'].items()))
+        rat_s = ';'.join(f"{k}:{v:.2f}" for k,v in sorted(x.get('per_lsz_r', {}).items()))
+        w.writerow([x['sample'], f"{x['change_1_8_c']:.2f}", vals_s, rat_s])
+print(f"  Wrote CSV -> {out_inc_csv}")
+
+out_dec_csv = os.path.join(results_dir, f"{base}.localsize.1to8.compress.decreases.csv")
+with open(out_dec_csv, 'w', newline='') as cf:
+    w = csv.writer(cf)
+    w.writerow(['sample','change_pct','per_lsz','per_lsz_ratio'])
+    for x in dec:
+        vals_s = ';'.join(f"{k}:{v:.1f}" for k,v in sorted(x['per_lsz_c'].items()))
+        rat_s = ';'.join(f"{k}:{v:.2f}" for k,v in sorted(x.get('per_lsz_r', {}).items()))
+        w.writerow([x['sample'], f"{x['change_1_8_c']:.2f}", vals_s, rat_s])
+print(f"  Wrote CSV -> {out_dec_csv}")
+
+# Build decompress 1->8 lists from sample_impacts if present
+inc_decomp = []
+dec_decomp = []
+for s in sample_impacts:
+    per_d = s.get('per_lsz_d', {})
+    if per_d and 1 in per_d and 8 in per_d and per_d[1]>0:
+        ch_d = (per_d[8] - per_d[1]) / per_d[1] * 100
+        if ch_d > 0:
+            inc_decomp.append({'sample': s['sample'], 'per_lsz_d': per_d, 'change_1_8_d': ch_d})
+        elif ch_d < 0:
+            dec_decomp.append({'sample': s['sample'], 'per_lsz_d': per_d, 'change_1_8_d': ch_d})
+inc_decomp.sort(key=lambda z: z['change_1_8_d'], reverse=True)
+dec_decomp.sort(key=lambda z: z['change_1_8_d'])
+
+print('\nTop samples by LocalSize increase (1->8, DECOMPRESS kernel):')
+print(' sample (effect%) | per-lsz medians (lsz:med)')
+print('-------------------|--------------------------------')
+for x in inc_decomp[:10]:
+    s = x['sample']; eff = x['change_1_8_d']; med_str = ', '.join(f"{k}:{v:.1f}" for k,v in sorted(x['per_lsz_d'].items()))
+    print(f" {s:<22} | {eff:7.2f}% | {med_str}")
+if not inc_decomp:
+    print('  (no increasing samples detected for 1->8 decompress)')
+
+print('\nTop samples by LocalSize decrease (1->8, DECOMPRESS kernel):')
+print(' sample (effect%) | per-lsz medians (lsz:med)')
+print('-------------------|--------------------------------')
+for x in dec_decomp[:10]:
+    s = x['sample']; eff = x['change_1_8_d']; med_str = ', '.join(f"{k}:{v:.1f}" for k,v in sorted(x['per_lsz_d'].items()))
+    print(f" {s:<22} | {eff:7.2f}% | {med_str}")
+if not dec_decomp:
+    print('  (no decreasing samples detected for 1->8 decompress)')
+
+# export decompress 1->8 CSVs (ratio not applicable; column added for consistency)
+out_inc_d_csv = os.path.join(results_dir, f"{base}.localsize.1to8.decompress.increases.csv")
+with open(out_inc_d_csv,'w',newline='') as cf:
+    w = csv.writer(cf)
+    w.writerow(['sample','change_pct','per_lsz','per_lsz_ratio'])
+    for x in inc_decomp:
+        w.writerow([x['sample'], f"{x['change_1_8_d']:.2f}", ';'.join(f"{k}:{v:.1f}" for k,v in sorted(x['per_lsz_d'].items())), ''])
+print(f"  Wrote CSV -> {out_inc_d_csv}")
+
+out_dec_d_csv = os.path.join(results_dir, f"{base}.localsize.1to8.decompress.decreases.csv")
+with open(out_dec_d_csv,'w',newline='') as cf:
+    w = csv.writer(cf)
+    w.writerow(['sample','change_pct','per_lsz','per_lsz_ratio'])
+    for x in dec_decomp:
+        w.writerow([x['sample'], f"{x['change_1_8_d']:.2f}", ';'.join(f"{k}:{v:.1f}" for k,v in sorted(x['per_lsz_d'].items())), ''])
+print(f"  Wrote CSV -> {out_dec_d_csv}")
+
+# Now compute expanded per-factor per-sample impacts and export them
+print('\n[SECTION C.2] Per-factor per-sample impacts & CSV exports')
+
+factors = [('lsz_int','LocalSize'), ('block_kb','BlockSize'), ('level_int','Level'), ('alg','Algorithm')]
+
+def per_sample_factor_impact(f_key, mode):
+    out = []
+    for s in samples:
+        ds_s = [d for d in rows if d['sample']==s and d['mode']==mode and d['tool'] in ('GPU','DAEMON')]
+        if not ds_s:
+            continue
+        vals_by = {}
+        ratios_by = {}
+        for v in sorted(set(d[f_key] for d in ds_s if d[f_key] not in (None,'')), key=lambda x: (int(x) if str(x).isdigit() else str(x))):
+            vals = [d['mbps_kernel'] for d in ds_s if d[f_key]==v and d['mbps_kernel']>0]
+            if vals:
+                vals_by[v] = median(vals)
+            if mode == 'compress':
+                rats = [d['ratio_pct'] for d in ds_s if d[f_key]==v and d['ratio_pct']>0]
+                if rats:
+                    ratios_by[v] = median(rats)
+        if len(vals_by) >= 2:
+            med_all = median(list(vals_by.values()))
+            rng = max(vals_by.values()) - min(vals_by.values())
+            rng_pct = rng / med_all * 100 if med_all>0 else 0.0
+            out.append((rng_pct, s, vals_by, ratios_by))
+    out.sort(reverse=True)
+    return out
+
+for fk, fl in factors:
+    for mode in ('compress','decompress'):
+        topn = per_sample_factor_impact(fk, mode)[:20]
+        outcsv = os.path.join(results_dir, f"{base}.top_{fl}.{mode}.csv")
+        with open(outcsv, 'w', newline='') as cf:
+            w = csv.writer(cf)
+            w.writerow(['sample','range_pct','kernel_values','ratio_values'])
+            for row in topn:
+                # unpack 3- or 4-tuple to be tolerant
+                if len(row) == 4:
+                    rng, s, vals, rats = row
+                else:
+                    rng, s, vals = row; rats = {}
+                vals_s = ';'.join(f"{k}:{v:.1f}" for k,v in sorted(vals.items(), key=lambda kv: (int(kv[0]) if str(kv[0]).isdigit() else str(kv[0]))))
+                rat_s = ''
+                if mode == 'compress' and rats:
+                    rat_s = ';'.join(f"{k}:{v:.2f}" for k,v in sorted(rats.items(), key=lambda kv: (int(kv[0]) if str(kv[0]).isdigit() else str(kv[0]))))
+                w.writerow([s, f"{rng:.2f}", vals_s, rat_s])
+        print(f"  Wrote per-factor top list -> {outcsv}")
+# adjacent decreases
+adj_decrease = sorted([x for x in sample_impacts if x['min_adj_c']<0], key=lambda z: z['min_adj_c'])
+print('\nTop samples with largest adjacent decrease (compress kernel):')
+print(' sample | min_adj% | per-lsz medians')
+print('--------|---------|-----------------')
+for x in adj_decrease[:10]:
+    print(f" {x['sample']:<22} | {x['min_adj_c']:7.2f}% | {', '.join(f'{k}:{v:.1f}' for k,v in sorted(x['per_lsz_c'].items()))}")
+
+# Ratio changes
+inc_r = sorted([x for x in sample_impacts if x['range_pct_r']>0], key=lambda z: z['range_pct_r'], reverse=True)
+print('\nTop samples by compression ratio range across LocalSize:')
+print(' sample | range% | per-lsz ratios')
+print('--------|--------|---------------')
+for x in inc_r[:10]:
+    print(f" {x['sample']:<22} | {x['range_pct_r']:6.2f}% | {', '.join(f'{k}:{v:.2f}' for k,v in sorted(x['per_lsz_r'].items()))}")
+
+# SECTION D: Per-alg LocalSize sensitivity (expanded)
+print('\n[SECTION D] Per-alg LocalSize sensitivity (GPU Standalone)')
+for a in algs:
+    ds_a = [d for d in rows if d['alg']==a and d['tool']=='GPU' and d['mode']=='compress']
+    if not ds_a:
+        continue
+    print(f"\nAlgorithm: {a}")
+    print('lsz | rows | kernel med | kernel mean | std | ratio med')
+    for l in lsz_vals:
+        ds_l = [d for d in ds_a if d['lsz_int']==l]
+        ker = summarize([d['mbps_kernel'] for d in ds_l], positive=True)
+        rat = summarize([d['ratio_pct'] for d in ds_l], positive=True)
+        print(f"{str(l):>3} | {ker['n']:4d} | {ker['median']:10.1f} | {ker['mean']:11.1f} | {ker['std']:6.1f} | {rat['median']:8.2f}")
+
+# SECTION E: High variability configs
+print('\n[SECTION E] High-variability configs across samples (compress kernel)')
+from collections import defaultdict
+cfgs = defaultdict(list)
+for d in rows:
+    if d['mode']=='compress' and d['tool'] in ('GPU','DAEMON'):
+        key = (d['alg'], d['level'], d['block_kb'], d['lsz_int'])
+        cfgs[key].append(d['mbps_kernel'])
+var_list = []
+for k,v in cfgs.items():
+    n = len([x for x in v if x>0])
+    if n >= 3:
+        st = stddev([x for x in v if x>0])
+        med = median([x for x in v if x>0])
+        var_list.append((st, med, n, k))
+var_list.sort(reverse=True)
+print('stdev | med | n | config(alg,level,blk,lsz)')
+for st,med,n,k in var_list[:15]:
+    print(f"{st:5.1f} | {med:6.1f} | {n:2d} | {k}")
+
+# conclusions
+print('\n[CONCLUSIONS - ACTIONABLE]')
+print('1. Kernel throughput is reported combined for GPU+Daemon (as requested); use per-tool total MB/s when comparing to Host CPU.')
+print('2. LocalSize can both increase and decrease throughput; top-increase and top-decrease lists identify targets for focused re-runs with more repeats.')
+print('3. Consider adding REPEATS and finer LocalSize sweeps for top samples; use median/std to improve separability.')
+print('4. For high-variability configs, enable --debug and profile kernels on those samples.')
+
+# restore stdout and write the captured report to a file
+sys.stdout = old_stdout
+report_path = os.path.join(results_dir, f"{base}.extended_report.txt")
+with open(report_path, 'w') as rf:
+    rf.write(buf.getvalue())
+print(f"Wrote extended report -> {report_path}")
+PY
 }
 
 # ========================================
-# 快速扫描模式
+# 主逻辑
 # ========================================
-quick_scan() {
-    echo "=== Quick Parameter Scan Mode ==="
-    init_csv
-
-    # 减少配置组合
-    ALGO_TYPES=("1x" "1y")
-    LEVELS=(10 11 12 14)
-    BLOCK_SIZES=(8 16 64)  # KB
-    LOCAL_SIZES=(1)
-    CPU_THREADS=(1 2)
-    COPY_MODES=(0)  # 0=zero-copy, 1=standard copy
-    STDIO_BUF_OPTIONS=(4)  # stdio buffer sizes in MB
-    MT_IO_OPTIONS=(1)  # multi-threaded IO
-    MT_IO_THREADS_OPTIONS=(2) # MT_IO thread counts
-    COALESCE_OPTIONS=(1)  # enable/disable output coalescing
-
-    local samples=()
-    # collect all files (regular files + symlinks) in SAMPLES_DIR
-    while IFS= read -r -d '' f; do
-        [ -f "$f" -o -L "$f" ] && samples+=("$f")
-    done < <(find "$SAMPLES_DIR" \( -type f -o -type l \) -print0)
-
-    for sample in "${samples[@]}"; do
-        test_cpu "$sample"
-        test_gpu_standalone "$sample"
-        test_gpu_daemon "$sample"
-    done
-
-    generate_report
-}
-
-# ========================================
-# 中等规模扫描模式 - 更全面的配置
-# ========================================
-medium_scan() {
-    echo "=== Medium Parameter Scan Mode ==="
-    echo "Testing more configurations..."
-    init_csv
-
-    # 配置组合
-    ALGO_TYPES=("1x" "1y")
-    LEVELS=(10 11 12 14)
-    BLOCK_SIZES=(4 8 16 32 64)  # KB
-    CPU_THREADS=(1 2)
-    LOCAL_SIZES=(1)
-    COPY_MODES=(0 1)
-    COALESCE_OPTIONS=(0 1)
-    STDIO_BUF_OPTIONS=(4 32)
-    MT_IO_THREADS_OPTIONS=(1 2)
-
-    local samples=()
-    # collect all files (regular files + symlinks) in SAMPLES_DIR
-    while IFS= read -r -d '' f; do
-        [ -f "$f" -o -L "$f" ] && samples+=("$f")
-    done < <(find "$SAMPLES_DIR" \( -type f -o -type l \) -print0)
-
-    local total=${#samples[@]}
-    local idx=0
-
-    for sample in "${samples[@]}"; do
-        idx=$((idx + 1))
-        echo -e "\n${BLUE}[${idx}/${total}] Processing: $(basename "$sample")${NC}"
-        test_cpu "$sample"
-        test_gpu_standalone "$sample"
-        test_gpu_daemon "$sample"
-    done
-
-    generate_report
-}
-
-# ========================================
-# 完整扫描
-# ========================================
-full_scan() {
-    echo "=== Full Parameter Scan ==="
-    echo "Warning: This will take a long time!"
-    echo ""
-    init_csv
-
-    local samples=()
-    # collect all files (regular files + symlinks) in SAMPLES_DIR
-    while IFS= read -r -d '' f; do
-        [ -f "$f" -o -L "$f" ] && samples+=("$f")
-    done < <(find "$SAMPLES_DIR" \( -type f -o -type l \) -print0)
-
-    local total=${#samples[@]}
-    local idx=0
-
-    for sample in "${samples[@]}"; do
-        idx=$((idx + 1))
-        echo -e "\n${BLUE}[${idx}/${total}] Processing: $(basename "$sample")${NC}"
-        test_cpu "$sample"
-        test_gpu_standalone "$sample"
-        test_gpu_daemon "$sample"
-    done
-
-    generate_report
-}
-
-# ========================================
-# 主程序
-# ========================================
-case "${1:-}" in
-    -q|--quick)
-        quick_scan
-        ;;
-    -D|--daemon-only)
-        daemon_only_scan
-        ;;
-    -m|--medium)
-        medium_scan
-        ;;
-    -f|--full)
-        full_scan
-        ;;
-    -r|--report-only)
+case "$1" in
+    -c|--cpu-only)
+        init_csv
+        for s in "$SAMPLES_DIR"/*; do [ -f "$s" ] && test_cpu "$s"; done
         generate_report
         ;;
-    -h|--help)
-        echo "Usage: $0 [options]"
-        echo ""
-        echo "Options:"
-        echo "  -q, --quick    Quick scan with reduced configurations (default)"
-        echo "  -m, --medium   Medium scan with more configurations (recommended)"
-        echo "  -f, --full     Full parameter scan (takes a long time)"
-        echo "  -r, --report-only  Generate a report from an existing CSV (override via CSV_FILE env)"
-        echo "  -h, --help     Show this help"
-        echo ""
-        echo "Environment:"
-        echo "  SAMPLES_DIR    Directory containing test samples (default: /root/samples)"
+    -g|--gpu-only)
+        # GPU-only full scan; writes GPU rows only to $CSV_FILE
+        init_csv
+        for s in "$SAMPLES_DIR"/*; do [ -f "$s" ] && (test_gpu_standalone "$s"; test_gpu_daemon "$s") || true; done
+        ;;
+    -m|--merge)
+        # Merge CPU and GPU CSVs: usage: param_scan.sh -m <cpu_csv> <gpu_csv> [out_csv]
+        merge_csv "$2" "$3" "$4"
+        ;;
+    -r|--report-only)
+        generate_report "$2"
         ;;
     *)
-        quick_scan
+        init_csv
+        for s in "$SAMPLES_DIR"/*; do
+            [ -f "$s" ] && (test_cpu "$s"; test_gpu_standalone "$s"; test_gpu_daemon "$s")
+        done
+        generate_report
         ;;
 esac

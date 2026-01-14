@@ -1,0 +1,503 @@
+#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
+#include <CL/cl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <stdint.h>
+#include <math.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <errno.h>
+#include <libgen.h>
+#include <linux/limits.h>
+#include <signal.h>
+#include "lzo_defaults.h"
+#include "timing.h"
+#include "lzo_gpu_utils.h"
+#include "lzo_gpu_core.h"
+
+/* Forward declarations for daemon and client modules */
+int run_lzo_daemon(int argc, char** argv);
+int run_lzo_client(int argc, char** argv);
+
+/* Helper for multi-threaded pread into a destination buffer.
+ * Each thread handles a subrange (off,len) of the destination.
+ */
+/* forward declaration of now_ns used below by the reaper */
+static inline uint64_t now_ns(void);
+
+/*
+* 压缩文件格式：
+uint16  magic     = 0x4C5A   // 'L''Z'
+uint32  orig_size               (≤4 GiB)
+uint32  blk_size
+uint32  nblk
+uint32  len[nblk]               // 每块压缩长度
+-----   nblk 个压缩块数据
+*/
+#define MAGIC  0x4C5A   /* 'L''Z' */
+#define D_BITS          11
+//#define BLK_SIZE        (32 * 1024)
+/* Compression ratio tracking */
+#define ENABLE_COMPRESSION_RATIO_TRACKING 1
+
+#if defined(_WIN32) || defined(_WIN64)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+static inline uint64_t now_ns(void)
+{
+    static LARGE_INTEGER freq = { 0 };
+    if (freq.QuadPart == 0)
+        QueryPerformanceFrequency(&freq);
+
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    /*   counter / freq = 秒
+     * → counter * 1e9 / freq = 纳秒
+     */
+    return (uint64_t)counter.QuadPart * (uint64_t)1000000000ULL /
+        (uint64_t)freq.QuadPart;
+}
+
+#else
+#include <time.h>
+
+static inline uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+#endif
+
+static inline void print_ns(const char* tag, uint64_t ns) {
+    unsigned long us = (unsigned long)(ns / 1000ULL);
+    /* print_us_tag is provided by timing.h */
+    print_us_tag(stdout, tag, us);
+}
+
+/* CLI override variables (set by parsing -B/--block-size and --local) */
+static size_t g_cli_fixed_block_bytes = 0; /* 0 = not specified */
+static int g_cli_fixed_block_exact = 0; /* 1 = user specified bytes (B suffix) -> respect exact */
+static size_t g_cli_local_size = 0;       /* 0 = not specified */
+
+#define CHECK(expr)  do{ cl_int _e=(expr);                       \
+        if(_e!=CL_SUCCESS){                                      \
+            fprintf(stderr,"OpenCL error %d at %s:%d\n",         \
+                    _e,__FILE__,__LINE__); exit(1);} }while(0)
+
+static inline size_t lzo_worst(size_t n) {
+    return n + n / 16 + 64 + 3;
+}
+
+static cl_context  ctx;
+static cl_command_queue q;
+static cl_device_id dev;
+static int debug = 0;  /* use --debug to enable kernel instrumentation */
+/* kernel_opt logic removed - optimizations now default */
+
+static void ocl_init(void)
+{
+    cl_platform_id pf;
+    cl_device_type dtype = CL_DEVICE_TYPE_GPU;
+    CHECK(clGetPlatformIDs(1, &pf, NULL));
+    CHECK(clGetDeviceIDs(pf, dtype, 1, &dev, NULL));
+    ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, NULL);
+    cl_queue_properties props[] = {
+        CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0
+    };
+    q = clCreateCommandQueueWithProperties(ctx, dev, props, NULL);
+}
+
+void print_buildlog(cl_program program, cl_device_id device) {
+    char* buff_erro;
+    cl_int errcode;
+    size_t build_log_len;
+    errcode = clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &build_log_len);
+    if (errcode) {
+        printf("clGetProgramBuildInfo failed at line %d\n", __LINE__);
+        exit(-1);
+    }
+    buff_erro = malloc(build_log_len);
+    if (!buff_erro) {
+        printf("malloc failed at line %d\n", __LINE__);
+        exit(-2);
+    }
+
+    errcode = clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, build_log_len, buff_erro, NULL);
+    if (errcode) {
+        printf("clGetProgramBuildInfo failed at line %d\n", __LINE__);
+        exit(-3);
+    }
+
+    fprintf(stderr, "Build log: \n%s\n", buff_erro); //Be careful with fprint
+    free(buff_erro);
+    fprintf(stderr, "clBuildProgram failed\n");
+}
+
+
+/* Helper: load program from source file with D_BITS macro */
+static cl_program load_prog_with_dbits(const char* alg_name, int bits)
+{
+    char build_log[8192] = {0};
+    cl_program p = lzo_load_program_with_dbits(ctx, dev, alg_name, bits, build_log, sizeof(build_log));
+    if (!p && debug) {
+        fprintf(stderr, "DBG: failed to load/compile kernel %s (D_BITS=%d): %s\n", alg_name, bits, build_log);
+    }
+    return p;
+}
+
+static inline void show_help(char *prog_name)
+{
+    fprintf(stderr, "Unified LZO GPU Tool\n");
+    fprintf(stderr, "Usage Modes:\n");
+    fprintf(stderr, "  1. Standalone:   %s [options] <input_file>\n", prog_name);
+    fprintf(stderr, "  2. Run Daemon:   %s --daemon [options]\n", prog_name);
+    fprintf(stderr, "  3. Use Daemon:   %s --use-daemon [options] <input_file>\n", prog_name);
+    fprintf(stderr, "  4. Stop Daemon:  %s --stop-daemon\n", prog_name);
+
+    fprintf(stderr, "\nBasic Options:\n");
+    fprintf(stderr, "  -c                   Compress mode (default)\n");
+    fprintf(stderr, "  -d, --decompress     Decompress mode\n");
+    fprintf(stderr, "  -o, --output FILE    Output file (use '-' for stdout)\n");
+    fprintf(stderr, "  -a, --alg ALG        Algorithm (lzo1x, lzo1y) (default: lzo1x)\n");
+    fprintf(stderr, "  -L, --level LEVEL    Dictionary bits (10-18) (default: 14)\n");
+    fprintf(stderr, "  -B, --block-size N   Fixed block size (B/KB/MB)\n");
+    fprintf(stderr, "  --debug              Enable kernel debug instrumentation\n");
+    fprintf(stderr, "  -v, --verbose        Enable performance statistics\n");
+    fprintf(stderr, "  --local N            Local work-group size (1,8,64)\n");
+    fprintf(stderr, "Detailed Help:\n");
+    fprintf(stderr, "  %s --daemon -h           # Daemon-specific settings\n", prog_name);
+    fprintf(stderr, "  %s --use-daemon -h       # Client-specific settings\n\n", prog_name);
+
+    fprintf(stderr, "Examples:\n");
+    fprintf(stderr, "  Compress:         %s input.dat -o out.lzo\n", prog_name);
+    fprintf(stderr, "  Decompress:       %s -d out.lzo -o out.dec\n", prog_name);
+    fprintf(stderr, "  Using Daemon:     %s --use-daemon -a lzo1y bigfile.bin\n", prog_name);
+    fprintf(stderr, "  %s -h|--help                                 # show this help\n", prog_name);
+    fprintf(stderr, "\nEnvironment variables (grouped — standalone / client->daemon / advanced):\n");
+    fprintf(stderr, "    LZO_STANDARD_COPY=0|1    0=zero-copy (map into pinned buffer), 1=standard host->device copy (explicit upload). Applies to both compression and decompression.\n");
+}
+
+
+/* Prototypes for extracted helpers to keep main concise */
+static int do_decompress_mode(const char* lz_path, const char* output_path, int output_explicit, int suppress_non_data);
+static int do_compress_mode(const char* in_path, const char* output_path, int output_explicit, int suppress_non_data, const char* alg_name, int comp_level);
+
+/* Implementations: wrappers that use the shared core backend (lzo_gpu_core.c)
+ * The helpers create short-lived OpenCL contexts, load the appropriate kernels
+ * and call lzo_compress_core / lzo_decompress_core to perform the heavy lifting.
+ */
+static int do_compress_mode(const char* in_path, const char* output_path, int output_explicit, int suppress_non_data, const char* alg_name, int comp_level)
+{
+    if (!in_path) {
+        fprintf(stderr, "error: missing input\n");
+        return 1;
+    }
+
+    if (comp_level < 0) comp_level = LZO_DEFAULT_COMP_LEVEL;
+
+    ocl_init();
+
+    /* load compression kernel */
+    cl_program prog_c = NULL;
+    cl_kernel krn_c = NULL;
+    char build_log[8192] = {0};
+    int kernel_has_dbg = 0;
+    if (lzo_load_comp_kernel(ctx, dev, alg_name, comp_level, debug, &prog_c, &krn_c, &kernel_has_dbg, build_log, sizeof(build_log)) != 0) {
+        if (build_log[0]) fprintf(stderr, "error: failed to load kernel for %s bits=%d: %s\n", alg_name, comp_level, build_log);
+        else fprintf(stderr, "error: failed to load kernel for %s bits=%d\n", alg_name, comp_level);
+        return 1;
+    }
+
+    int standard_copy = (getenv("LZO_STANDARD_COPY") && atoi(getenv("LZO_STANDARD_COPY")) == 1) ? 1 : 0;
+    int fixed_block_kb = (g_cli_fixed_block_bytes > 0) ? (int)(g_cli_fixed_block_bytes / 1024) : 0;
+    int alg_id = (strcmp(alg_name, "lzo1y") == 0) ? 1 : 0;
+
+    lzo_gpu_workspace_t ws;
+    lzo_gpu_workspace_init(&ws);
+
+    /* Create parameter object */
+    lzo_compress_params_t params = {
+        .level = comp_level,
+        .alg_id = alg_id,
+        .standard_copy = standard_copy,
+        .fixed_block_kb = fixed_block_kb,
+        .local_size_param = (int)g_cli_local_size,
+        .debug = debug
+    };
+
+    unsigned long time_us = 0;
+    size_t output_size = 0;
+    timing_t t_out = {0};
+
+    int ret = lzo_compress_core(ctx, q, dev, krn_c, in_path, output_path, &params, &ws, &time_us, &output_size, &t_out);
+
+    lzo_gpu_workspace_free(&ws);
+    if (krn_c) clReleaseKernel(krn_c);
+    if (prog_c) clReleaseProgram(prog_c);
+    if (q) { clReleaseCommandQueue(q); q = NULL; }
+    if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+    return ret;
+}
+
+static int do_decompress_mode(const char* lz_path, const char* output_path, int output_explicit, int suppress_non_data)
+{
+    if (!lz_path) { fprintf(stderr, "error: missing input .lzo\n"); return 1; }
+    int standard_copy = (getenv("LZO_STANDARD_COPY") && atoi(getenv("LZO_STANDARD_COPY")) == 1) ? 1 : 0;
+
+    FILE* f = fopen(lz_path, "rb");
+    if (!f) { perror("fopen"); return 1; }
+    uint16_t magic; fread(&magic, 2, 1, f);
+    if (magic != 0x4C5A) { fprintf(stderr, "error: magic mismatch\n"); fclose(f); return 1; }
+    uint32_t a[4]; fread(a, 4, 4, f); // orig_sz, blk_sz, nblk, alg_id
+    fclose(f);
+
+    const char* alg_name = (a[3] == 1) ? "lzo1y" : "lzo1x";
+    char decomp_base[64]; snprintf(decomp_base, sizeof(decomp_base), "%s_decomp", alg_name);
+
+    ocl_init();
+    cl_program prog_d = load_prog_with_dbits(decomp_base, 0);
+    if (!prog_d) { fprintf(stderr, "error: unable to load decompressor for %s\n", decomp_base); return 1; }
+    char krn_name[64]; snprintf(krn_name, sizeof(krn_name), "%s_block_decompress", alg_name);
+    cl_int err; cl_kernel krn_d = clCreateKernel(prog_d, krn_name, &err);
+    if (err != CL_SUCCESS) { fprintf(stderr, "clCreateKernel failed for %s (err=%d)\n", krn_name, err); clReleaseProgram(prog_d); return 1; }
+
+    lzo_gpu_workspace_t ws;
+    lzo_gpu_workspace_init(&ws);
+    unsigned long time_us = 0; size_t output_size = 0; timing_t t_out = {0};
+
+    int rc = lzo_decompress_core(ctx, q, dev, krn_d, lz_path, output_path, &ws, standard_copy, (int)g_cli_local_size, debug, &time_us, &output_size, &t_out);
+    lzo_gpu_workspace_free(&ws);
+
+    if (krn_d) clReleaseKernel(krn_d);
+    if (prog_d) clReleaseProgram(prog_d);
+    if (q) { clReleaseCommandQueue(q); q = NULL; }
+    if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+    return rc;
+}
+
+
+/* Implementations will call into lzo_gpu_core.c which provides lzo_compress_core/lzo_decompress_core */
+#include "lzo_gpu_core.h"
+
+
+int run_lzo_standalone(int argc, char** argv)
+{
+    if (argc < 1) { // Changed from 2 to 1 because we might pass 0/1 args if flags stripped
+        show_help(argv[0]);
+        return 0;
+    }
+
+    int decompress_mode = 0;
+    const char *in_path = NULL;
+    const char *lz_path = NULL;
+    const char *output_path = NULL;
+    int output_explicit = 0; /* whether -o/--output was explicitly provided */
+    int suppress_non_data = 0; /* when writing to stdout (-), suppress non-data prints */
+    int comp_level = -1; /* -1 means adaptive (not explicitly specified by user) */
+    const char *alg_name = "lzo1x";
+
+    /* pass 1: detect mode, help, verbose */
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            show_help(argv[0]);
+            return 0;
+        }
+        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) {
+             decompress_mode = 1;
+        }
+        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+            g_verbose = 1;
+        }
+    }
+
+    /* pass 2: parse options and positionals with knowledge of mode */
+    for (int i = 1; i < argc; ++i) {
+        const char* arg = argv[i];
+        if (strcmp(arg, "--debug") == 0) { debug = 1; continue; }
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) { continue; }
+        if (strcmp(arg, "-o") == 0 || strcmp(arg, "--output") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "missing argument for %s\n", arg);
+                return 1;
+            }
+            output_path = argv[++i];
+            output_explicit = 1;
+            if (strcmp(output_path, "-") == 0) suppress_non_data = 1;
+            continue;
+        }
+        if (strcmp(arg, "-L") == 0 || strcmp(arg, "-l") == 0 || strcmp(arg, "--level") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "missing argument for %s\n", arg);
+                return 1;
+            }
+            comp_level = atoi(argv[++i]);
+            if (comp_level < 8 || comp_level > 20) {
+                fprintf(stderr, "error: dictionary size must be between 8 and 20 bits (got %d)\n", comp_level);
+                return 1;
+            }
+            continue;
+        }
+        if (strcmp(arg, "-a") == 0 || strcmp(arg, "--alg") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "missing argument for %s\n", arg);
+                return 1;
+            }
+            alg_name = argv[++i];
+            if (strcmp(alg_name, "1x") == 0 || strcmp(alg_name, "lzo1x") == 0)
+                alg_name = "lzo1x";
+            else if (strcmp(alg_name, "1y") == 0 || strcmp(alg_name, "lzo1y") == 0)
+                alg_name = "lzo1y";
+            else {
+                fprintf(stderr, "错误: 未知算法 '%s'. 支持: lzo1x, lzo1y (或 1x/1y)\n", alg_name);
+                return 1;
+            }
+            continue;
+        }
+        if (strcmp(arg, "-c") == 0) {
+            /* -c means compress mode (default, explicit flag for clarity) */
+            decompress_mode = 0;
+            continue;
+        }
+        if (strcmp(arg, "-d") == 0 || strcmp(arg, "--decompress") == 0) {
+            decompress_mode = 1;
+            continue;
+        }
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
+            g_verbose = 1;
+            continue;
+        }
+        if (strncmp(arg, "-B=", 3) == 0) { /* short shorthand -B=value */
+            const char* s = arg + 3;
+            g_cli_fixed_block_exact = lzo_specified_unit_is_bytes(s);
+            size_t b = lzo_parse_block_size(s);
+            if (b > 0) g_cli_fixed_block_bytes = b;
+            continue;
+        }
+        if (strcmp(arg, "-B") == 0) { if (i + 1 < argc) { const char* s = argv[++i]; g_cli_fixed_block_exact = lzo_specified_unit_is_bytes(s); size_t b = lzo_parse_block_size(s); if (b > 0) g_cli_fixed_block_bytes = b; } continue; }
+        if (strncmp(arg, "--block-size=", 13) == 0) { const char* s = arg + 13; g_cli_fixed_block_exact = lzo_specified_unit_is_bytes(s); size_t b = lzo_parse_block_size(s); if (b > 0) g_cli_fixed_block_bytes = b; continue; }
+        if (strcmp(arg, "--block-size") == 0) { if (i + 1 < argc) { const char* s = argv[++i]; g_cli_fixed_block_exact = lzo_specified_unit_is_bytes(s); size_t b = lzo_parse_block_size(s); if (b > 0) g_cli_fixed_block_bytes = b; } continue; }
+        if (strncmp(arg, "--local=", 8) == 0) { g_cli_local_size = (size_t)atoi(arg + 8); if (g_cli_local_size == 0) g_cli_local_size = 0; continue; }
+        if (strcmp(arg, "--local") == 0) { if (i + 1 < argc) { g_cli_local_size = (size_t)atoi(argv[++i]); if (g_cli_local_size == 0) g_cli_local_size = 0; } continue; }
+        /* positional */
+        if (arg[0] != '-') {
+            if (decompress_mode) {
+                if (!lz_path) { lz_path = arg; continue; }
+                /* ignore extra positionals; verify file should come via --verify */
+            } else {
+                if (!in_path) { in_path = arg; continue; }
+            }
+        }
+    }
+
+    /* Set default output names if not specified */
+    char default_output[512];
+    if (output_explicit == 0 || output_path == NULL) {
+        if (decompress_mode) {
+            if (lz_path) {
+                size_t ilen = strlen(lz_path);
+                const char *suf = ".lzo";
+                size_t suf_len = strlen(suf);
+                if (ilen > suf_len && strcmp(lz_path + ilen - suf_len, suf) == 0) {
+                    /* strip suffix */
+                    size_t n = (ilen - suf_len < sizeof(default_output) - 1) ? ilen - suf_len : sizeof(default_output) - 1;
+                    memcpy(default_output, lz_path, n);
+                    default_output[n] = '\0';
+                } else {
+                    /* append .dec */
+                    snprintf(default_output, sizeof(default_output), "%s.dec", lz_path);
+                }
+                output_path = default_output;
+            }
+        } else {
+            if (in_path) {
+                snprintf(default_output, sizeof(default_output), "%s.lzo", in_path);
+                output_path = default_output;
+            }
+        }
+    }
+
+    /* Decompress mode */
+    if (decompress_mode) {
+        return do_decompress_mode(lz_path, output_path, output_explicit, suppress_non_data);
+    }
+
+    /* Compress path (simple, fast) */
+    return do_compress_mode(in_path, output_path, output_explicit, suppress_non_data, alg_name, comp_level);
+}
+
+
+/* --- Unified Tool Main Entry --- */
+static int stop_daemon(void) {
+    const char* pid_path = lzo_daemon_pidfile_path();
+    const char* sock_path = lzo_daemon_socket_path();
+    FILE* f = fopen(pid_path, "r");
+    if (!f) {
+        printf("守护进程似乎没有运行 (未找到 PID 文件: %s)\n", pid_path);
+        /* Check if socket exists anyway */
+        if (access(sock_path, F_OK) == 0) unlink(sock_path);
+        return 0;
+    }
+    pid_t pid;
+    if (fscanf(f, "%d", &pid) != 1) {
+        fclose(f);
+        printf("无法读取 PID 文件内容\n");
+        return 1;
+    }
+    fclose(f);
+
+    printf("正在停止守护进程 (PID: %d)...\n", pid);
+    if (kill(pid, SIGTERM) == 0) {
+        /* Wait up to 5 seconds for it to exit */
+        for (int i = 0; i < 50; i++) {
+            if (kill(pid, 0) != 0) break;
+            usleep(100000);
+        }
+        if (kill(pid, 0) == 0) {
+            printf("警告: 守护进程未能在 5 秒内退出，正在强制终止...\n");
+            kill(pid, SIGKILL);
+        }
+    } else if (errno == ESRCH) {
+        printf("进程 %d 已经退出\n", pid);
+    } else {
+        perror("停止守护进程失败");
+    }
+
+    unlink(pid_path);
+    unlink(sock_path);
+    printf("守护进程清理完成\n");
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    /* Handle global options like --socket/--pid first for all sub-commands */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--socket") == 0) {
+            if (i + 1 < argc) lzo_set_daemon_socket_path(argv[i+1]);
+        } else if (strcmp(argv[i], "--pid") == 0) {
+            if (i + 1 < argc) lzo_set_daemon_pidfile_path(argv[i+1]);
+        }
+    }
+
+    if (argc >= 2) {
+        if (strcmp(argv[1], "--daemon") == 0) {
+            return run_lzo_daemon(argc - 1, argv + 1);
+        }
+        if (strcmp(argv[1], "--stop-daemon") == 0) {
+            return stop_daemon();
+        }
+        if (strcmp(argv[1], "--use-daemon") == 0) {
+            /* If --use-daemon is the first arg, we shift args for the client */
+            return run_lzo_client(argc - 1, argv + 1);
+        }
+    }
+    /* Default: Standalone mode */
+    return run_lzo_standalone(argc, argv);
+}

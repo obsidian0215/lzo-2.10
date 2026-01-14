@@ -185,20 +185,27 @@ def generate_structured_data(size, structure_ratio=0.8):
     return bytes(data)
 
 
-def _random_sizes_mb(count, min_mb=1, max_mb=512, seed=None):
+def _random_sizes_bytes(count, min_mb=1, max_mb=512, seed=None):
     # Produce 'count' sizes (in bytes) between min_mb and max_mb by sampling
     # approximately log-uniformly to include small and very large files.
+    # We add significant jitter so sizes are not exact increments of 1MB.
     if seed is not None:
         random.seed(seed)
     sizes = set()
     while len(sizes) < count:
         r = random.random()
-        size_mb = int(math.exp(math.log(min_mb) + r * (math.log(max_mb) - math.log(min_mb))))
-        if size_mb < 1:
-            size_mb = 1
-        if size_mb > max_mb:
-            size_mb = max_mb
-        sizes.add(size_mb)
+        # Log-uniform log(min_bytes) to log(max_bytes)
+        min_bytes = min_mb * 1024 * 1024
+        max_bytes = max_mb * 1024 * 1024
+        size_bytes = int(math.exp(math.log(min_bytes) + r * (math.log(max_bytes) - math.log(min_bytes))))
+
+        # Add jitter: +/- 10% or at least some random KB
+        jitter_range = max(1024 * 16, size_bytes // 10)
+        size_bytes += random.randint(-jitter_range, jitter_range)
+
+        if size_bytes < 1024:
+            size_bytes = 1024
+        sizes.add(size_bytes)
     return sorted(sizes)
 
 
@@ -211,24 +218,26 @@ def generate_suite(out_dir, per_pattern=5, min_mb=1, max_mb=512, seed=None):
     """
     os.makedirs(out_dir, exist_ok=True)
     patterns = ["zero", "random", "repeat", "structured", "mixed"]
-    print(f"Generating test suite in {out_dir} ...")
+    print(f"Generating irregular test suite in {out_dir} ...")
 
     def write_file_stream(outpath, gen):
         with open(outpath, 'wb') as f:
             for chunk in gen:
                 f.write(chunk)
 
-    # Determine sizes per pattern: a handful of random sizes (MB) between min_mb and max_mb
+    # Determine sizes per pattern
     for p in patterns:
-        sizes_mb = _random_sizes_mb(per_pattern, min_mb=min_mb, max_mb=max_mb, seed=seed)
-        for i, size_mb in enumerate(sizes_mb):
-            fname = f"sample_{size_mb}mb_{p}_{i+1}.txt"
+        sizes_bytes = _random_sizes_bytes(per_pattern, min_mb=min_mb, max_mb=max_mb, seed=seed)
+        for i, size_val in enumerate(sizes_bytes):
+            # Name reflects the specific irregular size to avoid "regular" names
+            size_str = f"{size_val / (1024*1024):.2f}mb"
+            fname = f"sample_{size_str}_{p}_{i+1}.txt"
             outpath = os.path.join(out_dir, fname)
             if os.path.exists(outpath):
                 print(f"Skipping existing {outpath}")
                 continue
-            size_val = size_mb * 1024 * 1024
-            print(f"Generating {outpath} ({size_mb} MB, pattern={p})")
+
+            print(f"Generating {outpath} ({size_val:,} bytes, pattern={p})")
             if p == "zero":
                 gen = gen_zero_chunks(size_val)
             elif p == "random":
@@ -265,7 +274,6 @@ def main():
     # If --suite requested, generate a suite and exit
     if args.suite:
         generate_suite(args.out_dir, per_pattern=args.per_pattern, min_mb=args.min_mb, max_mb=args.max_mb, seed=args.seed)
-        return
         return
 
     if not args.size:

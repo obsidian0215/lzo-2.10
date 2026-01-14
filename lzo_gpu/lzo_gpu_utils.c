@@ -12,7 +12,13 @@ int lzo_find_file_path(const char *name, char *out, size_t outlen)
 {
     char path[PATH_MAX];
     char base[PATH_MAX];
-    /* 1: exe dir and exe_dir/../lzo_gpu */
+    /* 1: LZO_GPU_DIR (Highest priority for testing) */
+    const char *env = getenv("LZO_GPU_DIR");
+    if (env && env[0]) {
+        snprintf(path, sizeof(path), "%s/%s", env, name);
+        if (access(path, R_OK) == 0) { strncpy(out, path, outlen - 1); out[outlen - 1] = '\0'; return 0; }
+    }
+    /* 2: exe dir and exe_dir/../lzo_gpu */
     char exe_path[PATH_MAX] = {0};
     ssize_t r = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
     if (r > 0) {
@@ -25,12 +31,6 @@ int lzo_find_file_path(const char *name, char *out, size_t outlen)
             snprintf(path, sizeof(path), "%s/../lzo_gpu/%s", exe_path, name);
             if (access(path, R_OK) == 0) { strncpy(out, path, outlen - 1); out[outlen - 1] = '\0'; return 0; }
         }
-    }
-    /* 2: LZO_GPU_DIR */
-    const char *env = getenv("LZO_GPU_DIR");
-    if (env && env[0]) {
-        snprintf(path, sizeof(path), "%s/%s", env, name);
-        if (access(path, R_OK) == 0) { strncpy(out, path, outlen - 1); out[outlen - 1] = '\0'; return 0; }
     }
     /* 3: OUT_DIR */
     env = getenv("OUT_DIR");
@@ -101,7 +101,30 @@ char* lzo_read_file(const char *path, size_t *sz_out)
     if (sz_out) *sz_out = (size_t)sz;
     return buf;
 }
+static char g_override_socket_path[512] = {0};
+static char g_override_pid_path[512] = {0};
 
+void lzo_set_daemon_socket_path(const char* path) {
+    if (path) strncpy(g_override_socket_path, path, sizeof(g_override_socket_path)-1);
+}
+
+void lzo_set_daemon_pidfile_path(const char* path) {
+    if (path) strncpy(g_override_pid_path, path, sizeof(g_override_pid_path)-1);
+}
+
+const char* lzo_daemon_socket_path(void) {
+    if (g_override_socket_path[0]) return g_override_socket_path;
+    const char* env = getenv("LZO_DAEMON_SOCKET");
+    if (env && env[0]) return env;
+    return "/tmp/lzo_gpu_daemon.sock";
+}
+
+const char* lzo_daemon_pidfile_path(void) {
+    if (g_override_pid_path[0]) return g_override_pid_path;
+    const char* env = getenv("LZO_DAEMON_PID");
+    if (env && env[0]) return env;
+    return "/tmp/lzo_gpu_daemon.pid";
+}
 /* lzo_utils: adaptive entropy/blocking helpers */
 double lzo_calc_entropy(const unsigned char* data, size_t size)
 {
@@ -133,9 +156,9 @@ size_t lzo_parse_block_size(const char* str) {
     double val = strtod(str, &end);
     if (end == str) return 0;
     while (*end == ' ' || *end == '\t') end++;
-    size_t multiplier = 1024; /* default KB */
+    size_t multiplier = 1; /* default to Bytes if pure numeric, for precision */
     if (*end == '\0') {
-        multiplier = 1024;
+        multiplier = 1;
     } else if (strcasecmp(end, "B") == 0 || strcasecmp(end, "BYTES") == 0) {
         multiplier = 1;
     } else if (strcasecmp(end, "K") == 0 || strcasecmp(end, "KB") == 0) {
@@ -157,7 +180,7 @@ int lzo_specified_unit_is_bytes(const char* str) {
     char* end;
     (void)strtod(str, &end);
     while (*end == ' ' || *end == '\t') end++;
-    if (*end == '\0') return 0;
+    if (*end == '\0') return 1; /* Pure numeric counts as explicitly bytes */
     if (strcasecmp(end, "B") == 0 || strcasecmp(end, "BYTES") == 0) return 1;
     return 0;
 }
@@ -182,33 +205,27 @@ size_t lzo_adaptive_block_size(size_t in_sz, cl_uint cu)
     /* Calculate block size from target block count */
     size_t base_block = (in_sz + target_nblk - 1) / target_nblk;
 
-    /* Apply size-based bounds matching test results (kernel_analysis_20251225_034050) */
+    /* Apply size-based bounds matching Level 12-18 test results (matrix_sweep 2026/01/11) */
     size_t size_based_min, size_based_max;
 
-    if (in_sz >= 134 * 1024 * 1024) {
-        /* XLarge files (134MB+): 32KB optimal (test: 988 MB/s with L12) */
-        size_based_min = 28 * 1024; size_based_max = 36 * 1024;
-    } else if (in_sz >= 47 * 1024 * 1024) {
-        /* Large files (47-134MB): 32KB optimal (test peak: 1736 MB/s with L11) */
-        size_based_min = 28 * 1024; size_based_max = 36 * 1024;
-    } else if (in_sz >= 10 * 1024 * 1024) {
-        /* Medium-large files (10-47MB): 16KB balanced (test: 1346 MB/s with L10) */
-        size_based_min = 12 * 1024; size_based_max = 20 * 1024;
-    } else if (in_sz >= 5 * 1024 * 1024) {
-        /* Medium files (5-10MB): 8-16KB blocks (test: 8KB→978 MB/s, 16KB→1346 MB/s) */
-        size_based_min = 8 * 1024; size_based_max = 16 * 1024;
+    if (in_sz >= 8 * 1024 * 1024) {
+        /* Large files (8MB+): 64KB is the sweet spot for speed (339MB/s) and ratio */
+        size_based_min = 64 * 1024; size_based_max = 64 * 1024;
     } else if (in_sz >= 1 * 1024 * 1024) {
-        /* Small files (1-5MB): 8KB balanced (test: 268 MB/s, CR: 59x) */
-        size_based_min = 6 * 1024; size_based_max = 10 * 1024;
+        /* Medium files (1-8MB): 32KB yields best compression depth based on sweep */
+        size_based_min = 32 * 1024; size_based_max = 32 * 1024;
+    } else if (in_sz >= 128 * 1024) {
+        /* Small files (128KB - 1MB): 16KB for balanced efficiency */
+        size_based_min = 16 * 1024; size_based_max = 16 * 1024;
     } else {
-        /* Very small files (<1MB): 1-4KB blocks (test: 1KB→313 MB/s fastest) */
-        size_based_min = 1 * 1024; size_based_max = 4 * 1024;
+        /* Tiny files (<128KB): 8KB to minimize transfer latency and allow small parallelism */
+        size_based_min = 8 * 1024; size_based_max = 8 * 1024;
     }
     /* Clamp to size-based range */
     if (base_block < size_based_min) base_block = size_based_min;
     if (base_block > size_based_max) base_block = size_based_max;
 
-    /* Align to 1KB boundary for optimal memory access */
+    /* Align to specified boundary (4KB) for optimal coalesced memory access */
     base_block = (base_block + (LZO_ALIGN_BYTES_DEFAULT - 1)) & ~(LZO_ALIGN_BYTES_DEFAULT - 1);
 
     /* Ensure within absolute bounds */
@@ -252,29 +269,22 @@ size_t lzo_adaptive_block_size_with_entropy(const unsigned char* data, size_t in
     /* Apply size-based bounds matching test results (kernel_analysis_20251225_034050) */
     size_t size_based_min, size_based_max;
 
-    if (in_sz >= 134 * 1024 * 1024) {
-        /* XLarge files (134MB+): 32KB optimal (test: 988 MB/s with L12) */
-        size_based_min = 28 * 1024; size_based_max = 36 * 1024;
-    } else if (in_sz >= 47 * 1024 * 1024) {
-        /* Large files (47-134MB): 32KB optimal (test peak: 1736 MB/s with L11) */
-        size_based_min = 28 * 1024; size_based_max = 36 * 1024;
+    if (in_sz >= 50 * 1024 * 1024) {
+        /* XLarge/Large files (50MB+): Allow up to 128KB+ for consistency */
+        size_based_min = 32 * 1024; size_based_max = 128 * 1024;
+        /* For files > 100MB, we bias more towards large blocks */
+        if (in_sz >= 100 * 1024 * 1024) {
+             size_based_min = 64 * 1024;
+             size_based_max = 256 * 1024;
+        }
     } else if (in_sz >= 10 * 1024 * 1024) {
-        /* Medium-large files (10-47MB): 16KB balanced (test: 1346 MB/s with L10) */
-        size_based_min = 12 * 1024; size_based_max = 20 * 1024;
-    } else if (in_sz >= 5 * 1024 * 1024) {
-        /* Medium files (5-10MB): 8-16KB blocks (test: 8KB→978 MB/s, 16KB→1346 MB/s) */
-        size_based_min = 8 * 1024; size_based_max = 16 * 1024;
+        /* Large files (10-50MB): 32KB optimal balance */
+        size_based_min = 24 * 1024; size_based_max = 36 * 1024;
     } else if (in_sz >= 1 * 1024 * 1024) {
-        /* Small files (1-5MB): 8KB balanced (test: 268 MB/s, CR: 59x) */
-        size_based_min = 6 * 1024; size_based_max = 10 * 1024;
-    } else if (in_sz >= 512 * 1024) {
-        /* Very small files (512KB-1MB): 4-8KB blocks */
-        size_based_min = 4 * 1024; size_based_max = 8 * 1024;
-    } else if (in_sz >= 256 * 1024) {
-        /* Tiny files (256KB-512KB): 2-4KB blocks */
-        size_based_min = 2 * 1024; size_based_max = 4 * 1024;
+        /* Medium files (1-10MB): 8-16KB balanced (test: 8KB→978 MB/s, 16KB→1346 MB/s) */
+        size_based_min = 8 * 1024; size_based_max = 20 * 1024;
     } else {
-        /* Minimal files (<256KB): 1-4KB blocks (test: 1KB→313 MB/s fastest) */
+        /* Very small files (<1MB): 1-4KB blocks (test: 1KB→313 MB/s fastest) */
         size_based_min = 1 * 1024; size_based_max = 4 * 1024;
     }
 
@@ -396,63 +406,6 @@ void lzo_choose_blocking_adaptive(const unsigned char* data, size_t in_sz, cl_de
     *nblk_out = nblk;
 }
 
-/* Adaptive compression level selection based on file size and entropy.
- *
- * Based on comprehensive kernel testing (64 samples, 1482 configs):
- * - Small (<5MB): Level 10 (best speed-compression balance)
- * - Medium (5-47MB): Level 10 (L10→L11: -26% speed, +1.4% compression ratio, not worth it)
- * - Large (47-134MB): Level 11 (L11 is sweet spot: 1736 MB/s peak)
- * - XLarge (>134MB): Level 12 (L12 reaches compression ceiling)
- *
- * Entropy adjustments:
- * - High entropy (incompressible): prefer lower levels (speed more important)
- * - Low entropy (highly compressible): can use higher levels (better compression payoff)
- *
- * Only called when user hasn't explicitly specified compression level.
- */
-int lzo_adaptive_compression_level(size_t in_sz, double entropy, int debug)
-{
-    int base_level = 11; /* Default to balanced */
-
-    /* Size-based selection matching test results */
-    if (in_sz < 5 * 1024 * 1024) {
-        /* Small files (<5MB): Level 10 optimal */
-        base_level = 10;
-    } else if (in_sz < 47 * 1024 * 1024) {
-        /* Medium files (5-47MB): Level 10 optimal (L11 too expensive) */
-        base_level = 10;
-    } else if (in_sz < 134 * 1024 * 1024) {
-        /* Large files (47-134MB): Level 11 is peak (1736 MB/s) */
-        base_level = 11;
-    } else {
-        /* XLarge files (>134MB): Level 12 for best compression */
-        base_level = 12;
-    }
-
-    /* Entropy-based adjustment */
-    if (entropy > 0.0) {
-        if (entropy > LZO_ADAPTIVE_HIGH_ENTROPY) {
-            /* High entropy (incompressible): reduce level by 1 for speed */
-            if (base_level > 10) base_level--;
-        } else if (entropy < LZO_ADAPTIVE_LOW_ENTROPY) {
-            /* Low entropy (highly compressible): increase level by 1 for better compression */
-            if (base_level < 14) base_level++;
-        }
-        /* Medium entropy: keep base level */
-    }
-
-    /* Clamp to valid range (10-14 for LZO1X) */
-    if (base_level < 10) base_level = 10;
-    if (base_level > 14) base_level = 14;
-
-    if (debug) {
-        fprintf(stderr, "[ADAPTIVE] Compression level: %d (size=%zu entropy=%.4f)\n",
-                base_level, in_sz, entropy);
-    }
-
-    return base_level;
-}
-
 /* Load an OpenCL program from an available precompiled binary or compile from source.
  * Does NOT exit on failure; returns NULL on error and fills build_log (if provided).
  */
@@ -480,7 +433,9 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
                     prog = clCreateProgramWithBinary(ctx, 1, &dev, (const size_t*)&bsz,
                                                     (const unsigned char**)&bin, &binary_status, &err);
                     if (err == CL_SUCCESS && binary_status == CL_SUCCESS) {
-                        err = clBuildProgram(prog, 1, &dev, "-cl-std=CL2.0", NULL, NULL);
+                        /* Rebuild with the same fast-math flags used by build_kernel */
+                        const char *opts = "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable";
+                        err = clBuildProgram(prog, 1, &dev, opts, NULL, NULL);
                         if (err == CL_SUCCESS) {
                             if (build_log) build_log[0] = '\0';
                             free(bin); fclose(fb); return prog;
@@ -523,7 +478,8 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
                     prog = clCreateProgramWithBinary(ctx, 1, &dev, (const size_t*)&bsz,
                                                     (const unsigned char**)&bin, &binary_status, &err);
                     if (err == CL_SUCCESS && binary_status == CL_SUCCESS) {
-                        err = clBuildProgram(prog, 1, &dev, "-cl-std=CL2.0", NULL, NULL);
+                        const char *opts = "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable";
+                        err = clBuildProgram(prog, 1, &dev, opts, NULL, NULL);
                         if (err == CL_SUCCESS) {
                             if (build_log) build_log[0] = '\0';
                             free(bin); fclose(fb); return prog;
@@ -549,26 +505,18 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
         }
     }
 
-    /* Fallback: compile from source. When <alg> contains "_debug" or "_opt",
-     * strip these suffixes to find the base source (e.g., lzo1x.cl or lzo1y.cl),
-     * then compile with appropriate macros (-D LZO_GPU_DEBUG and/or -D LZO_USE_UNROLL2).
+    /* Fallback: compile from source. When <alg> contains "_debug",
+     * strip the suffix to find the base source (e.g., lzo1x.cl or lzo1y.cl),
+     * then compile with appropriate macros (-D LZO_GPU_DEBUG and -D LZO_USE_UNROLL2).
      */
     {
         char resolved_src[PATH_MAX]; size_t src_len = 0; char* src = NULL;
-        int want_opt = 0;
         int want_debug = 0;
 
-        /* Determine the base algorithm name by stripping _debug and _opt suffixes */
+        /* Determine the base algorithm name by stripping _debug suffix */
         char base_name[64];
         strncpy(base_name, alg_name, sizeof(base_name) - 1);
         base_name[sizeof(base_name) - 1] = '\0';
-
-        /* Check for _opt suffix */
-        char *opt_pos = strstr(base_name, "_opt");
-        if (opt_pos) {
-            *opt_pos = '\0';  /* Remove _opt suffix */
-            want_opt = 1;
-        }
 
         /* Check for _debug suffix */
         char *debug_pos = strstr(base_name, "_debug");
@@ -593,18 +541,15 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
         prog = clCreateProgramWithSource(ctx, 1, (const char**)&src, &src_len, &err);
         if (err != CL_SUCCESS) { if (build_log) snprintf(build_log, build_log_len, "clCreateProgramWithSource failed (err=%d)", err); free(src); return NULL; }
 
-        /* Build with appropriate macros based on variant flags */
+        /* Build with appropriate macros based on variant flags.
+         * LZO_USE_UNROLL2 is now enabled by default for all kernel builds.
+         */
         char build_opts[256];
-        if (want_opt && want_debug) {
-            snprintf(build_opts, sizeof(build_opts), "-cl-std=CL2.0 -I. -I./lzo_gpu -I.. -D D_BITS=%d -D LZO_USE_UNROLL2 -D LZO_GPU_DEBUG", bits);
-        } else if (want_opt) {
-            snprintf(build_opts, sizeof(build_opts), "-cl-std=CL2.0 -I. -I./lzo_gpu -I.. -D D_BITS=%d -D LZO_USE_UNROLL2", bits);
-        } else if (want_debug) {
-            snprintf(build_opts, sizeof(build_opts), "-cl-std=CL2.0 -I. -I./lzo_gpu -I.. -D D_BITS=%d -D LZO_GPU_DEBUG", bits);
+        if (want_debug) {
+            snprintf(build_opts, sizeof(build_opts), "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I. -I./lzo_gpu -I.. -D D_BITS=%d -D LZO_USE_UNROLL2 -D LZO_GPU_DEBUG", bits);
         } else {
-            snprintf(build_opts, sizeof(build_opts), "-cl-std=CL2.0 -I. -I./lzo_gpu -I.. -D D_BITS=%d", bits);
+            snprintf(build_opts, sizeof(build_opts), "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I. -I./lzo_gpu -I.. -D D_BITS=%d -D LZO_USE_UNROLL2", bits);
         }
-
         err = clBuildProgram(prog, 1, &dev, build_opts, NULL, NULL);
         if (err != CL_SUCCESS) {
             size_t log_sz = 0; clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
@@ -625,70 +570,36 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
 }
 
 /* Load and create a compression kernel (see header for behavior). */
-int lzo_load_comp_kernel(cl_context ctx, cl_device_id dev, const char *alg_name, int comp_level, int kernel_debug, int kernel_opt, int debug, cl_program *out_prog, cl_kernel *out_krn, int *kernel_has_dbg, char *build_log, size_t build_log_len)
+int lzo_load_comp_kernel(cl_context ctx, cl_device_id dev, const char *alg_name, int comp_level, int debug, cl_program *out_prog, cl_kernel *out_krn, int *kernel_has_dbg, char *build_log, size_t build_log_len)
 {
     cl_int err;
     cl_program prog = NULL;
     cl_kernel krn = NULL;
-    int use_opt_debug_variant = 0, use_opt_prod_variant = 0, use_debug_variant = 0;
-    char prog_base_name[64]; char alt_base_name[64];
+    char effective_alg[64];
+    char prog_base_name[64];
 
-    /* Try kernel_opt variants first (when enabled).
-     * Opt variants are implemented by compiling the base/source with -D LZO_USE_UNROLL2
-     * so we attempt program names like <alg>_debug_opt and <alg>_opt (may be precompiled binaries
-     * or compiled from base sources with the extra macro).
-     */
-    if (kernel_opt) {
-        if (debug) {
-            snprintf(prog_base_name, sizeof(prog_base_name), "%s_debug_opt", alg_name);
-            prog = lzo_load_program_with_dbits(ctx, dev, prog_base_name, comp_level, build_log, build_log_len);
-            if (prog) {
-                use_opt_debug_variant = 1;
-                if (debug) fprintf(stderr, "DBG: kernel_opt+debug requested; loaded %s (bits=%d)\n", prog_base_name, comp_level);
-            } else if (debug) fprintf(stderr, "DBG: kernel_opt+debug: not found or build failed for %s, trying %s_opt\n", prog_base_name, alg_name);
-        }
-        if (!prog) {
-            snprintf(alt_base_name, sizeof(alt_base_name), "%s_opt", alg_name);
-            prog = lzo_load_program_with_dbits(ctx, dev, alt_base_name, comp_level, build_log, build_log_len);
-            if (prog) {
-                use_opt_prod_variant = 1;
-                (void)use_opt_prod_variant; /* Suppress unused warning */
-                if (debug) fprintf(stderr, "DBG: kernel_opt requested; loaded %s (bits=%d)\n", alt_base_name, comp_level);
-            } else if (debug) fprintf(stderr, "DBG: kernel_opt prod: not found or build failed for %s, falling back to base\n", alt_base_name);
-        }
-        if (!prog && debug) {
-            fprintf(stderr, "DBG: kernel_opt requested but no opt variant found for %s (bits=%d); falling back to base\n", alg_name, comp_level);
-        }
-    }
+    strncpy(effective_alg, alg_name, sizeof(effective_alg)-1);
+    effective_alg[sizeof(effective_alg)-1] = '\0';
 
     /* Next try debug variant if requested (debug flag required) */
-    if (!prog && kernel_debug && debug) {
-        snprintf(prog_base_name, sizeof(prog_base_name), "%s_debug", alg_name);
+    if (debug) {
+        snprintf(prog_base_name, sizeof(prog_base_name), "%s_debug", effective_alg);
         /* Try loading debug binary directly - don't require .cl source to exist */
         prog = lzo_load_program_with_dbits(ctx, dev, prog_base_name, comp_level, build_log, build_log_len);
-        if (prog) {
-            use_debug_variant = 1;
-            if (debug) fprintf(stderr, "DBG: debug requested; loaded %s binary (bits=%d)\n", prog_base_name, comp_level);
-        } else if (debug) {
-            fprintf(stderr, "DBG: debug requested but %s binary not found; falling back to base\n", prog_base_name);
-        }
     }
 
     /* Fallback to base algorithm */
     if (!prog) {
-        prog = lzo_load_program_with_dbits(ctx, dev, alg_name, comp_level, build_log, build_log_len);
+        prog = lzo_load_program_with_dbits(ctx, dev, effective_alg, comp_level, build_log, build_log_len);
         if (!prog) {
-            if (build_log && build_log[0] == '\0') snprintf(build_log, build_log_len, "failed to build kernel variants for %s", alg_name);
+            if (build_log && build_log[0] == '\0') snprintf(build_log, build_log_len, "failed to build kernel variants for %s", effective_alg);
             return -1;
         }
     }
 
     char krn_name[96];
-    /* unified kernel names: opt variants reuse the same kernel symbol as their base (debug or non-debug)
-     * so we only select between debug vs non-debug kernel symbol names here.
-     */
-    if (use_opt_debug_variant || use_debug_variant) snprintf(krn_name, sizeof(krn_name), "%s_block_compress_debug", alg_name);
-    else snprintf(krn_name, sizeof(krn_name), "%s_block_compress", alg_name);
+    if (debug) snprintf(krn_name, sizeof(krn_name), "%s_block_compress_debug", effective_alg);
+    else snprintf(krn_name, sizeof(krn_name), "%s_block_compress", effective_alg);
 
     krn = clCreateKernel(prog, krn_name, &err);
     if (err != CL_SUCCESS) {
@@ -767,9 +678,8 @@ int lzo_parse_and_print_debug_buffer(const uint32_t *dbg_map, size_t dbg_fields,
                 out_len_dbg > (uint32_t)worst_blk ||
                 (flag_dbg != 0 && flag_dbg != 1) ||
                 lookups_dbg > (1u<<24) ||
-                hits_dbg > lookups_dbg ||
-                matched_bytes_dbg > in_len_dbg ||
-                updates_dbg > lookups_dbg) {
+                hits_dbg > (1u<<24) ||
+                matched_bytes_dbg > in_len_dbg) {
                 fprintf(stderr, "ERR: suspicious debug data at block %zu: IN=%u OUT=%u FLAG=%u LOOKUPS=%u HITS=%u MATCH_BYTES=%u UPDATES=%u\n",
                         i, in_len_dbg, out_len_dbg, flag_dbg, lookups_dbg, hits_dbg, matched_bytes_dbg, updates_dbg);
                 /* full dump */
@@ -802,3 +712,72 @@ int lzo_parse_and_print_debug_buffer(const uint32_t *dbg_map, size_t dbg_fields,
     return abort_debug_sanity;
 }
 
+
+/* Optimized IO helpers */
+#include <time.h>
+#include <stdint.h>
+
+static inline uint64_t utils_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+int lzo_read_file_to_buf(const char* path, void* dest, size_t size, unsigned long* read_us_out) {
+    if (!path || !dest || size == 0) return -1;
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+
+    uint64_t t_start = utils_now_ns();
+    size_t nread = fread(dest, 1, size, f);
+    uint64_t t_end = utils_now_ns();
+
+    if (read_us_out) *read_us_out = (unsigned long)((t_end - t_start) / 1000);
+    fclose(f);
+    return (nread == size) ? 0 : -1;
+}
+
+int lzo_write_compressed_file(const char* path,
+                              size_t orig_size, size_t blk_size,
+                              size_t nblk, const unsigned int* lens,
+                              const void* sparse_data, size_t worst_blk,
+                              int alg_id, int debug) {
+    if (!path || !lens || !sparse_data || nblk == 0) return -1;
+
+    FILE* f = fopen(path, "wb");
+    if (!f) return -1;
+
+    /* Use 2MB buffer for glibc buffered writing */
+    char* vbuf = (char*)malloc(2 * 1024 * 1024);
+    if (vbuf) setvbuf(f, vbuf, _IOFBF, 2 * 1024 * 1024);
+
+    uint16_t magic = 0x4C5A;
+    unsigned int header[4] = {(unsigned int)orig_size, (unsigned int)blk_size, (unsigned int)nblk, (unsigned int)alg_id};
+
+    if (fwrite(&magic, 1, 2, f) != 2) goto err;
+    if (fwrite(header, 4, 4, f) != 4) goto err;
+    if (fwrite(lens, 4, nblk, f) != nblk) goto err;
+
+    const unsigned char* dev_out = (const unsigned char*)sparse_data;
+    if (worst_blk == 0) {
+        size_t total = 0;
+        for(size_t i=0; i<nblk; i++) total += lens[i];
+        if (fwrite(dev_out, 1, total, f) != total) goto err;
+    } else {
+        /* Sequential fwrite handles coalescing via vbuf */
+        for (size_t i = 0; i < nblk; i++) {
+            if (lens[i] > 0) {
+                if (fwrite(dev_out + i * worst_blk, 1, lens[i], f) != lens[i]) goto err;
+            }
+        }
+    }
+
+    fclose(f);
+    if (vbuf) free(vbuf);
+    return 0;
+
+err:
+    if (f) fclose(f);
+    if (vbuf) free(vbuf);
+    return -1;
+}

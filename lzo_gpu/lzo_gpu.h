@@ -118,4 +118,13 @@ typedef union {
 #define lzo_dict_p lzo_dict_t *
 #endif
 
+/* Configuration for hardware features */
+#if defined(__IMAGE_SUPPORT__) || defined(__opencl_c_images) || defined(__INTEL_ALU_EXT__)
+#define LZO_USE_UNALIGNED 1
+#endif
+
+#ifndef LZO_USE_UNALIGNED
+#define LZO_USE_UNALIGNED 0
+#endif
+
 #endif /* __LZO_GPU_H_INCLUDED */

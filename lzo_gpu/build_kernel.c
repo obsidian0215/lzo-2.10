@@ -40,8 +40,8 @@ int main(int argc, char** argv) {
     if (!prog || err != CL_SUCCESS) { fprintf(stderr, "clCreateProgramWithSource failed: %d\n", err); clReleaseContext(ctx); free(src); return 1; }
 
     /* request OpenCL 2.0/C2.0 for kernels that use generic address space */
-    char build_opts[256];
-    snprintf(build_opts, sizeof(build_opts), "-cl-std=CL2.0 %s", extra_opts);
+    char build_opts[512];
+    snprintf(build_opts, sizeof(build_opts), "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable %s", extra_opts);
 
     err = clBuildProgram(prog, 1, &dev, build_opts, NULL, NULL);
     if (err != CL_SUCCESS) {

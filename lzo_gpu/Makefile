@@ -6,21 +6,15 @@ LDFLAGS ?= -lOpenCL -lm
 ## attempt to precompile kernels that aren't actually in the tree.
 CL_SOURCES := $(wildcard *.cl)
 
-all: build_kernel lzo_gpu lzo_gpu_daemon lzo_gpu_client precompile-combos
+all: build_kernel lzo_gpu
 
-build_kernel: build_kernel.c lzo_gpu_utils.c lzo_gpu_io.c
-	$(CC) $(CFLAGS) -o build_kernel build_kernel.c lzo_gpu_utils.c lzo_gpu_io.c $(LDFLAGS) -lpthread
+build_kernel: build_kernel.c lzo_gpu_utils.c
+	$(CC) $(CFLAGS) -o build_kernel build_kernel.c lzo_gpu_utils.c $(LDFLAGS) -lpthread
 
 
-# build the GPU host CLI (standalone renamed source)
-lzo_gpu: lzo_gpu_standalone.c lzo_gpu_utils.c lzo_gpu_core.c lzo_gpu_io.c
-	$(CC) $(CFLAGS) -o lzo_gpu lzo_gpu_standalone.c lzo_gpu_utils.c lzo_gpu_core.c lzo_gpu_io.c $(LDFLAGS) -lpthread
-# build the GPU daemon
-lzo_gpu_daemon: lzo_gpu_daemon.c lzo_gpu_utils.c lzo_gpu_core.c lzo_gpu_io.c
-	$(CC) $(CFLAGS) -o lzo_gpu_daemon lzo_gpu_daemon.c lzo_gpu_utils.c lzo_gpu_core.c lzo_gpu_io.c $(LDFLAGS) -lpthread
-# build the GPU client
-lzo_gpu_client: lzo_gpu_client.c
-	$(CC) $(CFLAGS) -o lzo_gpu_client lzo_gpu_client.c
+# build the unified GPU host CLI
+lzo_gpu: lzo_gpu.c lzo_gpu_daemon.c lzo_gpu_client.c lzo_gpu_utils.c lzo_gpu_core.c
+	$(CC) $(CFLAGS) -o lzo_gpu lzo_gpu.c lzo_gpu_daemon.c lzo_gpu_client.c lzo_gpu_utils.c lzo_gpu_core.c $(LDFLAGS) -lpthread
 
 precompile: build_kernel
 # If KERNEL is specified, build only that kernel (basename without .cl)
@@ -36,25 +30,11 @@ precompile: build_kernel
 precompile-combos: build_kernel
 	@echo "Generate binaries for all algorithms and dictionary sizes"
 	@for alg in lzo1x lzo1y; do \
-		for bits in 10 11; do \
+		for bits in 11 12 13 14 15; do \
 			echo "Building $${alg}_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits})..."; \
-			./build_kernel $${alg}.cl $${alg}_$${bits}.clbin "-I. -D D_BITS=$${bits}" || exit 1; \
-			echo "Building $${alg}_opt_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits} + LZO_USE_UNROLL2)..."; \
-			./build_kernel $${alg}.cl $${alg}_opt_$${bits}.clbin "-I. -D D_BITS=$${bits} -D LZO_USE_UNROLL2" || exit 1; \
-			echo "Building $${alg}_debug_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits} + LZO_GPU_DEBUG)..."; \
-			./build_kernel $${alg}.cl $${alg}_debug_$${bits}.clbin "-I. -D D_BITS=$${bits} -D LZO_GPU_DEBUG" || exit 1; \
-			echo "Building $${alg}_debug_opt_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits} + LZO_GPU_DEBUG + LZO_USE_UNROLL2)..."; \
-			./build_kernel $${alg}.cl $${alg}_debug_opt_$${bits}.clbin "-I. -D D_BITS=$${bits} -D LZO_GPU_DEBUG -D LZO_USE_UNROLL2" || exit 1; \
-		done; \
-		for bits in 12 13; do \
-			echo "Building $${alg}_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits})..."; \
-			./build_kernel $${alg}.cl $${alg}_$${bits}.clbin "-I. -D D_BITS=$${bits}" || exit 1; \
-			echo "Building $${alg}_opt_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits} + LZO_USE_UNROLL4)..."; \
-			./build_kernel $${alg}.cl $${alg}_opt_$${bits}.clbin "-I. -D D_BITS=$${bits} -D LZO_USE_UNROLL4" || exit 1; \
-			echo "Building $${alg}_debug_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits} + LZO_GPU_DEBUG)..."; \
-			./build_kernel $${alg}.cl $${alg}_debug_$${bits}.clbin "-I. -D D_BITS=$${bits} -D LZO_GPU_DEBUG" || exit 1; \
-			echo "Building $${alg}_debug_opt_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits} + LZO_GPU_DEBUG + LZO_USE_UNROLL4)..."; \
-			./build_kernel $${alg}.cl $${alg}_debug_opt_$${bits}.clbin "-I. -D D_BITS=$${bits} -D LZO_GPU_DEBUG -D LZO_USE_UNROLL4" || exit 1; \
+			./build_kernel $${alg}.cl $${alg}_$${bits}.clbin "-I. -D D_BITS=$${bits} -D LZO_USE_UNROLL2" || exit 1; \
+			echo "Building $${alg}_debug_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits} + DBG)..."; \
+			./build_kernel $${alg}.cl $${alg}_debug_$${bits}.clbin "-I. -D D_BITS=$${bits} -D LZO_GPU_DEBUG -D LZO_USE_UNROLL2" || exit 1; \
 		done; \
 	done
 	@echo "Also build decompression kernels"
@@ -113,7 +93,7 @@ testdata:
 	python3 ../tools/generate-test-data.py --suite --out-dir "$$OUTDIR" || (echo "failed to generate test data"; exit 1)
 
 clean:
-	rm -f build_kernel lzo_gpu lzo_gpu_daemon lzo_gpu_client *.bin
+	rm -f build_kernel lzo_gpu *.bin
 	@echo "Note: precompiled .clbin kernel binaries are preserved by default. Run 'make clean-clbin' to remove them."
 
 clean-clbin:
@@ -122,4 +102,4 @@ clean-clbin:
 # remove everything including precompiled kernels
 distclean: clean clean-clbin
 
-.PHONY: all build_kernel lzo_gpu lzo_gpu_daemon lzo_gpu_client precompile precompile-all clean clean-clbin distclean
+.PHONY: all build_kernel lzo_gpu precompile precompile-all clean clean-clbin distclean

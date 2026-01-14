@@ -33,8 +33,6 @@ size_t lzo_adaptive_block_size(size_t in_sz, cl_uint cu);
 size_t lzo_adaptive_block_size_with_entropy(const unsigned char* data, size_t in_sz, cl_uint cu, double* entropy_out, int debug);
 size_t lzo_adaptive_block_size_from_entropy(size_t in_sz, double entropy, cl_uint cu, int debug);
 int lzo_specified_unit_is_bytes(const char* s);
-/* Adaptive compression level selection based on file size and entropy (only used when level not specified) */
-int lzo_adaptive_compression_level(size_t in_sz, double entropy, int debug);
 /* data may be NULL if caller cannot provide a memory pointer — in that case
  * the function will fallback to count-based strategy using device CU only.
  * fixed_blk_bytes forces a specific block size if > 0. If the caller sets
@@ -49,17 +47,31 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
 
 /* Load and create a compression kernel for the given algorithm and D_BITS.
  * Selection rules (mirrors previous standalone logic):
- *  - If kernel_opt: try <alg>_debug_opt (or precompiled <alg>_debug_opt) then <alg>_opt.cl (or precompiled <alg>_opt).
  *  - If kernel_debug: try <alg>_debug.cl
  *  - Fallback to <alg>.cl
+ *  - Note: LZO_USE_UNROLL2 is now applied by default in all cases.
  * On success returns 0 and fills out_prog/out_krn and sets *kernel_has_dbg (1 if kernel takes debug buffer arg).
  * On failure returns non-zero and, if provided, writes a short message into build_log.
  */
-int lzo_load_comp_kernel(cl_context ctx, cl_device_id dev, const char *alg_name, int comp_level, int kernel_debug, int kernel_opt, int debug, cl_program *out_prog, cl_kernel *out_krn, int *kernel_has_dbg, char *build_log, size_t build_log_len);
+int lzo_load_comp_kernel(cl_context ctx, cl_device_id dev, const char *alg_name, int comp_level, int debug, cl_program *out_prog, cl_kernel *out_krn, int *kernel_has_dbg, char *build_log, size_t build_log_len);
 
 /* Parse and print an instrumented debug buffer (same logic used by standalone). Returns 0 on OK, 1 on sanity failure. */
 int lzo_parse_and_print_debug_buffer(const uint32_t *dbg_map, size_t dbg_fields, size_t nblk, size_t blk, size_t worst_blk);
 
+/* Daemon paths */
+void lzo_set_daemon_socket_path(const char* path);
+void lzo_set_daemon_pidfile_path(const char* path);
+const char* lzo_daemon_socket_path(void);
+const char* lzo_daemon_pidfile_path(void);
+
+/* Optimized IO helpers */
+int lzo_read_file_to_buf(const char* path, void* dest, size_t size, unsigned long* read_us_out);
+
+int lzo_write_compressed_file(const char* path,
+                              size_t orig_size, size_t blk_size,
+                              size_t nblk, const unsigned int* lens,
+                              const void* sparse_data, size_t worst_blk,
+                              int alg_id, int debug);
 
 #ifdef __cplusplus
 }

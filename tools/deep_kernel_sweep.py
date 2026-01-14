@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Deep kernel sweep for representative samples.
 
-Runs standalone lzo_gpu in debug/opt instrumented kernels across
+Runs standalone lzo_gpu in baseline/opt/opt-debug/debug kernels across
 D_BITS × block sizes and aggregates median kernel exec times and
 per-block counters (lookups/hits/match_bytes).
 
 Usage example:
-  python3 tools/deep_kernel_sweep.py --out /tmp/deep_scan --samples pattern_16b_1mb.dat,random_4kb.dat --blocks 256B,512B,1k,2k,4k,8k --bits 6,7,8,9,10,11,12,14 --repeats 3
+    python3 tools/deep_kernel_sweep.py --out /tmp/deep_scan --blocks 256B,512B,1k,2k,4k,8k --bits 6,7,8,9,10,11,12,14 --repeats 3
+
+Defaults:
+- samples: all regular files under /root/samples
+- variants: baseline,opt,opt-debug,debug
 """
 
 import argparse
@@ -16,6 +20,7 @@ import time
 import datetime
 import re
 import csv
+import filecmp
 
 from pathlib import Path
 from statistics import median
@@ -29,7 +34,10 @@ def run_cmd(cmd, timeout=300, extra_env=None):
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
-    p = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    # If LZO_GPU_DIR is specified, run the command in that directory so that
+    # the OpenCL compiler can find local headers (like lzo_gpu.h) via -I.
+    cwd = env.get('LZO_GPU_DIR')
+    p = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, cwd=cwd)
     return p.returncode, p.stdout.decode('utf-8', errors='replace'), p.stderr.decode('utf-8', errors='replace')
 
 
@@ -56,14 +64,47 @@ patt_kernel_ms = re.compile(r'Kernel Exec\s*:\s*([0-9.]+)\s*ms')
 
 
 def parse_kernel_ms(stdout_text):
-    for line in stdout_text.splitlines():
-        m = patt_kernel_ms.search(line)
-        if m:
-            try:
-                return float(m.group(1))
-            except Exception:
-                return None
-    return None
+    comp_ms = None
+    dec_ms = None
+
+    # Split by Statistics headers to separate compression and decompression
+    parts = re.split(r'=== (?:Compression|Decompression) Statistics ===', stdout_text)
+
+    # Patt for "Kernel Exec : 123.456 ms"
+    patt = re.compile(r'Kernel Exec\s*:\s*([0-9.]+)\s*ms')
+
+    # If we have 3 parts: [before, compression_stats, decompression_stats]
+    if len(parts) >= 3:
+        # Compression is in parts[1], Decompression in parts[2]
+        m1 = patt.search(parts[1])
+        if m1: comp_ms = float(m1.group(1))
+        m2 = patt.search(parts[2])
+        if m2: dec_ms = float(m2.group(1))
+        return comp_ms, dec_ms
+
+    # Fallback for single match
+    m = patt.search(stdout_text)
+    if m: comp_ms = float(m.group(1))
+    return comp_ms, None
+
+def parse_kernel_thr(stdout_text):
+    comp_thr = None
+    dec_thr = None
+
+    parts = re.split(r'=== (?:Compression|Decompression) Statistics ===', stdout_text)
+    # Patt for "(kernel: 123.45 MB/s)"
+    patt = re.compile(r'\(kernel:\s*([0-9.]+)\s*MB/s\)')
+
+    if len(parts) >= 3:
+        m1 = patt.search(parts[1])
+        if m1: comp_thr = float(m1.group(1))
+        m2 = patt.search(parts[2])
+        if m2: dec_thr = float(m2.group(1))
+        return comp_thr, dec_thr
+
+    m = patt.search(stdout_text)
+    if m: comp_thr = float(m.group(1))
+    return comp_thr, None
 
 
 def parse_size_bytes(s):
@@ -162,18 +203,18 @@ def choose_adaptive_blocks_bits(size_bytes, dev_info):
     MB = KB * KB
 
     # More permissive candidates (allow up to the device/C default max block)
-    if size_bytes < 5 * MB:
-        cand_blocks = [1024, 2048, 4096, 8192]
-        cand_bits = [8, 9, 10]
-    elif size_bytes < 47 * MB:
-        cand_blocks = [4096, 8192, 16384, 32768]
+    if size_bytes < 4 * MB:
+        cand_blocks = [1024, 2048, 4096]
         cand_bits = [10, 11, 12]
-    elif size_bytes < 134 * MB:
-        cand_blocks = [8192, 16384, 32768, 65536]
+    elif size_bytes < 38 * MB:
+        cand_blocks = [4096, 8192, 16384]
+        cand_bits = [10, 11, 12]
+    elif size_bytes < 98 * MB:
+        cand_blocks = [8192, 16384, 32768]
         cand_bits = [11, 12, 13]
     else:
-        cand_blocks = [16384,32768, 65536, 131072]
-        cand_bits = [12, 13, 14]
+        cand_blocks = [16384,32768, 65536]
+        cand_bits = [11, 12, 13]
 
     # cap bits by device local memory (dict entry = 2 bytes)
     local_mem = dev_info.get('local_mem', 64 * 1024) if dev_info else 64 * 1024
@@ -227,14 +268,75 @@ def choose_adaptive_blocks_bits(size_bytes, dev_info):
     return filtered_blocks, cand_bits, info
 
 
+def discover_samples(arg_samples):
+    """Return a list of sample filenames.
+
+    If arg_samples is provided, it can be a comma-separated list of filenames
+    or a list of paths (if passed via shell glob).
+    """
+    if arg_samples:
+        # Handle both comma-separated string and list of paths from glob
+        if isinstance(arg_samples, str):
+            items = [s.strip() for s in arg_samples.split(',') if s.strip()]
+        else:
+            items = arg_samples
+
+        # If items are absolute paths, just take the basename but keep the path for later
+        # Actually, the rest of the script expects filenames relative to /root/samples
+        # or absolute paths. Let's normalize to absolute paths if they exist.
+        results = []
+        for item in items:
+            p = Path(item)
+            if p.exists():
+                results.append(str(p.resolve()))
+            else:
+                # Try relative to /root/samples
+                p2 = Path('/root/samples') / item
+                if p2.exists():
+                    results.append(str(p2.resolve()))
+        return results
+
+    root = Path('/root/samples')
+    if not root.exists():
+        return []
+    # Include both regular files and symlinks (resolve symlinks to verify they point to files)
+    files = []
+    for p in root.iterdir():
+        # Include if it's a regular file or if it's a symlink that resolves to a file
+        if p.is_file() or (p.is_symlink() and p.resolve().is_file()):
+            files.append(p.name)
+    return sorted(files)
+
+
+def normalize_variants(arg_variants):
+    """Normalize and validate variant names.
+
+    Accepts variants like: baseline, exp, exp2, opt, debug, opt-debug, exp-opt, exp-debug, exp2-opt, etc.
+    Returns the normalized unique list in the same order provided.
+    """
+    mapped = []
+    for v in arg_variants:
+        if not v: continue
+        v = v.strip().lower()
+        # normalize alternative spellings
+        v = v.replace('debug-opt','opt-debug')
+        v = v.replace('_','-')
+        # accept any token that looks reasonable (letters, digits, hyphen)
+        if re.match(r'^[a-z0-9\-]+$', v):
+            if v not in mapped:
+                mapped.append(v)
+    return mapped
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', default=None, help='Output directory')
-    ap.add_argument('--samples', default='pattern_16b_1mb.dat,zero_17kb.dat,random_4kb.dat,seq_1mb.dat,zero_1mb.dat,sparse_1mb.dat', help='Comma-separated sample filenames')
+    ap.add_argument('--samples', default=None, help='Comma-separated sample filenames; default: all files under /root/samples')
     ap.add_argument('--blocks', default=None, help='Comma-separated block sizes to consider; when omitted, per-sample adaptive selection is used')
-    ap.add_argument('--bits', default='6,7,8,9,10,11,12,14', help='Comma-separated D_BITS values')
-    ap.add_argument('--variants', default='debug,opt', help='Comma-separated kernel variants (debug,opt)')
+    ap.add_argument('--bits', default='10,11,12,13', help='Comma-separated D_BITS values')
+    ap.add_argument('--variants', default='baseline,opt,opt-debug,debug', help='Comma-separated kernel variants (baseline,opt,opt-debug,debug)')
     ap.add_argument('--repeats', type=int, default=3, help='Number of repeats per config')
+    ap.add_argument('--algo', default='lzo1x', help='Algorithm name (lzo1x, lzo1y)')
     args = ap.parse_args()
 
     out_base = Path(args.out) if args.out else None
@@ -243,15 +345,15 @@ def main():
     repo_root = Path(__file__).resolve().parents[1]
     lzo_bin = str(repo_root / 'lzo_gpu' / 'lzo_gpu')
 
-    samples = [s.strip() for s in args.samples.split(',') if s.strip()]
+    samples = discover_samples(args.samples)
     # DEFAULT_BLOCKS is used only when the user doesn't specify --blocks
-    DEFAULT_BLOCKS = '256B,512B,1k,2k,4k,8k'
+    DEFAULT_BLOCKS = '1k,4k,8k,16k,32k'
     blocks_arg = args.blocks if args.blocks is not None else DEFAULT_BLOCKS
     blocks = [b.strip() for b in blocks_arg.split(',') if b.strip()]
     bits = [int(b.strip()) for b in args.bits.split(',') if b.strip()]
-    variants = [v.strip() for v in args.variants.split(',') if v.strip()]
+    variants = normalize_variants(args.variants.split(','))
 
-    header = ['sample','sample_path','size_bytes','block_req','block_actual_kb','comp_level','kernel_variant','median_kernel_ms','median_kernel_thr','median_total_time_ms','median_nblk','median_total_lookups','median_total_hits','median_total_match_bytes','median_hit_rate','repeats','verified','compressed_size_bytes','compression_ratio']
+    header = ['sample','sample_path','size_bytes','block_req','block_actual_kb','comp_level','kernel_variant','median_kernel_ms','median_kernel_thr','median_decomp_kernel_ms','median_decomp_kernel_thr','median_total_time_ms','median_nblk','median_total_lookups','median_total_hits','median_total_match_bytes','median_hit_rate','repeats','verified','compressed_size_bytes','compression_ratio']
 
     # prepare CSV writer: stdout when no out_dir (zero-trace), or file when out specified
     if out_base:
@@ -335,6 +437,16 @@ def main():
                         cfg = f'B{block}_L{b}_{v}'
                         print(f"[{done}] {sample_basename} {cfg}", flush=True)
 
+                        # variant tokens: debug and opt may be combined with exp/exp2
+                        v_debug = ('debug' in v)
+                        v_opt = ('opt' in v)
+                        # algorithm name for -a flag
+                        alg_name = args.algo
+                        # prepare base extra env (no LZO_GPU_DIR needed - clbins in lzo_gpu dir)
+                        extra_env_base = {}
+                        if v_opt:
+                            extra_env_base['LZO_KERNEL_OPT'] = '1'
+
                         # Safety checks: rely on adaptive candidates and buffer limits; min-block restriction removed
                         block_bytes = int(blk)
                         if block_bytes == 0:
@@ -348,7 +460,7 @@ def main():
                         # If instrumented run would create too many blocks or too large debug buffer,
                         # try to increase block size (upscale) to meet safety constraints; if that's
                         # impossible (exceeds MAX_BLOCK_BYTES) then SKIP.
-                        if v in ('debug','opt') and ( (MAX_NBLK and nblk_est > MAX_NBLK) or (DBG_MAX_BYTES and dbg_bytes > DBG_MAX_BYTES) ):
+                        if v_debug and ( (MAX_NBLK and nblk_est > MAX_NBLK) or (DBG_MAX_BYTES and dbg_bytes > DBG_MAX_BYTES) ):
                             max_instrumented_blocks = DBG_MAX_BYTES // (7 * 4) if DBG_MAX_BYTES else MAX_NBLK
                             required_by_nblk = (size_bytes + MAX_NBLK - 1) // MAX_NBLK if MAX_NBLK else block_bytes
                             required_by_dbg = (size_bytes + max_instrumented_blocks - 1) // max_instrumented_blocks if max_instrumented_blocks else block_bytes
@@ -373,6 +485,8 @@ def main():
                         # initial verification run (once per config) and capture compressed size
                         kernel_ms_vals = []
                         kernel_thr_vals = []
+                        decomp_kernel_ms_vals = []
+                        decomp_kernel_thr_vals = []
                         total_time_vals = []
                         nblk_vals = []
                         total_lookups_vals = []
@@ -390,16 +504,15 @@ def main():
                         verify_out = Path(tmpf.name)
                         tmpf.close()
 
-                        comp_cmd = [lzo_bin, '-a', '1x', '-L', str(b), '-B', block, sample_path, '-o', str(verify_out)]
-                        extra_env = None
-                        if v == 'debug':
+                        comp_cmd = [lzo_bin, '-a', alg_name, '-L', str(b), '-B', block, sample_path, '-o', str(verify_out)]
+                        if v_debug:
                             comp_cmd.insert(1,'--debug')
-                        elif v == 'opt':
-                            extra_env = {'LZO_KERNEL_OPT': '1'}
-                        
+                        # copy the base extra env (contains LZO_KERNEL_OPT if opt variant)
+                        extra_env = dict(extra_env_base)
+
                         # Add --verify flag to compression command for in-memory round-trip verification
                         comp_cmd.append('--verify')
-                        
+
                         try:
                             rc_comp, sout_comp, serr_comp = run_cmd(comp_cmd, timeout=TIMEOUT, extra_env=extra_env)
                         except Exception as e:
@@ -419,9 +532,9 @@ def main():
                         verified = (rc_comp == 0 and 'verify ok' in comp_text)
 
                         # parse metrics from the verification compress run (included as first sample)
-                        k_ms = parse_kernel_ms(sout_comp + '\n' + serr_comp)
-                        m = re.search(r'\(kernel:\s*([0-9.]+)\s*MB/s\)', sout_comp + '\n' + serr_comp)
-                        k_thr = float(m.group(1)) if m else None
+                        output_combined = sout_comp + '\n' + serr_comp
+                        k_ms, d_ms = parse_kernel_ms(output_combined)
+                        k_thr, d_thr = parse_kernel_thr(output_combined)
                         gpu_blocks = parse_gpu_debug(serr_comp)
                         nblk = len(gpu_blocks)
                         total_lookups = sum(bk.get('lookups',0) for bk in gpu_blocks)
@@ -450,6 +563,8 @@ def main():
 
                         kernel_ms_vals.append(k_ms)
                         kernel_thr_vals.append(k_thr)
+                        if d_ms: decomp_kernel_ms_vals.append(d_ms)
+                        if d_thr: decomp_kernel_thr_vals.append(d_thr)
                         total_time_vals.append(None) # not parsing TOTAL here
                         nblk_vals.append(nblk)
                         total_lookups_vals.append(total_lookups)
@@ -458,6 +573,24 @@ def main():
                         hit_rate_vals.append(hit_rate)
 
                         if not verified:
+                            # CPU Fallback Verification: determine if it's a compression or decompression issue
+                            cpu_lzo = "/root/lzo-2.10/lzo_cpu/lzo_cpu"
+                            failure_reason = "Unknown"
+                            rc_cpu = -1
+                            if os.path.exists(cpu_lzo) and verify_out.exists():
+                                with tempfile.NamedTemporaryFile(prefix='cpu_dec_', suffix='.raw', delete=False) as tmp_cpu_dec:
+                                    tmp_cpu_dec_path = tmp_cpu_dec.name
+
+                                cpu_cmd = [cpu_lzo, '-d', '-a', alg_name, str(verify_out), '-o', tmp_cpu_dec_path]
+                                rc_cpu, sout_cpu, serr_cpu = run_cmd(cpu_cmd)
+
+                                if rc_cpu == 0 and os.path.exists(tmp_cpu_dec_path) and filecmp.cmp(sample_path, tmp_cpu_dec_path, shallow=False):
+                                    failure_reason = "GPU_DECOMP_ISSUE"
+                                else:
+                                    failure_reason = "GPU_COMP_ISSUE"
+
+                                if os.path.exists(tmp_cpu_dec_path): os.unlink(tmp_cpu_dec_path)
+
                             # Record failure (write failures CSV only if out_dir requested; otherwise keep zero-trace)
                             try:
                                 if out_base:
@@ -465,10 +598,18 @@ def main():
                                     write_header = not failures_file.exists()
                                     with open(failures_file, 'a', newline='') as ff:
                                         if write_header:
-                                            ff.write('timestamp,sample,sample_path,block,bits,variant,comp_size_bytes,compression_ratio,rc_comp,rc_dec\n')
+                                            ff.write('timestamp,sample,sample_path,block,bits,variant,comp_size_bytes,compression_ratio,rc_comp,rc_cpu,failure_reason\n')
                                         ts = datetime.datetime.utcnow().isoformat() + 'Z'
-                                        rc_dec_str = str(rc_dec) if 'rc_dec' in locals() else ''
-                                        ff.write(f'{ts},{sample_basename},"{sample_path}",{block},{b},{v},{comp_size or ""},{comp_ratio or ""},{rc_comp},{rc_dec_str}\n')
+                                        ff.write(f'{ts},{sample_basename},"{sample_path}",{block},{b},{v},{comp_size or ""},{comp_ratio or ""},{rc_comp},{rc_cpu},{failure_reason}\n')
+
+                                    # Also write a more detailed log for human inspection
+                                    with open(out_base / 'verify_failures.log', 'a') as fl:
+                                        fl.write(f"[{ts}] FAILURE: {sample_basename} {cfg}\n")
+                                        fl.write(f"Reason: {failure_reason}\n")
+                                        fl.write(f"GPU Return Code: {rc_comp}\n")
+                                        fl.write(f"CPU Return Code: {rc_cpu}\n")
+                                        fl.write(f"GPU Stderr: {serr_comp[:1000]}\n")
+                                        fl.write("-" * 40 + "\n")
                                 else:
                                     # zero-trace mode: do not emit any textual traces (silent)
                                     pass
@@ -484,6 +625,8 @@ def main():
                             # compute medians from the single run
                             med_kernel_ms = median_or_none(kernel_ms_vals)
                             med_kernel_thr = median_or_none(kernel_thr_vals)
+                            med_decomp_ms = median_or_none(decomp_kernel_ms_vals)
+                            med_decomp_thr = median_or_none(decomp_kernel_thr_vals)
                             med_nblk = median_or_none(nblk_vals)
                             med_total_lookups = median_or_none(total_lookups_vals)
                             med_total_hits = median_or_none(total_hits_vals)
@@ -493,7 +636,7 @@ def main():
                             # write summary row and skip further repeats
                             block_bytes_row = parse_size_bytes(block)
                             block_actual_kb = None if med_nblk is None else (0 if med_nblk==0 else int(med_nblk * block_bytes_row / 1024))
-                            row = [sample_basename, sample_path, size_bytes, block, block_actual_kb, b, v, med_kernel_ms, med_kernel_thr, None, med_nblk, med_total_lookups, med_total_hits, med_total_match_bytes, med_hit_rate, args.repeats, 'NO', comp_size, comp_ratio]
+                            row = [sample_basename, sample_path, size_bytes, block, block_actual_kb, b, v, med_kernel_ms, med_kernel_thr, med_decomp_ms, med_decomp_thr, None, med_nblk, med_total_lookups, med_total_hits, med_total_match_bytes, med_hit_rate, args.repeats, 'NO', comp_size, comp_ratio]
                             w.writerow(row)
                             fout.flush()
                             continue
@@ -505,21 +648,19 @@ def main():
                             rfil = Path(tmpf.name)
                             tmpf.close()
 
-                            cmd = [lzo_bin, '-a', '1x', '-L', str(b), '-B', block, sample_path, '-o', str(rfil)]
-                            extra_env = None
-                            if v == 'debug':
+                            cmd = [lzo_bin, '-a', alg_name, '-L', str(b), '-B', block, sample_path, '-o', str(rfil)]
+                            if v_debug:
                                 cmd.insert(1,'--debug')
-                            elif v == 'opt':
-                                extra_env = {'LZO_KERNEL_OPT': '1'}
+                            extra_env = dict(extra_env_base)
                             try:
                                 rc, sout, serr = run_cmd(cmd, timeout=TIMEOUT, extra_env=extra_env)
                             except Exception as e:
                                 rc = -1; sout=''; serr=str(e)
 
                             # parse metrics
-                            k_ms = parse_kernel_ms(sout + '\n' + serr)
-                            m = re.search(r'\(kernel:\s*([0-9.]+)\s*MB/s\)', sout + '\n' + serr)
-                            k_thr = float(m.group(1)) if m else None
+                            output_combined = sout + '\n' + serr
+                            k_ms, d_ms = parse_kernel_ms(output_combined)
+                            k_thr, d_thr = parse_kernel_thr(output_combined)
                             gpu_blocks = parse_gpu_debug(serr)
                             nblk = len(gpu_blocks)
                             total_lookups = sum(bk.get('lookups',0) for bk in gpu_blocks)
@@ -529,6 +670,8 @@ def main():
 
                             kernel_ms_vals.append(k_ms)
                             kernel_thr_vals.append(k_thr)
+                            if d_ms: decomp_kernel_ms_vals.append(d_ms)
+                            if d_thr: decomp_kernel_thr_vals.append(d_thr)
                             total_time_vals.append(None) # not parsing TOTAL here
                             nblk_vals.append(nblk)
                             total_lookups_vals.append(total_lookups)
@@ -544,6 +687,8 @@ def main():
 
                         med_kernel_ms = median_or_none(kernel_ms_vals)
                         med_kernel_thr = median_or_none(kernel_thr_vals)
+                        med_decomp_ms = median_or_none(decomp_kernel_ms_vals)
+                        med_decomp_thr = median_or_none(decomp_kernel_thr_vals)
                         med_nblk = median_or_none(nblk_vals)
                         med_total_lookups = median_or_none(total_lookups_vals)
                         med_total_hits = median_or_none(total_hits_vals)
@@ -553,7 +698,7 @@ def main():
                         # write summary row
                         block_bytes_row = parse_size_bytes(block)
                         block_actual_kb = None if med_nblk is None else (0 if med_nblk==0 else int(med_nblk * block_bytes_row / 1024))
-                        row = [sample_basename, sample_path, size_bytes, block, block_actual_kb, b, v, med_kernel_ms, med_kernel_thr, None, med_nblk, med_total_lookups, med_total_hits, med_total_match_bytes, med_hit_rate, args.repeats, ('YES' if verified else 'NO'), comp_size, comp_ratio]
+                        row = [sample_basename, sample_path, size_bytes, block, block_actual_kb, b, v, med_kernel_ms, med_kernel_thr, med_decomp_ms, med_decomp_thr, None, med_nblk, med_total_lookups, med_total_hits, med_total_match_bytes, med_hit_rate, args.repeats, ('YES' if verified else 'NO'), comp_size, comp_ratio]
                         w.writerow(row)
                         fout.flush()
                         # cleanup temporary verify file to avoid leaving artifacts

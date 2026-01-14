@@ -16,10 +16,12 @@ typedef struct {
 
     unsigned long blocking_calc_us;
 
-    unsigned long buffer_alloc_in_us;
+    /* Unified buffer allocation timing: total of all buffer allocs (in/out/len/off)
+     * Previous fields buffer_alloc_in_us / buffer_alloc_out_us / buffer_alloc_len_us
+     * have been removed in favor of this single consolidated metric.
+     */
+    unsigned long buffer_alloc_us;
     unsigned long data_upload_us;
-    unsigned long buffer_alloc_out_us;
-    unsigned long buffer_alloc_len_us;
 
     unsigned long setup_args_us;
     unsigned long kernel_setup_us;
@@ -30,7 +32,7 @@ typedef struct {
     unsigned long download_total_us;
 
     unsigned long file_write_us;
-    unsigned long cleanup_us;
+    /* Note: cleanup_us removed intentionally */
     /* Additional meta fields communicated through the timing struct so clients
      * receive the same levels of detail as standalone logs. These are used by
      * the client to surface block/kernel/workgroup information in client
