@@ -452,6 +452,25 @@ chmod +x tools/*.py tools/*.sh
 
 ---
 
+## Autotune 训练
+
+使用样本目录训练或迭代 Autotune 配置。默认输出路径优先写入 `lzo_gpu` 二进制同目录下的 `lzo_gpu.autotune.conf`（若不可写或找不到二进制则回退到 `~/.lzo_autotune.conf`）。
+
+```bash
+# 训练并写到二进制同目录下的 lzo_gpu.autotune.conf（若可用）
+python3 tools/autotune_train.py --sample-dir /path/to/samples --out /path/to/lzo_gpu.autotune.conf
+
+# 迭代合并已有结果（当 out 文件存在时会默认合并；也可通过 --existing/--merge 明确指定）
+python3 tools/autotune_train.py --sample-dir /path/to/new_samples --existing /path/to/lzo_gpu.autotune.conf --merge --out /path/to/lzo_gpu.autotune.conf --iters 2
+```
+
+环境变量：
+
+- `LZO_GPU_AUTOTUNE_CONF`：可显式指定运行时自动加载的配置文件路径（优先级最高）。
+
+说明：配置文件仅由 `tools/autotune_train.py` 生成/更新；运行时客户端会尝试读取该文件来填充未显式指定的参数项，**不会覆盖用户显式指定的参数**。如果无法在二进制目录写入，可选择将训练结果写入 `~/.lzo_autotune.conf` 并把 `LZO_GPU_AUTOTUNE_CONF` 指向该路径。
+
+
 ## 📚 参考文档
 
 - **LZO GPU实现**: `lzo_gpu/PERFORMANCE_SUMMARY.md`  (合并后的实现与性能说明)
@@ -462,20 +481,12 @@ chmod +x tools/*.py tools/*.sh
 
 ## 🔧 维护说明
 
-- ✅ 删除 `summarize_throughput.py` (功能被 `analysis.py analyze` 覆盖)
 | 脚本 | 状态 | 说明 |
 |------|------|------|
-| analysis.py (analyze) | ✅ 活跃 | GPU主力分析工具 |
-| plot_gpu_analysis.py | ✅ 活跃 | GPU统一绘图工具 (新) |
 | aggregate_results.py | ✅ 活跃 | CPU聚合工具 |
 | run_lzo_cpu.sh | ✅ 活跃 | CPU基准测试 |
 | param_scan.sh | ✅ 活跃 | GPU参数扫描 |
-| summarize_throughput.py | ❌ 已删除 | 被 `analysis.py analyze` 替代 |
-| generate_plots.py | ❌ 已删除 | 合并到plot_gpu_analysis.py |
-| generate_throughput_plots.py | ❌ 已删除 | 合并到plot_gpu_analysis.py |
+| generate_param_direction_tables.py | ✅ 活跃 | 生成 `per_param_direction_tables.md`（从主param_scan CSV） |
+| autotune_train.py | ✅ 活跃 | 从 `--sample-dir` 训练/迭代并写入 `~/.lzo_autotune.conf`，供运行时自动选择默认配置 |
 
 ---
-
-**文档版本**: 2.0
-**最后更新**: 2024-11-22
-**维护者**: LZO Tools Team

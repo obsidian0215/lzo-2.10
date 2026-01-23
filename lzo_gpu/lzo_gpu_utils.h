@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <CL/cl.h>
 #include "lzo_defaults.h"
+#include "lzo_gpu_protocol.h"
 
 /* 通用工具宏 */
 #ifndef CLAMP
@@ -35,10 +36,10 @@ size_t lzo_adaptive_block_size_from_entropy(size_t in_sz, double entropy, cl_uin
 int lzo_specified_unit_is_bytes(const char* s);
 /* data may be NULL if caller cannot provide a memory pointer — in that case
  * the function will fallback to count-based strategy using device CU only.
- * fixed_blk_bytes forces a specific block size if > 0. If the caller sets
+ * blk_bytes forces a specific block size if > 0. If the caller sets
  * fixed_exact==1 then the requested value is used as-is (no alignment/minimum).
  */
-void lzo_choose_blocking_adaptive(const unsigned char* data, size_t in_sz, cl_device_id dev, size_t fixed_blk_bytes, int fixed_exact, size_t* blk_sz_out, size_t* nblk_out, int debug);
+void lzo_choose_blocking_adaptive(const unsigned char* data, size_t in_sz, cl_device_id dev, size_t blk_bytes, int fixed_exact, size_t* blk_sz_out, size_t* nblk_out, int debug);
 
 /* Load an OpenCL program from a precompiled binary (<prog>_<bits>.clbin or <prog>.clbin) or compile from source (<prog>.cl) with -D D_BITS=<bits>.
  * On success returns a built cl_program; on failure returns NULL and, if build_log is provided, writes build output into it.
@@ -46,17 +47,13 @@ void lzo_choose_blocking_adaptive(const unsigned char* data, size_t in_sz, cl_de
 cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const char *alg_name, int bits, char *build_log, size_t build_log_len);
 
 /* Load and create a compression kernel for the given algorithm and D_BITS.
- * Selection rules (mirrors previous standalone logic):
- *  - If kernel_debug: try <alg>_debug.cl
- *  - Fallback to <alg>.cl
- *  - Note: LZO_USE_UNROLL2 is now applied by default in all cases.
- * On success returns 0 and fills out_prog/out_krn and sets *kernel_has_dbg (1 if kernel takes debug buffer arg).
+ * Compiles/loads the base kernel (<alg>.cl / <alg>_<bits>.clbin). LZO_USE_UNROLL2 is applied by default.
+ * On success returns 0 and fills out_prog/out_krn and sets *kernel_has_dbg (1 if kernel takes a debug buffer arg; usually 0 in production builds).
  * On failure returns non-zero and, if provided, writes a short message into build_log.
  */
 int lzo_load_comp_kernel(cl_context ctx, cl_device_id dev, const char *alg_name, int comp_level, int debug, cl_program *out_prog, cl_kernel *out_krn, int *kernel_has_dbg, char *build_log, size_t build_log_len);
 
-/* Parse and print an instrumented debug buffer (same logic used by standalone). Returns 0 on OK, 1 on sanity failure. */
-int lzo_parse_and_print_debug_buffer(const uint32_t *dbg_map, size_t dbg_fields, size_t nblk, size_t blk, size_t worst_blk);
+/* Debug parsing and instrumentation helpers removed from production build. */
 
 /* Daemon paths */
 void lzo_set_daemon_socket_path(const char* path);
@@ -72,6 +69,17 @@ int lzo_write_compressed_file(const char* path,
                               size_t nblk, const unsigned int* lens,
                               const void* sparse_data, size_t worst_blk,
                               int alg_id, int debug);
+
+/* Apply autotune configuration to a request if corresponding fields are
+ * unspecified. Search order (priority):
+ *  1) LZO_GPU_AUTOTUNE_CONF (env) -> exact path
+ *  2) <exe_dir>/lzo_gpu.autotune.conf or <exe_dir>/../lzo_gpu/lzo_gpu.autotune.conf
+ *
+ * eturns 0 on success
+ * (config file found and applied, or defaults set after applying file);
+ * returns -1 if no configuration file was found.
+ */
+int lzo_apply_autotune_config(request_t* req);
 
 #ifdef __cplusplus
 }

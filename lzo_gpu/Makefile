@@ -33,11 +33,9 @@ precompile-combos: build_kernel
 		for bits in 11 12 13 14 15; do \
 			echo "Building $${alg}_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits})..."; \
 			./build_kernel $${alg}.cl $${alg}_$${bits}.clbin "-I. -D D_BITS=$${bits} -D LZO_USE_UNROLL2" || exit 1; \
-			echo "Building $${alg}_debug_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits} + DBG)..."; \
-			./build_kernel $${alg}.cl $${alg}_debug_$${bits}.clbin "-I. -D D_BITS=$${bits} -D LZO_GPU_DEBUG -D LZO_USE_UNROLL2" || exit 1; \
 		done; \
 	done
-	@echo "Also build decompression kernels"
+	@echo "Building decompression kernels"
 	@for alg in lzo1x lzo1y; do \
 		echo "Building $${alg}_decomp.clbin..."; \
 		./build_kernel $${alg}_decomp.cl $${alg}_decomp.clbin "-I." || exit 1; \

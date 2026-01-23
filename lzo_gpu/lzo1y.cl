@@ -26,11 +26,7 @@ typedef __generic unsigned int *  lzo_uintp;
 #define D_BITS 14
 #endif
 
-#ifdef LZO_GPU_DEBUG
-#ifndef DBG_FIELDS
-#define DBG_FIELDS 7
-#endif
-#endif
+/* Debug instrumentation removed in production build. */
 
 /* Standard macros */
 #define LZO_BYTE(x)       ((unsigned char) (x))
@@ -153,17 +149,10 @@ static inline uint lzo1y_hash32(uint dv)
 #define DINDEX(dv,p)        ((lzo1y_hash32(dv)) >> (32 - D_BITS))
 #define DENTRY(p,in)        ((lzo_dict_t) pd(p, in))
 
-#ifdef LZO_GPU_DEBUG
-static lzo_uint
-lzo1y_compress_core(__generic const lzo_bytep in , lzo_uint  in_len,
-                   __generic lzo_bytep out, lzo_uintp out_len,
-                    lzo_uint ti, lzo_dict_p dict, __generic uint *dbg_out)
-#else
 static lzo_uint
 lzo1y_compress_core(__generic const lzo_bytep in , lzo_uint  in_len,
                    __generic lzo_bytep out, lzo_uintp out_len,
                     lzo_uint ti, lzo_dict_p dict)
-#endif
 {
     __generic const lzo_bytep ip;
     __generic lzo_bytep op;
@@ -175,9 +164,7 @@ lzo1y_compress_core(__generic const lzo_bytep in , lzo_uint  in_len,
     ip = in;
     ii = ip;
 
-#ifdef LZO_GPU_DEBUG
-    uint dbg_lookups = 0, dbg_hits = 0, dbg_updates = 0, dbg_matched_bytes = 0;
-#endif
+
 
     ip += ti < 4 ? 4 - ti : 0;
     for (;;)
@@ -365,14 +352,7 @@ m_len_done:
     }
 
     *out_len = pd(op, out);
-#ifdef LZO_GPU_DEBUG
-    if (dbg_out) {
-        dbg_out[3] = dbg_lookups;
-        dbg_out[4] = dbg_hits;
-        dbg_out[5] = dbg_matched_bytes;
-        dbg_out[6] = dbg_updates;
-    }
-#endif
+
     return pd(in_end,ii-ti);
 }
 
@@ -414,11 +394,7 @@ static inline void dict_clear_global(__global lzo_dict_t* dict) {
     barrier(CLK_GLOBAL_MEM_FENCE);
 }
 
-#ifdef LZO_GPU_DEBUG
-static void do_compress(__global const uchar* in, uint in_len, __global uchar* out, lzo_uintp out_len, lzo_uint ti, __global lzo_dict_t* dict, __global uint* dbg)
-#else
 static void do_compress(__global const uchar* in, uint in_len, __global uchar* out, lzo_uintp out_len, lzo_uint ti, __global lzo_dict_t* dict)
-#endif
 {
     lzo_uint t = ti;
     __generic uchar* op = (__generic uchar*)out;
@@ -427,18 +403,13 @@ static void do_compress(__global const uchar* in, uint in_len, __global uchar* o
 
     if (get_local_id(0) == 0) {
         lzo_uint olen = 0;
-#ifdef LZO_GPU_DEBUG
-        t = lzo1y_compress_core(in, in_len, op, &olen, t, dict, dbg);
-#else
         t = lzo1y_compress_core(in, in_len, op, &olen, t, dict);
-#endif
         op += olen;
         op = lzo1y_compress_terminate(in + in_len, 0, op, t, (__generic uchar*)out);
         *out_len = (lzo_uint)(op - (__generic uchar*)out);
     }
 }
 
-#ifndef LZO_GPU_DEBUG
 __kernel void lzo1y_block_compress(__global const uchar *in ,
                                    __global       uchar *out,
                                    __global       uint  *out_len,
@@ -468,39 +439,3 @@ __kernel void lzo1y_block_compress(__global const uchar *in ,
         }
     }
 }
-#else
-__kernel void lzo1y_block_compress_debug(__global const uchar *in ,
-                                         __global       uchar *out,
-                                         __global       uint  *out_len,
-                                         const uint  in_sz,
-                                         const uint  blk_size,
-                                         const uint  worst_blk,
-                                         __global lzo_dict_t *dict_pool,
-                                         const uint  dict_pool_size,
-                                         __global uint *dbg)
-{
-    const uint gid = get_group_id(0);
-    const uint num_groups = get_num_groups(0);
-    __global lzo_dict_t *dict = dict_pool + ((size_t)gid << D_BITS);
-
-    uint nblk = (in_sz + blk_size - 1) / blk_size;
-
-    for (uint bidx = gid; bidx < nblk; bidx += num_groups) {
-        uint in_off = bidx * blk_size;
-        uint in_len = (in_off + blk_size <= in_sz) ? blk_size : (in_sz - in_off);
-
-        __global const uchar* ip = in + in_off;
-        __global uchar* op = out + bidx * worst_blk;
-
-        lzo_uint olen = 0;
-        do_compress(ip, in_len, op, &olen, 0, dict, dbg + bidx * DBG_FIELDS);
-
-        if (get_local_id(0) == 0) {
-            out_len[bidx] = (uint)olen;
-            dbg[bidx*DBG_FIELDS + 0] = in_len;
-            dbg[bidx*DBG_FIELDS + 1] = (uint)olen;
-            dbg[bidx*DBG_FIELDS + 2] = (olen == 0) ? 1 : 0;
-        }
-    }
-}
-#endif

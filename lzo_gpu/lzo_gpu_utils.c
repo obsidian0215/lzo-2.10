@@ -125,6 +125,92 @@ const char* lzo_daemon_pidfile_path(void) {
     if (env && env[0]) return env;
     return "/tmp/lzo_gpu_daemon.pid";
 }
+
+int lzo_apply_autotune_config(request_t* req)
+{
+    char conf_path[PATH_MAX];
+    const char* envp = getenv("LZO_GPU_AUTOTUNE_CONF");
+    FILE* f = NULL;
+
+    /* 1) env var override */
+    if (envp && *envp) {
+        snprintf(conf_path, sizeof(conf_path), "%s", envp);
+        f = fopen(conf_path, "r");
+    }
+
+    /* 2) exe-directory default: lzo_gpu.autotune.conf, .lzo_gpu.autotune.conf, or ../lzo_gpu/... */
+    if (!f) {
+        char exe_path[PATH_MAX] = {0};
+        ssize_t r = readlink("/proc/self/exe", exe_path, sizeof(exe_path)-1);
+        if (r > 0) {
+            exe_path[r] = '\0';
+            char* slash = strrchr(exe_path, '/');
+            if (slash) {
+                *slash = '\0';
+                snprintf(conf_path, sizeof(conf_path), "%s/lzo_gpu.autotune.conf", exe_path);
+                f = fopen(conf_path, "r");
+                if (!f) {
+                    snprintf(conf_path, sizeof(conf_path), "%s/.lzo_gpu.autotune.conf", exe_path);
+                    f = fopen(conf_path, "r");
+                }
+                if (!f) {
+                    snprintf(conf_path, sizeof(conf_path), "%s/../lzo_gpu/lzo_gpu.autotune.conf", exe_path);
+                    f = fopen(conf_path, "r");
+                }
+                if (!f) {
+                    snprintf(conf_path, sizeof(conf_path), "%s/../lzo_gpu/.lzo_gpu.autotune.conf", exe_path);
+                    f = fopen(conf_path, "r");
+                }
+            }
+        }
+    }
+
+    if (!f) return -1; /* no config found */
+
+    int cfg_alg = -1, cfg_level = -1, cfg_block_kb = -1, cfg_lsz = -1;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\0') continue;
+        char key[128], val[128];
+        if (sscanf(p, "%127[^=]=%127s", key, val) == 2) {
+            if (strcmp(key, "global_alg") == 0) {
+                if (strcmp(val, "1x") == 0 || strcmp(val, "lzo1x") == 0) cfg_alg = 0;
+                else if (strcmp(val, "1y") == 0 || strcmp(val, "lzo1y") == 0) cfg_alg = 1;
+                else if (val[0] >= '0' && val[0] <= '9') cfg_alg = atoi(val);
+            } else if (strcmp(key, "global_level") == 0) {
+                cfg_level = atoi(val);
+            } else if (strcmp(key, "global_block_kb") == 0) {
+                cfg_block_kb = atoi(val);
+            } else if (strcmp(key, "global_lsz") == 0) {
+                cfg_lsz = atoi(val);
+            }
+        }
+    }
+    fclose(f);
+
+    /* Apply only to fields that are unspecified (do not override user choices) */
+    if (req->block_size == 0 && cfg_block_kb > 0) req->block_size = cfg_block_kb;
+    if (req->local_size == 0 && cfg_lsz > 0) req->local_size = (uint32_t)cfg_lsz;
+    if (req->operation == 'C') {
+        if (req->level <= 0 && cfg_level > 0) req->level = cfg_level;
+        if (req->alg < 0 && cfg_alg >= 0) req->alg = cfg_alg;
+    } else {
+        /* For decompress, only apply local_size and block size (if needed) */
+        if (req->alg < 0 && cfg_alg >= 0) req->alg = cfg_alg;
+    }
+
+
+
+    /* Final fallbacks if still unspecified */
+    if (req->alg < 0) req->alg = 0; /* default lzo1x */
+    if (req->level <= 0 && req->operation == 'C') req->level = LZO_DEFAULT_COMP_LEVEL;
+    if (req->local_size == 0) req->local_size = LZO_LOCAL_SIZE_DEFAULT;
+    if (req->block_size == 0) req->block_size = LZO_DEFAULT_BLOCK_KB;
+
+    return 0;
+}
 /* lzo_utils: adaptive entropy/blocking helpers */
 double lzo_calc_entropy(const unsigned char* data, size_t size)
 {
@@ -313,15 +399,15 @@ size_t lzo_adaptive_block_size_with_entropy(const unsigned char* data, size_t in
     return base_block;
 }
 
-void lzo_choose_blocking_adaptive(const unsigned char* data, size_t in_sz, cl_device_id dev, size_t fixed_blk_bytes, int fixed_exact, size_t* blk_sz_out, size_t* nblk_out, int debug)
+void lzo_choose_blocking_adaptive(const unsigned char* data, size_t in_sz, cl_device_id dev, size_t blk_bytes, int fixed_exact, size_t* blk_sz_out, size_t* nblk_out, int debug)
 {
     cl_uint cu = 0;
     clGetDeviceInfo(dev, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cu), &cu, NULL);
     if (cu == 0) cu = 1;
 
     /* CLI or env override: fixed block size */
-    if (fixed_blk_bytes > 0) {
-        size_t blk = fixed_blk_bytes;
+    if (blk_bytes > 0) {
+        size_t blk = blk_bytes;
         int allow_unaligned = fixed_exact;
         /* Environment override: allow explicit unaligned blocks by setting LZO_ALLOW_UNALIGNED_BLOCKS=1 */
         const char* env = getenv("LZO_ALLOW_UNALIGNED_BLOCKS");
@@ -545,11 +631,8 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
          * LZO_USE_UNROLL2 is now enabled by default for all kernel builds.
          */
         char build_opts[256];
-        if (want_debug) {
-            snprintf(build_opts, sizeof(build_opts), "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I. -I./lzo_gpu -I.. -D D_BITS=%d -D LZO_USE_UNROLL2 -D LZO_GPU_DEBUG", bits);
-        } else {
-            snprintf(build_opts, sizeof(build_opts), "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I. -I./lzo_gpu -I.. -D D_BITS=%d -D LZO_USE_UNROLL2", bits);
-        }
+        /* Debug compilation flags removed; always build production kernels */
+        snprintf(build_opts, sizeof(build_opts), "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I. -I./lzo_gpu -I.. -D D_BITS=%d -D LZO_USE_UNROLL2", bits);
         err = clBuildProgram(prog, 1, &dev, build_opts, NULL, NULL);
         if (err != CL_SUCCESS) {
             size_t log_sz = 0; clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
@@ -581,25 +664,15 @@ int lzo_load_comp_kernel(cl_context ctx, cl_device_id dev, const char *alg_name,
     strncpy(effective_alg, alg_name, sizeof(effective_alg)-1);
     effective_alg[sizeof(effective_alg)-1] = '\0';
 
-    /* Next try debug variant if requested (debug flag required) */
-    if (debug) {
-        snprintf(prog_base_name, sizeof(prog_base_name), "%s_debug", effective_alg);
-        /* Try loading debug binary directly - don't require .cl source to exist */
-        prog = lzo_load_program_with_dbits(ctx, dev, prog_base_name, comp_level, build_log, build_log_len);
-    }
-
-    /* Fallback to base algorithm */
+    /* Load base algorithm program */
+    prog = lzo_load_program_with_dbits(ctx, dev, effective_alg, comp_level, build_log, build_log_len);
     if (!prog) {
-        prog = lzo_load_program_with_dbits(ctx, dev, effective_alg, comp_level, build_log, build_log_len);
-        if (!prog) {
-            if (build_log && build_log[0] == '\0') snprintf(build_log, build_log_len, "failed to build kernel variants for %s", effective_alg);
-            return -1;
-        }
+        if (build_log && build_log[0] == '\0') snprintf(build_log, build_log_len, "failed to build kernel for %s", effective_alg);
+        return -1;
     }
 
     char krn_name[96];
-    if (debug) snprintf(krn_name, sizeof(krn_name), "%s_block_compress_debug", effective_alg);
-    else snprintf(krn_name, sizeof(krn_name), "%s_block_compress", effective_alg);
+    snprintf(krn_name, sizeof(krn_name), "%s_block_compress", effective_alg);
 
     krn = clCreateKernel(prog, krn_name, &err);
     if (err != CL_SUCCESS) {
@@ -612,105 +685,12 @@ int lzo_load_comp_kernel(cl_context ctx, cl_device_id dev, const char *alg_name,
     cl_int rc_g = clGetKernelInfo(krn, CL_KERNEL_NUM_ARGS, sizeof(num_args), &num_args, NULL);
     if (rc_g == CL_SUCCESS && num_args >= 7) *kernel_has_dbg = 1;
     else *kernel_has_dbg = 0;
-    if (debug) fprintf(stderr, "DBG: kernel num_args=%u kernel_has_dbg_arg=%d\n", num_args, *kernel_has_dbg);
 
     *out_prog = prog; *out_krn = krn;
     return 0;
 }
 
-/* Parse and print an instrumented debug buffer. Returns 0 on OK, 1 if a sanity failure occurred. */
-int lzo_parse_and_print_debug_buffer(const uint32_t *dbg_map, size_t dbg_fields, size_t nblk, size_t blk, size_t worst_blk)
-{
-    int abort_debug_sanity = 0;
-
-    /* Detect whether verbose fields are present by sampling first few blocks */
-    int verbose = 0;
-    size_t sample_n = nblk < 8 ? nblk : 8;
-    for (size_t i = 0; i < sample_n; ++i) {
-        uint32_t a3 = dbg_map[i * dbg_fields + 3];
-        uint32_t a4 = dbg_map[i * dbg_fields + 4];
-        uint32_t a5 = dbg_map[i * dbg_fields + 5];
-        uint32_t a6 = dbg_map[i * dbg_fields + 6];
-        if (a3 != 0 || a4 != 0 || a5 != 0 || a6 != 0) { verbose = 1; break; }
-    }
-
-    for (size_t i = 0; i < nblk; ++i) {
-        uint32_t in_len_dbg = dbg_map[i * dbg_fields + 0];
-        uint32_t out_len_dbg = dbg_map[i * dbg_fields + 1];
-        uint32_t flag_dbg = dbg_map[i * dbg_fields + 2];
-
-        if (!verbose) {
-            /* Basic 3-field sanity checks */
-            if (in_len_dbg > (uint32_t)blk ||
-                out_len_dbg > (uint32_t)worst_blk ||
-                (flag_dbg != 0 && flag_dbg != 1)) {
-                fprintf(stderr, "ERR: suspicious debug data at block %zu: IN=%u OUT=%u FLAG=%u\n",
-                        i, in_len_dbg, out_len_dbg, flag_dbg);
-                /* write short dump */
-                char dump_path[256];
-                snprintf(dump_path, sizeof(dump_path), "/tmp/lzo_dbg_dump_%d.txt", getpid());
-                FILE *fd = fopen(dump_path, "w");
-                if (fd) {
-                    fprintf(fd, "nblk=%zu blk=%zu worst_blk=%zu\n", nblk, blk, worst_blk);
-                    size_t dump_n = nblk < 64 ? nblk : 64;
-                    for (size_t bi = 0; bi < dump_n; ++bi) {
-                        uint32_t a0 = dbg_map[bi*dbg_fields + 0];
-                        uint32_t a1 = dbg_map[bi*dbg_fields + 1];
-                        uint32_t a2 = dbg_map[bi*dbg_fields + 2];
-                        fprintf(fd, "BLOCK %4zu: %u %u %u\n", bi, a0, a1, a2);
-                    }
-                    fclose(fd);
-                    fprintf(stderr, "ERR: debug dump written to %s\n", dump_path);
-                }
-                abort_debug_sanity = 1;
-                break;
-            }
-            fprintf(stderr, "LZO_GPU_DEBUG BLOCK %4zu IN %6u OUT %6u FLAG %u\n",
-                    i, in_len_dbg, out_len_dbg, flag_dbg);
-        } else {
-            uint32_t lookups_dbg = dbg_map[i * dbg_fields + 3];
-            uint32_t hits_dbg = dbg_map[i * dbg_fields + 4];
-            uint32_t matched_bytes_dbg = dbg_map[i * dbg_fields + 5];
-            uint32_t updates_dbg = dbg_map[i * dbg_fields + 6];
-
-            /* Verbose sanity checks */
-            if (in_len_dbg > (uint32_t)blk ||
-                out_len_dbg > (uint32_t)worst_blk ||
-                (flag_dbg != 0 && flag_dbg != 1) ||
-                lookups_dbg > (1u<<24) ||
-                hits_dbg > (1u<<24) ||
-                matched_bytes_dbg > in_len_dbg) {
-                fprintf(stderr, "ERR: suspicious debug data at block %zu: IN=%u OUT=%u FLAG=%u LOOKUPS=%u HITS=%u MATCH_BYTES=%u UPDATES=%u\n",
-                        i, in_len_dbg, out_len_dbg, flag_dbg, lookups_dbg, hits_dbg, matched_bytes_dbg, updates_dbg);
-                /* full dump */
-                char dump_path[256];
-                snprintf(dump_path, sizeof(dump_path), "/tmp/lzo_dbg_dump_%d.txt", getpid());
-                FILE *fd = fopen(dump_path, "w");
-                if (fd) {
-                    fprintf(fd, "nblk=%zu blk=%zu worst_blk=%zu\n", nblk, blk, worst_blk);
-                    size_t dump_n = nblk < 64 ? nblk : 64;
-                    for (size_t bi = 0; bi < dump_n; ++bi) {
-                        uint32_t a0 = dbg_map[bi*dbg_fields + 0];
-                        uint32_t a1 = dbg_map[bi*dbg_fields + 1];
-                        uint32_t a2 = dbg_map[bi*dbg_fields + 2];
-                        uint32_t a3 = dbg_map[bi*dbg_fields + 3];
-                        uint32_t a4 = dbg_map[bi*dbg_fields + 4];
-                        uint32_t a5 = dbg_map[bi*dbg_fields + 5];
-                        uint32_t a6 = dbg_map[bi*dbg_fields + 6];
-                        fprintf(fd, "BLOCK %4zu: %u %u %u %u %u %u %u\n", bi, a0, a1, a2, a3, a4, a5, a6);
-                    }
-                    fclose(fd);
-                    fprintf(stderr, "ERR: debug dump written to %s\n", dump_path);
-                }
-                abort_debug_sanity = 1;
-                break;
-            }
-            fprintf(stderr, "LZO_GPU_DEBUG BLOCK %4zu IN %6u OUT %6u FLAG %u LOOKUPS %u HITS %u MATCH_BYTES %u UPDATES %u\n",
-                    i, in_len_dbg, out_len_dbg, flag_dbg, lookups_dbg, hits_dbg, matched_bytes_dbg, updates_dbg);
-        }
-    }
-    return abort_debug_sanity;
-}
+/* Debug parsing removed in production build. */
 
 
 /* Optimized IO helpers */

@@ -99,8 +99,6 @@ static inline size_t lzo_worst(size_t n) {
 static cl_context  ctx;
 static cl_command_queue q;
 static cl_device_id dev;
-static int debug = 0;  /* use --debug to enable kernel instrumentation */
-/* kernel_opt logic removed - optimizations now default */
 
 static void ocl_init(void)
 {
@@ -147,8 +145,8 @@ static cl_program load_prog_with_dbits(const char* alg_name, int bits)
 {
     char build_log[8192] = {0};
     cl_program p = lzo_load_program_with_dbits(ctx, dev, alg_name, bits, build_log, sizeof(build_log));
-    if (!p && debug) {
-        fprintf(stderr, "DBG: failed to load/compile kernel %s (D_BITS=%d): %s\n", alg_name, bits, build_log);
+    if (!p) {
+        fprintf(stderr, "failed to load/compile kernel %s (D_BITS=%d): %s\n", alg_name, bits, build_log);
     }
     return p;
 }
@@ -167,11 +165,10 @@ static inline void show_help(char *prog_name)
     fprintf(stderr, "  -d, --decompress     Decompress mode\n");
     fprintf(stderr, "  -o, --output FILE    Output file (use '-' for stdout)\n");
     fprintf(stderr, "  -a, --alg ALG        Algorithm (lzo1x, lzo1y) (default: lzo1x)\n");
-    fprintf(stderr, "  -L, --level LEVEL    Dictionary bits (10-18) (default: 14)\n");
-    fprintf(stderr, "  -B, --block-size N   Fixed block size (B/KB/MB)\n");
-    fprintf(stderr, "  --debug              Enable kernel debug instrumentation\n");
+    fprintf(stderr, "  -L, --level LEVEL    Dictionary bits (10-15) (default: 11)\n");
+    fprintf(stderr, "  -B, --block-size N   Block size (B/KB/MB) (default: 16KB)\n");
     fprintf(stderr, "  -v, --verbose        Enable performance statistics\n");
-    fprintf(stderr, "  --local N            Local work-group size (1,8,64)\n");
+    fprintf(stderr, "  --local N            Local work-group size (default: 4)\n");
     fprintf(stderr, "Detailed Help:\n");
     fprintf(stderr, "  %s --daemon -h           # Daemon-specific settings\n", prog_name);
     fprintf(stderr, "  %s --use-daemon -h       # Client-specific settings\n\n", prog_name);
@@ -210,14 +207,14 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
     cl_kernel krn_c = NULL;
     char build_log[8192] = {0};
     int kernel_has_dbg = 0;
-    if (lzo_load_comp_kernel(ctx, dev, alg_name, comp_level, debug, &prog_c, &krn_c, &kernel_has_dbg, build_log, sizeof(build_log)) != 0) {
+    if (lzo_load_comp_kernel(ctx, dev, alg_name, comp_level, 0, &prog_c, &krn_c, &kernel_has_dbg, build_log, sizeof(build_log)) != 0) {
         if (build_log[0]) fprintf(stderr, "error: failed to load kernel for %s bits=%d: %s\n", alg_name, comp_level, build_log);
         else fprintf(stderr, "error: failed to load kernel for %s bits=%d\n", alg_name, comp_level);
         return 1;
     }
 
     int standard_copy = (getenv("LZO_STANDARD_COPY") && atoi(getenv("LZO_STANDARD_COPY")) == 1) ? 1 : 0;
-    int fixed_block_kb = (g_cli_fixed_block_bytes > 0) ? (int)(g_cli_fixed_block_bytes / 1024) : 0;
+    int block_size = (g_cli_fixed_block_bytes > 0) ? (int)(g_cli_fixed_block_bytes / 1024) : 0;
     int alg_id = (strcmp(alg_name, "lzo1y") == 0) ? 1 : 0;
 
     lzo_gpu_workspace_t ws;
@@ -228,9 +225,9 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
         .level = comp_level,
         .alg_id = alg_id,
         .standard_copy = standard_copy,
-        .fixed_block_kb = fixed_block_kb,
+        .block_size = block_size,
         .local_size_param = (int)g_cli_local_size,
-        .debug = debug
+        .debug = 0
     };
 
     unsigned long time_us = 0;
@@ -263,17 +260,26 @@ static int do_decompress_mode(const char* lz_path, const char* output_path, int 
     char decomp_base[64]; snprintf(decomp_base, sizeof(decomp_base), "%s_decomp", alg_name);
 
     ocl_init();
-    cl_program prog_d = load_prog_with_dbits(decomp_base, 0);
-    if (!prog_d) { fprintf(stderr, "error: unable to load decompressor for %s\n", decomp_base); return 1; }
+    cl_program prog_d = NULL;
+    cl_int err;
+    char build_log[8192] = {0};
+
+
+    /* Fallback to base decompressor */
+    if (!prog_d) {
+        prog_d = lzo_load_program_with_dbits(ctx, dev, decomp_base, 0, build_log, sizeof(build_log));
+        if (!prog_d) { fprintf(stderr, "error: unable to load decompressor for %s\n", decomp_base); return 1; }
+    }
+
     char krn_name[64]; snprintf(krn_name, sizeof(krn_name), "%s_block_decompress", alg_name);
-    cl_int err; cl_kernel krn_d = clCreateKernel(prog_d, krn_name, &err);
+    cl_kernel krn_d = clCreateKernel(prog_d, krn_name, &err);
     if (err != CL_SUCCESS) { fprintf(stderr, "clCreateKernel failed for %s (err=%d)\n", krn_name, err); clReleaseProgram(prog_d); return 1; }
 
     lzo_gpu_workspace_t ws;
     lzo_gpu_workspace_init(&ws);
     unsigned long time_us = 0; size_t output_size = 0; timing_t t_out = {0};
 
-    int rc = lzo_decompress_core(ctx, q, dev, krn_d, lz_path, output_path, &ws, standard_copy, (int)g_cli_local_size, debug, &time_us, &output_size, &t_out);
+    int rc = lzo_decompress_core(ctx, q, dev, krn_d, lz_path, output_path, &ws, standard_copy, (int)g_cli_local_size, 0, &time_us, &output_size, &t_out);
     lzo_gpu_workspace_free(&ws);
 
     if (krn_d) clReleaseKernel(krn_d);
@@ -302,7 +308,9 @@ int run_lzo_standalone(int argc, char** argv)
     int output_explicit = 0; /* whether -o/--output was explicitly provided */
     int suppress_non_data = 0; /* when writing to stdout (-), suppress non-data prints */
     int comp_level = -1; /* -1 means adaptive (not explicitly specified by user) */
+    int comp_level_specified = 0;
     const char *alg_name = "lzo1x";
+    int alg_specified = 0;
 
     /* pass 1: detect mode, help, verbose */
     for (int i = 1; i < argc; ++i) {
@@ -321,7 +329,6 @@ int run_lzo_standalone(int argc, char** argv)
     /* pass 2: parse options and positionals with knowledge of mode */
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
-        if (strcmp(arg, "--debug") == 0) { debug = 1; continue; }
         if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) { continue; }
         if (strcmp(arg, "-o") == 0 || strcmp(arg, "--output") == 0) {
             if (i + 1 >= argc) {
@@ -339,6 +346,7 @@ int run_lzo_standalone(int argc, char** argv)
                 return 1;
             }
             comp_level = atoi(argv[++i]);
+            comp_level_specified = 1;
             if (comp_level < 8 || comp_level > 20) {
                 fprintf(stderr, "error: dictionary size must be between 8 and 20 bits (got %d)\n", comp_level);
                 return 1;
@@ -351,6 +359,7 @@ int run_lzo_standalone(int argc, char** argv)
                 return 1;
             }
             alg_name = argv[++i];
+            alg_specified = 1;
             if (strcmp(alg_name, "1x") == 0 || strcmp(alg_name, "lzo1x") == 0)
                 alg_name = "lzo1x";
             else if (strcmp(alg_name, "1y") == 0 || strcmp(alg_name, "lzo1y") == 0)
@@ -390,7 +399,6 @@ int run_lzo_standalone(int argc, char** argv)
         if (arg[0] != '-') {
             if (decompress_mode) {
                 if (!lz_path) { lz_path = arg; continue; }
-                /* ignore extra positionals; verify file should come via --verify */
             } else {
                 if (!in_path) { in_path = arg; continue; }
             }
@@ -421,6 +429,36 @@ int run_lzo_standalone(int argc, char** argv)
                 snprintf(default_output, sizeof(default_output), "%s.lzo", in_path);
                 output_path = default_output;
             }
+        }
+    }
+
+    /* Apply autotune config for compression if present (only change unspecified fields). */
+    if (!decompress_mode) {
+        request_t ar;
+        memset(&ar, 0, sizeof(ar));
+        ar.operation = 'C';
+        ar.block_size = (g_cli_fixed_block_bytes > 0) ? (int)(g_cli_fixed_block_bytes / 1024) : 0;
+        ar.local_size = (uint32_t)g_cli_local_size;
+        ar.alg = alg_specified ? ((strcmp(alg_name, "lzo1y") == 0) ? 1 : 0) : -1;
+        ar.level = comp_level_specified ? comp_level : -1;
+        if (in_path) {
+            struct stat st;
+            if (stat(in_path, &st) == 0) ar.input_size = st.st_size;
+        }
+
+        if (lzo_apply_autotune_config(&ar) == 0) {
+            if (!alg_specified && ar.alg >= 0) {
+                alg_name = (ar.alg == 1) ? "lzo1y" : "lzo1x";
+            }
+            if (!comp_level_specified && ar.level > 0) comp_level = ar.level;
+            if (g_cli_fixed_block_bytes == 0 && ar.block_size > 0) g_cli_fixed_block_bytes = (size_t)ar.block_size * 1024;
+            if (g_cli_local_size == 0 && ar.local_size > 0) g_cli_local_size = (size_t)ar.local_size;
+            if (g_verbose) {
+                fprintf(stderr, "[AUTOTUNE] Applied autotune suggestions: alg=%d level=%d block_kb=%d local_size=%u\n",
+                        ar.alg, ar.level, ar.block_size, ar.local_size);
+            }
+        } else {
+            if (g_verbose) fprintf(stderr, "[AUTOTUNE] No autotune config found in exe dir or LZO_GPU_AUTOTUNE_CONF\n");
         }
     }
 

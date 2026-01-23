@@ -48,7 +48,17 @@ extract_perf() {
     local d_total=$(get_val 'daemon\s*:\s*\K[0-9.]+')
     local t_read=$(get_val 'File Read\s*:\s*\K[0-9.]+')
     local t_write=$(get_val 'File Write\s*:\s*\K[0-9.]+')
-    local ratio_pct=$(echo "$output" | grep -oP '(Compression ratio\s*:\s*|\[)\K[0-9.]+' | head -1 | awk '{print ($1==""?0:$1)}')
+    # Prefer explicit percentage inside parentheses (e.g., "(21.23% of original)")
+    local ratio_pct=$(echo "$output" | grep -i 'Compression ratio' | grep -oP '[0-9]+(?:\\.[0-9]+)?(?=%)' | head -1 | awk '{print ($1==""?0:$1)}')
+    if [ -z "$ratio_pct" ] || [ "$ratio_pct" = "0" ]; then
+        # Fallback: extract multiplicative ratio (e.g., "4.71" from "4.71:1") and convert to percent
+        local ratio_raw=$(echo "$output" | grep -oP '(?<=Compression ratio\s*:\s*)[0-9]+(?:\\.[0-9]+)?' | head -1)
+        if [ -n "$ratio_raw" ] && [ "$ratio_raw" != "0" ]; then
+            ratio_pct=$(echo "scale=8; 100.0 / $ratio_raw" | bc 2>/dev/null)
+        else
+            ratio_pct=0
+        fi
+    fi
 
     local t_io=$(echo "$t_read + $t_write" | bc 2>/dev/null || echo 0)
     local t_mem=0
@@ -650,7 +660,6 @@ print('\n[CONCLUSIONS - ACTIONABLE]')
 print('1. Kernel throughput is reported combined for GPU+Daemon (as requested); use per-tool total MB/s when comparing to Host CPU.')
 print('2. LocalSize can both increase and decrease throughput; top-increase and top-decrease lists identify targets for focused re-runs with more repeats.')
 print('3. Consider adding REPEATS and finer LocalSize sweeps for top samples; use median/std to improve separability.')
-print('4. For high-variability configs, enable --debug and profile kernels on those samples.')
 
 # restore stdout and write the captured report to a file
 sys.stdout = old_stdout
@@ -674,13 +683,21 @@ case "$1" in
         # GPU-only full scan; writes GPU rows only to $CSV_FILE
         init_csv
         for s in "$SAMPLES_DIR"/*; do [ -f "$s" ] && (test_gpu_standalone "$s"; test_gpu_daemon "$s") || true; done
-        ;;
-    -m|--merge)
-        # Merge CPU and GPU CSVs: usage: param_scan.sh -m <cpu_csv> <gpu_csv> [out_csv]
-        merge_csv "$2" "$3" "$4"
+        generate_report
         ;;
     -r|--report-only)
         generate_report "$2"
+        ;;
+    -m|--merge-csv)
+        merge_csv "$2" "$3" "$4"
+        ;;
+    -f|--full)
+        # Full CPU + GPU scan
+        init_csv
+        for s in "$SAMPLES_DIR"/*; do
+            [ -f "$s" ] && (test_cpu "$s"; test_gpu_standalone "$s"; test_gpu_daemon "$s")
+        done
+        generate_report
         ;;
     *)
         init_csv

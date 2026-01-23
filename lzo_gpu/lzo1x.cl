@@ -14,15 +14,7 @@
 #define D_BITS 14
 #endif
 
-/* Debug instrumentation: enable via -D LZO_GPU_DEBUG.
- * When enabled, debug emits extended fields (IN, OUT, FLAG, LOOKUPS, HITS, MATCH_BYTES, UPDATES):
- * 7 fields per block by default. To override, define DBG_FIELDS externally.
- */
-#ifdef LZO_GPU_DEBUG
-#ifndef DBG_FIELDS
-#define DBG_FIELDS 7
-#endif
-#endif
+/* Debug instrumentation removed in production build. */
 
 /* Standard macros */
 #define LZO_BYTE(x)       ((unsigned char) (x))
@@ -185,17 +177,10 @@ static inline uint lzo1x_hash32(uint dv)
 
 
 
-#ifdef LZO_GPU_DEBUG
-static lzo_uint
-lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
-                   LZO_ADDR_GLOBAL lzo_bytep out, lzo_uintp out_len,
-                    lzo_uint ti, lzo_voidp wrkmem, __global uint *dbg_out)
-#else
 static lzo_uint
 lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
                    LZO_ADDR_GLOBAL lzo_bytep out, lzo_uintp out_len,
                     lzo_uint ti, lzo_voidp wrkmem)
-#endif
 {
     LZO_ADDR_GLOBAL const lzo_bytep ip;
     LZO_ADDR_GLOBAL lzo_bytep op;
@@ -208,9 +193,7 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
     ip = in;
     ii = ip;
 
-#ifdef LZO_GPU_DEBUG
-    uint dbg_lookups = 0, dbg_hits = 0, dbg_updates = 0, dbg_matched_bytes = 0;
-#endif
+
 
     ip += ti < 4 ? 4 - ti : 0;
     for (;;)
@@ -298,26 +281,20 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
                 break;
             dv = UA_GET_LE32(ip);
             dindex = DINDEX(dv,ip);
-#ifdef LZO_GPU_DEBUG
-            dbg_lookups++;
-#endif
+
             /* Single-way dictionary lookup with fast hash */
             m_off = dict[dindex];
             m_pos = in + m_off;
 
             if (m_off != 0 && dv == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
-#ifdef LZO_GPU_DEBUG
-                dbg_hits++;
-#endif
+
                 saved_dindex = dindex;
                 goto match_found;
             }
 
             /* Miss - overwrite with current position */
             dict[dindex] = DENTRY(ip,in);
-#ifdef LZO_GPU_DEBUG
-            dbg_updates++;
-#endif
+
             goto literal;
         }
 
@@ -424,10 +401,7 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
 m_len_done:
         /* Update dictionary entry with current position */
         dict[saved_dindex] = DENTRY(ip,in);
-#ifdef LZO_GPU_DEBUG
-        dbg_updates++;
-        dbg_matched_bytes += m_len;
-#endif
+
         m_off = pd(ip,m_pos);
         ip += m_len;
         ii = ip;
@@ -478,14 +452,7 @@ m_len_done:
     }
 
     *out_len = pd(op, out);
-#ifdef LZO_GPU_DEBUG
-    if (dbg_out) {
-        dbg_out[3] = dbg_lookups;
-        dbg_out[4] = dbg_hits;
-        dbg_out[5] = dbg_matched_bytes;
-        dbg_out[6] = dbg_updates;
-    }
-#endif
+
     return pd(in_end,ii-ti);
 }
 
@@ -526,11 +493,7 @@ static inline void dict_clear(lzo_voidp wrkmem) {
     barrier(CLK_GLOBAL_MEM_FENCE);
 }
 
-#ifdef LZO_GPU_DEBUG
-static void do_compress(__global const uchar* in, uint in_len, __global uchar* out, lzo_uintp out_len, lzo_uint ti, lzo_voidp wrkmem, __global uint* dbg)
-#else
 static void do_compress(__global const uchar* in, uint in_len, __global uchar* out, lzo_uintp out_len, lzo_uint ti, lzo_voidp wrkmem)
-#endif
 {
     lzo_uint t = ti;
     __global uchar* op = out;
@@ -539,11 +502,7 @@ static void do_compress(__global const uchar* in, uint in_len, __global uchar* o
 
     if (get_local_id(0) == 0) {
         lzo_uint olen = 0;
-#ifdef LZO_GPU_DEBUG
-        t = lzo1x_compress_core(in, in_len, op, &olen, t, wrkmem, dbg);
-#else
         t = lzo1x_compress_core(in, in_len, op, &olen, t, wrkmem);
-#endif
         op += olen;
         // Terminate the block
         op = lzo1x_compress_terminate(in + in_len, 0, op, t);
@@ -552,7 +511,6 @@ static void do_compress(__global const uchar* in, uint in_len, __global uchar* o
     }
 }
 
-#ifndef LZO_GPU_DEBUG
 __kernel void lzo1x_block_compress(__global const uchar *in ,
                                    __global       uchar *out,
                                    __global       uint  *out_len,
@@ -582,38 +540,3 @@ __kernel void lzo1x_block_compress(__global const uchar *in ,
         }
     }
 }
-#else
-__kernel void lzo1x_block_compress_debug(__global const uchar *in ,
-                                        __global       uchar *out,
-                                        __global       uint  *out_len,
-                                        const uint  in_sz,
-                                        const uint  blk_size,
-                                        const uint  worst_blk,
-                                        __global lzo_dict_t *dict_pool,
-                                        const uint  dict_pool_size,
-                                        __global uint *dbg)
-{
-    const uint gid = get_group_id(0);
-    const uint num_groups = get_num_groups(0);
-    const uint total_blocks = (in_sz + blk_size - 1) / blk_size;
-
-    __global lzo_dict_t *dict = dict_pool + ((size_t)gid << D_BITS);
-
-    for (uint b = gid; b < total_blocks; b += num_groups) {
-        uint in_off = b * blk_size;
-        __global const uchar* ip = in + in_off;
-        __global uchar* op = out + b * worst_blk;
-        uint in_len = (in_off + blk_size <= in_sz) ? blk_size : (in_sz - in_off);
-
-        lzo_uint olen = 0;
-        do_compress(ip, in_len, op, &olen, 0, dict, dbg + b * DBG_FIELDS);
-
-        if (get_local_id(0) == 0) {
-            out_len[b] = (uint)olen;
-            dbg[b*DBG_FIELDS + 0] = in_len;
-            dbg[b*DBG_FIELDS + 1] = olen;
-            dbg[b*DBG_FIELDS + 2] = (olen == 0) ? 1 : 0;
-        }
-    }
-}
-#endif

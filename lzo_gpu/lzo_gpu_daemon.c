@@ -55,7 +55,6 @@ typedef struct {
     /* Private kernels for this worker to avoid race conditions on clSetKernelArg */
     /* Alg: 0=1x, 1=1y | Bits: 0-8 (10-18) */
     cl_kernel kernels_comp[2][9];
-    cl_kernel kernels_comp_debug[2][9];
     cl_kernel kernels_decomp[2];
 } worker_res_t;
 
@@ -77,8 +76,6 @@ typedef struct {
     /* Alg: 0=1x, 1=1y */
     /* Bits: 0=10, 1=11, 2=12, 3=13, 4=14, 5=15, 6=16, 7=17, 8=18 */
     cl_program programs[2][9];
-    /* Debug-instrumented variants cache (per-algorithm x bits) */
-    cl_program programs_debug[2][9];
 
     /* 解压缩kernels (每个算法一个) */
     cl_program prog_decomp[2];
@@ -181,13 +178,12 @@ int init_opencl_resources(void)
         g_state.workers[i].in_use = 0;
 
         memset(g_state.workers[i].kernels_comp, 0, sizeof(g_state.workers[i].kernels_comp));
-        memset(g_state.workers[i].kernels_comp_debug, 0, sizeof(g_state.workers[i].kernels_comp_debug));
+
         memset(g_state.workers[i].kernels_decomp, 0, sizeof(g_state.workers[i].kernels_decomp));
     }
 
     // 4. 初始化全局Program数组
     memset(g_state.programs, 0, sizeof(g_state.programs));
-    memset(g_state.programs_debug, 0, sizeof(g_state.programs_debug));
     memset(g_state.prog_decomp, 0, sizeof(g_state.prog_decomp));
 
     printf("[DAEMON] Kernels将按需编译 (Lazy Loading)...\n");
@@ -207,11 +203,11 @@ int init_opencl_resources(void)
 }
 
 /* 获取或编译压缩Program (线程安全,全局缓存) */
-static cl_program get_compress_program(int alg, int bits, int kernel_debug)
+static cl_program get_compress_program(int alg, int bits)
 {
     if (alg < 0 || alg > 1 || bits < 10 || bits > 18) return NULL;
     int bit_idx = bits - 10;
-    cl_program *p_prog = kernel_debug ? &g_state.programs_debug[alg][bit_idx] : &g_state.programs[alg][bit_idx];
+    cl_program *p_prog = &g_state.programs[alg][bit_idx];
 
     pthread_mutex_lock(&g_state.compile_lock);
     if (*p_prog) {
@@ -227,11 +223,7 @@ static cl_program get_compress_program(int alg, int bits, int kernel_debug)
     size_t bin_sz = 0;
     unsigned char* bin = NULL;
 
-    if (kernel_debug) {
-        snprintf(bin_name, sizeof(bin_name), "%s_debug_%d.clbin", alg_names[alg], bits);
-    } else {
-        snprintf(bin_name, sizeof(bin_name), "%s_%d.clbin", alg_names[alg], bits);
-    }
+    snprintf(bin_name, sizeof(bin_name), "%s_%d.clbin", alg_names[alg], bits);
 
     bin = (unsigned char*)lzo_read_file(bin_name, &bin_sz);
     if (bin) {
@@ -250,7 +242,7 @@ static cl_program get_compress_program(int alg, int bits, int kernel_debug)
     /* 2. Fallback: Compile from source */
     char src_file[64];
     snprintf(src_file, sizeof(src_file), "%s.cl", alg_names[alg]);
-    printf("[DAEMON] 尝试编译 Kernel Program: %s (D_BITS=%d + LZO_USE_UNROLL2%s)...\n", src_file, bits, kernel_debug ? " + LZO_GPU_DEBUG" : "");
+    printf("[DAEMON] 尝试编译 Kernel Program: %s (D_BITS=%d + LZO_USE_UNROLL2)...\n", src_file, bits);
 
     size_t src_len;
     char* src = lzo_read_file(src_file, &src_len);
@@ -266,7 +258,7 @@ static cl_program get_compress_program(int alg, int bits, int kernel_debug)
         free(src);
         if (err == CL_SUCCESS) {
             char build_opts_with_inc[512];
-            snprintf(build_opts_with_inc, sizeof(build_opts_with_inc), "-cl-std=CL2.0 -I.%s -D D_BITS=%d -D LZO_USE_UNROLL2%s", include_opt, bits, kernel_debug ? " -D LZO_GPU_DEBUG" : "");
+            snprintf(build_opts_with_inc, sizeof(build_opts_with_inc), "-cl-std=CL2.0 -I.%s -D D_BITS=%d -D LZO_USE_UNROLL2", include_opt, bits);
             err = clBuildProgram(*p_prog, 1, &g_state.device, build_opts_with_inc, NULL, NULL);
             if (err == CL_SUCCESS) {
                 pthread_mutex_unlock(&g_state.compile_lock);
@@ -283,20 +275,20 @@ static cl_program get_compress_program(int alg, int bits, int kernel_debug)
     return NULL;
 }
 
-static cl_kernel get_compress_kernel_for_worker(worker_res_t* worker, int alg, int bits, int debug)
+static cl_kernel get_compress_kernel_for_worker(worker_res_t* worker, int alg, int bits)
 {
     if (alg < 0 || alg > 1 || bits < 10 || bits > 18) return NULL;
     int bit_idx = bits - 10;
-    cl_kernel *p_krn = debug ? &worker->kernels_comp_debug[alg][bit_idx] : &worker->kernels_comp[alg][bit_idx];
+    cl_kernel *p_krn = &worker->kernels_comp[alg][bit_idx];
 
     if (*p_krn) return *p_krn;
 
-    cl_program prog = get_compress_program(alg, bits, debug);
+    cl_program prog = get_compress_program(alg, bits);
     if (!prog) return NULL;
 
     const char* alg_names[] = {"lzo1x", "lzo1y"};
     char kernel_name[64];
-    snprintf(kernel_name, sizeof(kernel_name), "%s_block_compress%s", alg_names[alg], debug ? "_debug" : "");
+    snprintf(kernel_name, sizeof(kernel_name), "%s_block_compress", alg_names[alg]);
 
     cl_int err;
     *p_krn = clCreateKernel(prog, kernel_name, &err);
@@ -401,7 +393,7 @@ int handle_compress_request(request_t* req, response_t* resp, worker_res_t* work
            req->input_path, req->output_path, req->level);
 
     // 根据alg和level选择合适的worker私有kernel
-    cl_kernel kernel = get_compress_kernel_for_worker(worker, req->alg, req->level, req->debug);
+    cl_kernel kernel = get_compress_kernel_for_worker(worker, req->alg, req->level);
     const char* alg_names[] = {"lzo1x", "lzo1y"};
 
     if (!kernel) {
@@ -421,9 +413,9 @@ int handle_compress_request(request_t* req, response_t* resp, worker_res_t* work
         .level = req->level,
         .alg_id = req->alg,
         .standard_copy = req->standard_copy,
-        .fixed_block_kb = req->fixed_block_kb,
+        .block_size = req->block_size,
         .local_size_param = req->local_size,
-        .debug = req->debug
+        .debug = 0
     };
 
     int ret = lzo_compress_core(
@@ -524,7 +516,7 @@ int handle_decompress_request(request_t* req, response_t* resp, worker_res_t* wo
         req->output_path[0] == '\0' ? "/dev/null" : req->output_path,
         &worker->ws,
         req->standard_copy,
-        req->local_size, req->debug,
+        req->local_size, 0,
         &time_us,
         &output_size,
         &t
@@ -578,7 +570,6 @@ void cleanup_opencl_resources(void)
         for (int a = 0; a < 2; a++) {
             for (int b = 0; b < 9; b++) {
                 if (g_state.workers[i].kernels_comp[a][b]) clReleaseKernel(g_state.workers[i].kernels_comp[a][b]);
-                if (g_state.workers[i].kernels_comp_debug[a][b]) clReleaseKernel(g_state.workers[i].kernels_comp_debug[a][b]);
             }
             if (g_state.workers[i].kernels_decomp[a]) clReleaseKernel(g_state.workers[i].kernels_decomp[a]);
         }
@@ -591,7 +582,6 @@ void cleanup_opencl_resources(void)
     for (int i = 0; i < 2; i++) {
         for (int j = 0; j < 9; j++) {
             if (g_state.programs[i][j]) clReleaseProgram(g_state.programs[i][j]);
-            if (g_state.programs_debug[i][j]) clReleaseProgram(g_state.programs_debug[i][j]);
         }
         if (g_state.prog_decomp[i]) clReleaseProgram(g_state.prog_decomp[i]);
     }

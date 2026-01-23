@@ -121,6 +121,8 @@ static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos,
     while (len > 0) { *op++ = *m_pos++; len--; }
 }
 
+/* Debug instrumentation removed in production build. */
+
 static lzo_uint
 lzo1y_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
     LZO_ADDR_GLOBAL lzo_bytep out, lzo_uintp out_len,
@@ -132,6 +134,7 @@ lzo1y_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
     LZO_ADDR_GLOBAL const lzo_bytep m_pos;
     *out_len = 0;
 
+
     if (*ip > 17) {
         t = *ip++ - 17;
         if (t < 4) goto match_next;
@@ -141,6 +144,7 @@ lzo1y_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
     }
 
     for (;;) {
+
         t = *ip++;
         if (t >= 16) goto match;
         if (t == 0) {
@@ -151,6 +155,7 @@ lzo1y_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
         }
         {
             uint copy_len = (uint)(3 + t);
+
             UA_COPYN(op, ip, copy_len);
             op += copy_len;
             ip += copy_len;
@@ -161,6 +166,7 @@ lzo1y_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
         m_pos = op - (1 + M2_MAX_OFFSET);
         m_pos -= t >> 2;
         m_pos -= *ip++ << 2;
+
         *op++ = *m_pos++;
         *op++ = *m_pos++;
         *op++ = *m_pos;
@@ -201,11 +207,13 @@ lzo1y_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
                 m_pos -= 0x4000;
             } else {
                 m_pos = op - 1 - (t >> 2) - (*ip++ << 2);
+
                 *op++ = *m_pos++;
                 *op++ = *m_pos;
                 goto match_done;
             }
         copy_match:
+
             COPY_MATCH(op, m_pos, t + 2);
             op += t + 2;
         match_done:
@@ -219,6 +227,9 @@ lzo1y_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
     }
 eof_found:
     *out_len = pd(op, out);
+
+
+
     return LZO_E_OK;
 }
 
@@ -236,3 +247,5 @@ __kernel void lzo1y_block_decompress(
     lzo1y_decompress(in_buf + in_off, in_len, out_buf + out_off, &out_len, NULL);
     out_lens[gid] = out_len;
 }
+
+

@@ -45,7 +45,7 @@ typedef struct {
 
     /* I/O and memory settings */
     int standard_copy;      /* 0=zero-copy (map), 1=standard copy */
-    int fixed_block_kb;     /* Fixed block size in KB (0=adaptive) */
+    int block_size;      /* Fixed block size in KB (0=adaptive) */
 
     /* Debug and profiling */
     int local_size_param;   /* OpenCL local work-group size */

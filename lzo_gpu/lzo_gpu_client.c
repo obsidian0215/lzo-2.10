@@ -14,6 +14,7 @@
 #include "timing.h"
 #include "lzo_defaults.h"
 #include "lzo_gpu_utils.h"
+#include "lzo_gpu_core.h"
 #include <getopt.h>
 #include <limits.h>
 #include <stddef.h>
@@ -45,6 +46,7 @@ static void fill_request_env_flags(request_t* req) {
 
 }
 
+
 /* Simple CLI parsing for per-request flags. These CLI flags override env vars. */
 /* Note: coalescing control is removed from code.
  * stdio buffer control is hardcoded to 1MB.
@@ -60,25 +62,24 @@ static void parse_client_cli_opts(int argc, char** argv, request_t* req) {
             }
             continue;
         }
-        if (strncmp(a, "-B=", 3) == 0) { req->fixed_block_kb = (int)(lzo_parse_block_size(a + 3) / 1024); argv[i] = "--"; continue; }
-        if (strcmp(a, "-B") == 0 && i + 1 < argc) { argv[i] = "--"; req->fixed_block_kb = (int)(lzo_parse_block_size(argv[++i]) / 1024); argv[i] = "--"; continue; }
-        if (strncmp(a, "--block-size=", 13) == 0) { req->fixed_block_kb = (int)(lzo_parse_block_size(a + 13) / 1024); argv[i] = "--"; continue; }
-        if (strcmp(a, "--block-size") == 0 && i + 1 < argc) { argv[i] = "--"; req->fixed_block_kb = (int)(lzo_parse_block_size(argv[++i]) / 1024); argv[i] = "--"; continue; }
+        if (strncmp(a, "-B=", 3) == 0) { req->block_size = (int)(lzo_parse_block_size(a + 3) / 1024); argv[i] = "--"; continue; }
+        if (strcmp(a, "-B") == 0 && i + 1 < argc) { argv[i] = "--"; req->block_size = (int)(lzo_parse_block_size(argv[++i]) / 1024); argv[i] = "--"; continue; }
+        if (strncmp(a, "--block-size=", 13) == 0) { req->block_size = (int)(lzo_parse_block_size(a + 13) / 1024); argv[i] = "--"; continue; }
+        if (strcmp(a, "--block-size") == 0 && i + 1 < argc) { argv[i] = "--"; req->block_size = (int)(lzo_parse_block_size(argv[++i]) / 1024); argv[i] = "--"; continue; }
         if (strncmp(a, "--local=", 8) == 0) { req->local_size = atoi(a + 8); argv[i] = "--"; continue; }
         if (strcmp(a, "--local") == 0 && i + 1 < argc) { argv[i] = "--"; req->local_size = atoi(argv[++i]); argv[i] = "--"; continue; }
         if (strcmp(a, "--zero-copy") == 0) { req->standard_copy = 0; argv[i] = "--"; continue; }
         if (strcmp(a, "--standard-copy") == 0) { req->standard_copy = 1; argv[i] = "--"; continue; }
-        if (strcmp(a, "--debug") == 0) { req->debug = 1; argv[i] = "--"; continue; }
+
     }
 }
 
 /* set default request options */
 static void set_request_defaults(request_t* req) {
     req->standard_copy = 0;
-    req->fixed_block_kb = 0;
+    req->block_size = 0;
     req->local_size = 0;
-    /* per-request debug (0/1) */
-    req->debug = 0;
+    /* per-request debug flag removed */
     /* profile_writes removed */
 }
 
@@ -146,6 +147,8 @@ int decompress_with_daemon(const char* input, const char* output, int alg)
 
     /* fill options from env for fields still unspecified */
     fill_request_env_flags(&req);
+    /* apply autotune config (if available) to any unspecified options */
+    lzo_apply_autotune_config(&req);
 
     // 发送请求
     if (send(sock, &req, sizeof(req), 0) != sizeof(req)) {
@@ -270,11 +273,11 @@ int compress_with_daemon(const char* input, const char* output, int alg, int lev
     set_request_defaults(&req);
     memcpy(&req, &g_cli_req_flags, sizeof(req));
                     /* Diagnostic: print final request fields to stderr to confirm CLI parsing */
-                    if (req.debug) {
-                    fprintf(stderr, "[CLIENT] Request opts: fixed_block_kb=%d local_size=%d standard_copy=%d debug=%d sizeof(req)=%zu\n",
-                        req.fixed_block_kb, req.local_size, req.standard_copy, req.debug, sizeof(req));
-                    fprintf(stderr, "[CLIENT] offsetof: fixed_block_kb=%zu local_size=%zu debug=%zu\n",
-                        offsetof(request_t, fixed_block_kb), offsetof(request_t, local_size), offsetof(request_t, debug));
+                    if (g_verbose) {
+                        fprintf(stderr, "[CLIENT] Request opts: block_size=%dKB local_size=%d standard_copy=%d sizeof(req)=%zu\n",
+                                req.block_size, req.local_size, req.standard_copy, sizeof(req));
+                        fprintf(stderr, "[CLIENT] offsetof: block_size=%zuKB local_size=%zu\n",
+                                offsetof(request_t, block_size), offsetof(request_t, local_size));
                     }
     req.operation = 'C';
     strncpy(req.input_path, input, sizeof(req.input_path) - 1);
@@ -285,6 +288,8 @@ int compress_with_daemon(const char* input, const char* output, int alg, int lev
 
     /* fill options from env for fields still unspecified */
     fill_request_env_flags(&req);
+    /* apply autotune config (if available) to any unspecified options */
+    lzo_apply_autotune_config(&req);
 
     // 发送请求
     if (send(sock, &req, sizeof(req), 0) != sizeof(req)) {
@@ -371,15 +376,14 @@ static void show_help(const char* prog) {
     fprintf(stderr, "用法: %s [选项] <input1> [input2 ...]\n", prog);
     fprintf(stderr, "选项:\n");
     fprintf(stderr, "  -h, --help                    Show help and exit.\n");
-    fprintf(stderr, "  -L, -l, --level <10-18>       Set compression level (bits). Default: 12.\n");
+    fprintf(stderr, "  -L, -l, --level <10-15>       Set compression level (bits). Default: 11.\n");
     fprintf(stderr, "  -a, --alg <lzo1x|lzo1y>       Set algorithm. Default: lzo1x.\n");
     fprintf(stderr, "  -d, --decompress              Decompress mode.\n");
     fprintf(stderr, "  -o, --output <file>           Output file (only valid for single input).\n");
-    fprintf(stderr, "  -B N, --block-size N          Fixed block size (B/KB/MB).\n");
+    fprintf(stderr, "  -B N, --block-size N          Block size (B/KB/MB, default: 16KB).\n");
     fprintf(stderr, "  --mt-io / --no-mt-io          Enable/disable multi-threaded I/O.\n");
     fprintf(stderr, "  --zero-copy / --standard-copy Enable/disable zero-copy (pinned memory).\n");
     fprintf(stderr, "  --local N                     Local work-group size.\n");
-    fprintf(stderr, "  --debug                       Enable debug instrumentation.\n\n");
     fprintf(stderr, "示例:\n");
     fprintf(stderr, "  %s input.txt                  # 压缩为 input.txt.lzo\n", prog);
     fprintf(stderr, "  %s -d file1.lzo file2.lzo     # 批量解压\n", prog);
@@ -396,10 +400,13 @@ int run_lzo_client(int argc, char** argv)
     const char** inputs = malloc(argc * sizeof(char*));
     int input_count = 0;
     const char* output_arg = NULL;
-    int level = 12;  // 默认: 12 bits (4KB dict)
-    int alg = 0;     // 默认: lzo1x
-    char operation = 'C';  // 默认压缩
+    /* When unspecified we use autotune config or fallbacks; use -1 as sentinel */
+    int level = -1;  /* 未指定: 让服务端或 autotune 决定 */
+    int alg = -1;    /* 未指定: 让服务端或 autotune 决定 */
+    char operation = 'C';  /* 默认压缩 */
     int show_help_flag = 0;
+
+
 
     if (!inputs) { perror("malloc inputs"); return 1; }
 
@@ -414,6 +421,7 @@ int run_lzo_client(int argc, char** argv)
             show_help_flag = 1;
             break;
         }
+
         if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) {
             operation = 'D';
         } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--alg") == 0) {
@@ -467,6 +475,8 @@ int run_lzo_client(int argc, char** argv)
         free(inputs);
         return show_help_flag ? 0 : 1;
     }
+
+
 
     if (input_count > 1 && output_arg) {
         fprintf(stderr, "警告: 指定了多个输入文件且指定了 -o。所有输出将尝试写入同一个路径(可能失败或覆盖)。建议不要在多文件模式下使用 -o。\n");

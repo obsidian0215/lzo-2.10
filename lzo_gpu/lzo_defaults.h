@@ -13,7 +13,11 @@
 #define DEFAULT_DECOMP_CACHE_MB 256
 
 /* Compression configuration */
-#define LZO_DEFAULT_COMP_LEVEL 14
+/* Default compression level (bits). Reduced to 11 based on param-scan aggregated results */
+#define LZO_DEFAULT_COMP_LEVEL 11
+
+/* Default block size (in KB) when no adaptive/training result is available */
+#define LZO_DEFAULT_BLOCK_KB 16
 
 /* Block size and GPU parallelism configuration */
 #define LZO_OCC_FACTOR_DEFAULT 128
@@ -21,7 +25,6 @@
 #define LZO_MIN_BLOCK_BYTES_DEFAULT (4 * 1024)   /* 1KB minimum */
 #define LZO_MAX_BLOCK_BYTES_DEFAULT (128 * 1024)  /* 128KB maximum (increased from 64KB) */
 #define LZO_MAX_NBLOCKS_DEFAULT (8 * 1024)  /* Maximum blocks per job */
-
 /* Entropy calculation configuration */
 #define LZO_ADAPTIVE_SAMPLE_SIZE (64 * 1024)  /* 64KB sample for entropy */
 #define LZO_ADAPTIVE_LOW_ENTROPY 4.0
@@ -29,8 +32,8 @@
 #define LZO_ADAPTIVE_ENTROPY_ENABLED 0  /* 0=size-only (fast), 1=entropy-aware */
 
 /* OpenCL configuration */
-/* Default work-group size. Set to 1 for high occupancy with serial compression kernels. */
-#define LZO_LOCAL_SIZE_DEFAULT 1
+/* Default work-group size. Set to 4 (empirically best balance in our param-scan) */
+#define LZO_LOCAL_SIZE_DEFAULT 4
 
 /* Memory alignment */
 #ifndef ALIGN_BYTES
@@ -53,8 +56,6 @@ static inline int lzo_env_get_int(const char* name, int default_val) {
 	if (!s || *s == '\0') return default_val;
 	return atoi(s);
 }
-
-/* Note: profile writes are gated by per-run / per-request debug flag (use --debug). */
 
 /* Adaptive blocking: Enable entropy-based block size calculation (default: disabled for speed) */
 #define LZO_ADAPTIVE_ENTROPY_ENABLED 0  /* 0=size-only (fast), 1=entropy-aware (slower but better) */

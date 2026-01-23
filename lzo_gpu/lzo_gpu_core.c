@@ -162,8 +162,8 @@ int lzo_compress_core(
     else
         entropy_ptr = (const unsigned char*)mapped_in;
 
-    size_t fixed_blk_bytes = (params->fixed_block_kb > 0) ? (size_t)params->fixed_block_kb * 1024 : 0;
-    lzo_choose_blocking_adaptive(entropy_ptr, in_sz, device, fixed_blk_bytes, 0, &blk, &nblk, params->debug);
+    size_t blk_bytes = (params->block_size > 0) ? (size_t)params->block_size * 1024 : 0;
+    lzo_choose_blocking_adaptive(entropy_ptr, in_sz, device, blk_bytes, 0, &blk, &nblk, params->debug);
 
     uint64_t t_blocking_end = core_now_ns();
     unsigned long blocking_us = (t_blocking_end - t_blocking_start) / 1000;
@@ -171,7 +171,6 @@ int lzo_compress_core(
     if (!use_standard_copy) {
         uint64_t t_unmap_start = core_now_ns();
         CHECK(clEnqueueUnmapMemObject(queue, d_in, mapped_in, 0, NULL, NULL));
-        /* clFinish is removed here for better performance, OpenCL queue maintains ordering */
         uint64_t t_unmap_end = core_now_ns();
         upload_us = (t_unmap_end - t_unmap_start) / 1000;
     } else {
@@ -218,9 +217,6 @@ int lzo_compress_core(
     CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uint), &blk_cl));
     CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uint), &worst_blk_cl));
 
-    cl_mem d_dbg = NULL;
-    int kernel_has_dbg_arg = 0;
-
     /* Dictionary Pool Architecture:
      * We use a pool of dictionaries in global memory, scaled by the number of CUs.
      */
@@ -249,22 +245,7 @@ int lzo_compress_core(
         CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem), &d_dict));
         CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uint), &pool_size));
 
-        /* If it's a debug kernel, debug buffer is at index 8 */
-        cl_uint num_args = 0;
-        cl_int rc = clGetKernelInfo(kernel, CL_KERNEL_NUM_ARGS, sizeof(num_args), &num_args, NULL);
-        if (rc == CL_SUCCESS && num_args >= 9) {
-            kernel_has_dbg_arg = 1;
-            const size_t dbg_fields = 7;
-            size_t per_blk = dbg_fields * sizeof(cl_uint);
-            size_t dbg_bytes = nblk * per_blk;
-            d_dbg = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR, dbg_bytes, NULL, &err);
-            if (err == CL_SUCCESS) {
-                CHECK(clSetKernelArg(kernel, 8, sizeof(cl_mem), &d_dbg));
-            } else {
-                d_dbg = NULL;
-                CHECK(clSetKernelArg(kernel, 8, sizeof(cl_mem), &d_dbg));
-            }
-        }
+        /* Debug instrumentation removed in production build: no debug buffer is created */
     }
 
     size_t local_size = LZO_LOCAL_SIZE_DEFAULT;
@@ -316,29 +297,7 @@ int lzo_compress_core(
         fprintf(stderr, "[CORE][DEBUG-LENS] comp_total=%zu, out_needed=%zu\n", comp_total, out_needed);
     }
 
-    /* If kernel supports debug instrumentation and created a debug buffer, map and print it when debug mode is enabled. */
-    if (kernel_has_dbg_arg && d_dbg != NULL) {
-        const size_t dbg_fields = 7;
-        size_t dbg_bytes = nblk * dbg_fields * sizeof(cl_uint);
-        cl_int err_dbg;
-        if (params->debug) {
-            uint32_t *dbg_map = clEnqueueMapBuffer(queue, d_dbg, CL_TRUE, CL_MAP_READ, 0, dbg_bytes, 0, NULL, NULL, &err_dbg);
-            if (err_dbg == CL_SUCCESS && dbg_map) {
-                int abort_debug_sanity = lzo_parse_and_print_debug_buffer(dbg_map, dbg_fields, nblk, blk, worst_blk);
-                CHECK(clEnqueueUnmapMemObject(queue, d_dbg, dbg_map, 0, NULL, NULL));
-                if (abort_debug_sanity) {
-                    fprintf(stderr, "[CORE] Debug sanity checks failed, aborting compression job\n");
-                    /* cleanup and return error */
-                    free(len_arr);
-                    if (d_dbg) { clReleaseMemObject(d_dbg); d_dbg = NULL; }
-                    CHECK(clEnqueueUnmapMemObject(queue, d_out, host_comp, 0, NULL, NULL));
-                    return -1;
-                }
-            } else {
-                fprintf(stderr, "[CORE] Failed to map debug buffer: %d\n", err_dbg);
-            }
-        }
-    }
+
 
     uint64_t t_write_start = core_now_ns();
     int write_ret = 0;
@@ -353,7 +312,6 @@ int lzo_compress_core(
         fprintf(stderr, "[CORE] Failed to write compressed file\n");
         CHECK(clEnqueueUnmapMemObject(queue, d_out, host_comp, 0, NULL, NULL));
         free(len_arr);
-        if (d_dbg) { clReleaseMemObject(d_dbg); d_dbg = NULL; }
         return -1;
     }
 
@@ -361,11 +319,7 @@ int lzo_compress_core(
 
     free(len_arr);
     clFlush(queue);
-    clFinish(queue); /* release debug buffer if allocated */
-    if (d_dbg) {
-        clReleaseMemObject(d_dbg);
-        d_dbg = NULL;
-    }
+    clFinish(queue);
 
     uint64_t t_total_end = core_now_ns();
     unsigned long total_us = (t_total_end - t_total_start) / 1000;
@@ -488,7 +442,9 @@ int lzo_decompress_core(
     long current_pos = ftell(f_in); fseek(f_in, 0, SEEK_END); long file_sz = ftell(f_in); fseek(f_in, current_pos, SEEK_SET);
     size_t comp_sz = file_sz - current_pos;
 
-    fprintf(stderr, "[DECOMP] file summary: orig=%u blk=%u nblk=%u comp=%zu\n", orig_sz, blk_sz, nblk, comp_sz);
+    if (g_verbose) {
+        fprintf(stderr, "[DECOMP] file summary: orig=%u blk=%u nblk=%u comp=%zu\n", orig_sz, blk_sz, nblk, comp_sz);
+    }
 
     off_arr = malloc((nblk + 1) * sizeof(uint32_t));
     off_arr[0] = 0;

@@ -65,14 +65,13 @@ lzo_gpu/lzo_gpu
 lzo_gpu/samples/
 samples/
 lzo_gpu/build_kernel
+lzo_debug/
+analysis/
 
 exp_results/
 build/
 param_scan_*/
 archived/
-minilzo_cpu/
 lzo_hybrid/
-lzo_gpu_client
-lzo_gpu_daemon
 lzo_gpu/tools/benchmark_bandwidth
 # end

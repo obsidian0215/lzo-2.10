@@ -157,11 +157,6 @@ Force a fixed block size to reproduce or explore block-splitting impacts (KB):
 
 - If you see low upload times but high kernel times, try changing the kernel variant (-L flag) — smaller block sizes (1k/1l) often improve throughput.
 
-### Common diagnostics
-
-- Enable debug traces to inspect timings: use the standalone or client `--debug` flag — this prints time breakdowns for each stage.
-- If daemon is not applying preferences, confirm `lzo_gpu_client` is sending options (check client help) and daemon's logs for accepted/ignored options.
-
 ## Automated Benchmarking and Analysis
 
 To perform a comprehensive scan of algorithm variants, block sizes, and thread counts:

@@ -15,9 +15,8 @@ typedef struct {
     int level;               /* 10-18 */
     char input_path[1024];
     char output_path[1024];
-    int fixed_block_kb;
+    int block_size;
     int standard_copy;
-    int debug;
     size_t input_size;
     uint32_t local_size;
 } request_t;
