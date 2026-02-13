@@ -30,11 +30,7 @@ static inline size_t core_lzo_worst(size_t sz) {
     return sz + sz / 16 + 64 + 3;
 }
 
-static inline uint64_t core_now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
+#define core_now_ns lzo_now_ns
 
 void lzo_gpu_workspace_init(lzo_gpu_workspace_t* ws) {
     memset(ws, 0, sizeof(lzo_gpu_workspace_t));
@@ -162,7 +158,7 @@ int lzo_compress_core(
     else
         entropy_ptr = (const unsigned char*)mapped_in;
 
-    size_t blk_bytes = (params->block_size > 0) ? (size_t)params->block_size * 1024 : 0;
+    size_t blk_bytes = (params->block_size > 0) ? params->block_size : 0;
     lzo_choose_blocking_adaptive(entropy_ptr, in_sz, device, blk_bytes, 0, &blk, &nblk, params->debug);
 
     uint64_t t_blocking_end = core_now_ns();
@@ -226,7 +222,7 @@ int lzo_compress_core(
 
     /* multiplier: how many workgroups per CU. 4-8 is usually good for latency hiding.
      */
-    uint32_t pool_size = cus * 4;
+    uint32_t pool_size = cus * 6;
     if (pool_size > 2048) pool_size = 2048; // Cap at 2048 for now
     if (pool_size < 128) pool_size = 128;   // Minimum floor for small GPUs
 
@@ -234,7 +230,8 @@ int lzo_compress_core(
         fprintf(stderr, "[CORE] CU count: %u, dict_pool_size: %u\n", cus, pool_size);
     }
     {
-        size_t dict_per_block = (1ULL << params->level) * sizeof(unsigned short);
+        /* lzo_dict_t is now 32-bit to support fingerprinting and larger offsets */
+        size_t dict_per_block = (1ULL << params->level) * 4;
         size_t total_dict_size = (size_t)pool_size * dict_per_block;
 
         cl_mem d_dict = core_get_or_create_buffer(ctx, &ws->d_dict, &ws->dict_size, total_dict_size, CL_MEM_READ_WRITE, &err);
@@ -258,16 +255,11 @@ int lzo_compress_core(
     size_t active_groups = (nblk < pool_size) ? nblk : pool_size;
     size_t global_size = active_groups * local_size;
 
-    uint64_t t_exec_start = 0, t_exec_end = 0;
-    cl_event evt_compute;
-    cl_event* p_evt = g_verbose ? &evt_compute : NULL;
-
-    if (g_verbose) t_exec_start = core_now_ns();
-    CHECK(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_size, &local_size, 0, NULL, p_evt));
-    if (g_verbose) {
-        clWaitForEvents(1, &evt_compute);
-        t_exec_end = core_now_ns();
-    }
+    uint64_t t_exec_start = core_now_ns();
+    CHECK(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_size, &local_size, 0, NULL, NULL));
+    clFinish(queue);
+    uint64_t t_exec_end = core_now_ns();
+    unsigned long exec_us_host = (unsigned long)((t_exec_end - t_exec_start) / 1000);
 
     cl_uint* len_arr = malloc(nblk * sizeof(cl_uint));
     void* mapped_len = clEnqueueMapBuffer(queue, d_len, CL_TRUE, CL_MAP_READ, 0, nblk * sizeof(cl_uint), 0, NULL, NULL, &err);
@@ -327,51 +319,31 @@ int lzo_compress_core(
 
     unsigned long buffer_alloc_us = buffer_in_us + buffer_out_us;
     if (t_out) {
+        t_out->in_size = (unsigned long long)in_sz;
+        t_out->out_size = (unsigned long long)comp_total;
+        t_out->algo_config = (unsigned long long)params->level;
         t_out->file_read_us = read_us;
-        t_out->ocl_init_us = 0;
-        t_out->kernel_load_us = 0;
-        t_out->blocking_calc_us = blocking_us;
+        t_out->ocl_setup_us = g_ocl_init_us + g_kernel_load_us;
         t_out->buffer_alloc_us = buffer_alloc_us;
         t_out->data_upload_us = upload_us;
         /* buffer_alloc_out_us / buffer_alloc_len_us removed */
-        t_out->kernel_exec_us = (g_verbose) ? (unsigned long)((t_exec_end - t_exec_start)/1000) : 0;
+        t_out->kernel_exec_us = exec_us_host;
         t_out->download_total_us = download_us;
         t_out->file_write_us = write_us;
         t_out->blk_size_bytes = (unsigned long)blk;
         t_out->nblk = (unsigned long)nblk;
         t_out->global_size = (unsigned long)global_size;
         t_out->local_size = (unsigned long)local_size;
-        memset(t_out->kernel_name, 0, sizeof(t_out->kernel_name));
     }
 
-    double ratio = comp_total > 0 ? (double)in_sz / (double)comp_total : 0.0;
     if (g_verbose) {
-        fprintf(stderr, "\n=== Compression Statistics ===\n");
-        fprintf(stderr, "Input size       : %zu bytes (%.2f MB)\n", in_sz, in_sz / (1024.0 * 1024.0));
-        fprintf(stderr, "Compressed size  : %zu bytes (%.2f MB)\n", comp_total, comp_total / (1024.0 * 1024.0));
-        fprintf(stderr, "Compression ratio: %.2f:1 (%.2f%% of original)\n", ratio, 100.0 / ratio);
-        fprintf(stderr, "Block size       : %zu bytes (%zu KB)\n", blk, blk / 1024);
-        fprintf(stderr, "Number of blocks : %zu\n", nblk);
-        fprintf(stderr, "Compression level: %d\n", params->level);
-        fprintf(stderr, "Work groups      : global=%zu, local=%zu\n", global_size, local_size);
-        double kernel_thrpt = (t_out && t_out->kernel_exec_us > 0) ? ((double)in_sz / (1024.0*1024.0)) / (t_out->kernel_exec_us/1000000.0) : 0.0;
-        fprintf(stderr, "Throughput       : %.2f MB/s (kernel: %.2f MB/s)\n", ((double)in_sz / (1024.0*1024.0)) / (total_us/1000000.0), kernel_thrpt);
-        fprintf(stderr, "==============================\n\n");
-
-        fprintf(stderr, "\n=== Time Breakdown (Compression) ===\n");
-        print_us_tag(stderr, "1. File Read", read_us);
-        print_us_tag(stderr, "2. Blocking Calc", blocking_us);
-        unsigned long buffer_alloc_us = buffer_in_us + buffer_out_us;
-        print_us_tag(stderr, "3. Buffer Alloc", buffer_alloc_us);
-        print_us_tag(stderr, "4. GPU Upload", upload_us);
-        print_us_tag(stderr, "5. Kernel Exec", (unsigned long)((t_exec_end - t_exec_start)/1000));
-        print_us_tag(stderr, "6. GPU Download", download_us);
-        print_us_tag(stderr, "7. File Write", write_us);
-        print_us_tag(stderr, "TOTAL", total_us);
-        fprintf(stderr, "\n");
+        response_t r;
+        memset(&r, 0, sizeof(r));
+        if (t_out) r.timing = *t_out;
+        r.time_us = total_us;
+        r.status = 0;
+        lzo_print_response_stats(&r, input_path, 'C', params->alg_id);
     } else {
-        /* Minimal output for non-verbose mode: simple summary with total time */
-        printf("Compressed %zu -> %zu (%.2f:1) in %.2f ms\n", in_sz, comp_total, ratio, total_us / 1000.0);
     }
 
     return write_ret;
@@ -500,7 +472,6 @@ int lzo_decompress_core(
     f_in = NULL;
     uint64_t t_file_read_end = core_now_ns();
     unsigned long total_file_read_us = (t_file_read_end - t_file_read_start) / 1000;
-
     /* Now upload to GPU */
     uint64_t t_upload_start = core_now_ns();
 
@@ -570,31 +541,12 @@ int lzo_decompress_core(
 
     size_t local_size = (local_size_param > 0) ? (size_t)local_size_param : LZO_LOCAL_SIZE_DEFAULT;
     size_t global_size = ((size_t)nblk + local_size - 1) / local_size * local_size;
-    uint64_t t_exec_start = 0, t_exec_end = 0;
-    if (g_verbose) {
-        t_exec_start = core_now_ns();
-        fprintf(stderr, "[DECOMP] launching kernel: nblk=%u global_size=%zu local_size=%zu\n", nblk, global_size, local_size);
-    }
 
-    cl_event evt_exec = NULL;
-    cl_event* p_evt = g_verbose ? &evt_exec : NULL;
-    err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_size, &local_size, 0, NULL, p_evt);
+    uint64_t t_exec_start = core_now_ns();
+    err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_size, &local_size, 0, NULL, NULL);
     CHECK(err);
-
-    if (g_verbose && evt_exec) {
-        clWaitForEvents(1, &evt_exec);
-        t_exec_end = core_now_ns();
-    }
-
-    cl_ulong ev_start = 0, ev_end = 0;
-    if (g_verbose && evt_exec) {
-        cl_int perr = CL_SUCCESS;
-        perr = clGetEventProfilingInfo(evt_exec, CL_PROFILING_COMMAND_START, sizeof(ev_start), &ev_start, NULL);
-        if (perr == CL_SUCCESS) {
-            clGetEventProfilingInfo(evt_exec, CL_PROFILING_COMMAND_END, sizeof(ev_end), &ev_end, NULL);
-        }
-        clReleaseEvent(evt_exec);
-    }
+    clFinish(queue);
+    uint64_t t_exec_end = core_now_ns();
 
     uint64_t t_download_start = core_now_ns();
     mapped_out = clEnqueueMapBuffer(queue, d_out, CL_TRUE, CL_MAP_READ, 0, orig_sz, 0, NULL, NULL, &err);
@@ -603,8 +555,7 @@ int lzo_decompress_core(
     unsigned long download_us = (t_download_end - t_download_start) / 1000;
 
     uint64_t t_write_start2 = core_now_ns();
-    int write_ret = 0;
-    if (output_path && strcmp(output_path, "/dev/null") != 0) {
+    if (output_path) {
         fout = fopen(output_path, "wb");
         if (!fout) {
             perror("fopen output");
@@ -651,46 +602,29 @@ int lzo_decompress_core(
     unsigned long exec_host_us = (t_exec_end - t_exec_start) / 1000;
     unsigned long download_us_local = download_us;
     unsigned long write_us_local = write_us;
-    unsigned long exec_us_ev = 0;
-    if (ev_start != 0 && ev_end != 0 && ev_end > ev_start)
-        exec_us_ev = (unsigned long)((ev_end - ev_start) / 1000);
-
-    if (g_verbose) {
-        fprintf(stderr, "\n=== Decompression Statistics ===\n");
-        fprintf(stderr, "Compressed size  : %zu bytes (%.2f MB)\n", comp_sz, comp_sz / (1024.0 * 1024.0));
-        fprintf(stderr, "Output size      : %u bytes (%.2f MB)\n", orig_sz, orig_sz / (1024.0 * 1024.0));
-        fprintf(stderr, "Block size       : %u bytes (%u KB)\n", blk_sz, blk_sz / 1024);
-        fprintf(stderr, "Work groups      : global=%zu, local=%zu\n", global_size, local_size);
-        double kernel_thrpt = exec_host_us > 0 ? ((double)orig_sz / (1024.0*1024.0)) / (exec_host_us/1000000.0) : 0.0;
-        fprintf(stderr, "Throughput       : %.2f MB/s (kernel: %.2f MB/s)\n", ((double)orig_sz / (1024.0*1024.0)) / (*time_us_out/1000000.0), kernel_thrpt);
-        fprintf(stderr, "==============================\n\n");
-
-        fprintf(stderr, "\n=== Time Breakdown (Decompression) ===\n");
-        print_us_tag(stderr, "1. File Read", total_file_read_us);
-        print_us_tag(stderr, "2. Buffer Alloc", buf_us);
-        print_us_tag(stderr, "3. GPU Upload", upload_us_local);
-        print_us_tag(stderr, "4. Kernel Exec", exec_host_us);
-        if (exec_us_ev) print_us_tag(stderr, "   (event profiling)", exec_us_ev);
-        print_us_tag(stderr, "5. GPU Download", download_us_local);
-        print_us_tag(stderr, "6. File Write", write_us_local);
-        print_us_tag(stderr, "TOTAL", (unsigned long)(*time_us_out));
-        fprintf(stderr, "\n");
-    } else {
-        printf("Decompressed %zu -> %u in %.2f ms\n", comp_sz, orig_sz, (*time_us_out) / 1000.0);
-    }
 
     if (t_out) {
+        t_out->in_size = comp_sz;
+        t_out->out_size = orig_sz;
         t_out->file_read_us = (t_buf_comp_start - t_start) / 1000;
-        t_out->ocl_init_us = 0;
-        t_out->kernel_load_us = 0;
+        t_out->ocl_setup_us = g_ocl_init_us + g_kernel_load_us;
         t_out->buffer_alloc_us = buf_us;
         t_out->data_upload_us = upload_us_local;
-        t_out->setup_args_us = 0;
-        t_out->kernel_exec_us = exec_us_ev ? exec_us_ev : exec_host_us;
+        t_out->kernel_exec_us = exec_host_us;
         t_out->download_total_us = download_us_local;
         t_out->file_write_us = write_us_local;
         t_out->global_size = global_size; t_out->local_size = local_size; t_out->blk_size_bytes = blk_sz; t_out->nblk = nblk;
-        memset(t_out->kernel_name, 0, sizeof(t_out->kernel_name)); strncpy(t_out->kernel_name, "lzo1x_decomp", sizeof(t_out->kernel_name) - 1);
+        t_out->algo_config = 0;
+    }
+
+    if (g_verbose) {
+        response_t r;
+        memset(&r, 0, sizeof(r));
+        if (t_out) r.timing = *t_out;
+        r.time_us = *time_us_out;
+        r.status = 0;
+        lzo_print_response_stats(&r, input_path, 'D', 0);
+    } else {
     }
 
     ret = 0; /* Success */

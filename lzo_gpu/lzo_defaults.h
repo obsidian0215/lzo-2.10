@@ -14,13 +14,13 @@
 
 /* Compression configuration */
 /* Default compression level (bits). Reduced to 11 based on param-scan aggregated results */
-#define LZO_DEFAULT_COMP_LEVEL 11
+#define LZO_DEFAULT_COMP_LEVEL 12
 
 /* Default block size (in KB) when no adaptive/training result is available */
 #define LZO_DEFAULT_BLOCK_KB 16
 
 /* Block size and GPU parallelism configuration */
-#define LZO_OCC_FACTOR_DEFAULT 128
+#define LZO_OCC_FACTOR_DEFAULT 256
 #define LZO_ALIGN_BYTES_DEFAULT 4096  /* 4KB alignment for block sizes for memory efficiency */
 #define LZO_MIN_BLOCK_BYTES_DEFAULT (4 * 1024)   /* 1KB minimum */
 #define LZO_MAX_BLOCK_BYTES_DEFAULT (128 * 1024)  /* 128KB maximum (increased from 64KB) */
@@ -29,7 +29,7 @@
 #define LZO_ADAPTIVE_SAMPLE_SIZE (64 * 1024)  /* 64KB sample for entropy */
 #define LZO_ADAPTIVE_LOW_ENTROPY 4.0
 #define LZO_ADAPTIVE_HIGH_ENTROPY 7.0
-#define LZO_ADAPTIVE_ENTROPY_ENABLED 0  /* 0=size-only (fast), 1=entropy-aware */
+#define LZO_ADAPTIVE_ENTROPY_ENABLED 1  /* 0=size-only (fast), 1=entropy-aware */
 
 /* OpenCL configuration */
 /* Default work-group size. Set to 4 (empirically best balance in our param-scan) */
@@ -56,8 +56,5 @@ static inline int lzo_env_get_int(const char* name, int default_val) {
 	if (!s || *s == '\0') return default_val;
 	return atoi(s);
 }
-
-/* Adaptive blocking: Enable entropy-based block size calculation (default: disabled for speed) */
-#define LZO_ADAPTIVE_ENTROPY_ENABLED 0  /* 0=size-only (fast), 1=entropy-aware (slower but better) */
 
 #endif /* LZO_DEFAULTS_H */

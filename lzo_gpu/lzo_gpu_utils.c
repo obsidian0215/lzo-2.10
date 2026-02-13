@@ -6,6 +6,26 @@
 #include <math.h>
 #include <unistd.h>
 #include <limits.h>
+#include <sys/stat.h>
+
+unsigned long g_ocl_init_us = 0;
+unsigned long g_kernel_load_us = 0;
+unsigned long g_ocl_setup_us = 0; /* Not used but for safety */
+
+const char* format_size_lzo(size_t size) {
+    static char buf[32];
+    if (size < 1024) snprintf(buf, sizeof(buf), "%zu B", size);
+    else if (size < 1024 * 1024) snprintf(buf, sizeof(buf), "%.2f KB", size / 1024.0);
+    else if (size < 1024 * 1024 * 1024) snprintf(buf, sizeof(buf), "%.2f MB", size / (1024.0 * 1024.0));
+    else snprintf(buf, sizeof(buf), "%.2f GB", size / (1024.0 * 1024.0 * 1024.0));
+    return buf;
+}
+
+static void print_time_row(FILE *f, const char *label, unsigned long us, unsigned long total_us) {
+    double ms = us / 1000.0;
+    double pct = total_us > 0 ? (100.0 * us / total_us) : 0.0;
+    fprintf(f, "%-22s : %10.3f ms (%6.2f%%)\n", label, ms, pct);
+}
 
 /* Implementation of lzo_find_file_path */
 int lzo_find_file_path(const char *name, char *out, size_t outlen)
@@ -286,7 +306,7 @@ size_t lzo_adaptive_block_size(size_t in_sz, cl_uint cu)
     if (cu == 0) cu = 1;
 
     /* Target: 192x CU count (middle ground between 128-256x for good occupancy) */
-    size_t target_nblk = (size_t)cu * 192;
+    size_t target_nblk = (size_t)cu * LZO_OCC_FACTOR_DEFAULT;
 
     /* Calculate block size from target block count */
     size_t base_block = (in_sz + target_nblk - 1) / target_nblk;
@@ -760,4 +780,62 @@ err:
     if (f) fclose(f);
     if (vbuf) free(vbuf);
     return -1;
+}
+
+void lzo_print_response_stats(const response_t* resp, const char* input_path, int operation, int alg) {
+    const timing_t* t = &resp->timing;
+    size_t in_size = t->in_size;
+    if (in_size == 0) {
+        struct stat st;
+        if (stat(input_path, &st) == 0) in_size = st.st_size;
+    }
+
+    const char* mode_str = (operation == 'C' ? "Compress" : "Decompress");
+
+    printf("\n==============================================================================\n");
+    printf("  LZO GPU PERFORMANCE REPORT (%s)\n", mode_str);
+    printf("==============================================================================\n");
+    printf("%-22s : %s\n", "Input File", input_path);
+    printf("%-22s : %zu bytes (%s)\n", "Input Size", in_size, format_size_lzo(in_size));
+
+    if (operation == 'C') {
+        double ratio_pct = in_size > 0 ? (100.0 * (double)t->out_size / in_size) : 0;
+        printf("%-22s : %zu bytes (%s) (%.2f%% ratio)\n", "Output Size", (size_t)t->out_size, format_size_lzo(t->out_size), ratio_pct);
+    } else {
+        printf("%-22s : %zu bytes (%s)\n", "Output Size", (size_t)t->out_size, format_size_lzo(t->out_size));
+    }
+
+    const char* alg_name = (alg == 1 ? "lzo1y" : "lzo1x");
+    printf("%-22s : %s (Level: %d)\n", "Algorithm", alg_name, t->algo_config);
+    printf("%-22s : %lu blocks (BlockSize: %s)\n", "Workload", (unsigned long)t->nblk, format_size_lzo(t->blk_size_bytes));
+    printf("%-22s : Global: %lu, Local: %lu\n", "Grid Size", (unsigned long)t->global_size, (unsigned long)t->local_size);
+
+    printf("------------------------------------------------------------------------------\n");
+    printf("  Detailed Timing Breakdown\n");
+    printf("------------------------------------------------------------------------------\n");
+
+    unsigned long total_us = resp->time_us;
+    print_time_row(stdout, "File Read", t->file_read_us, total_us);
+    print_time_row(stdout, "OCI Setup", t->ocl_setup_us, total_us);
+    print_time_row(stdout, "Buffer Alloc", t->buffer_alloc_us, total_us);
+    print_time_row(stdout, "Data Upload/Map", t->data_upload_us, total_us);
+    print_time_row(stdout, "Kernel Execution", t->kernel_exec_us, total_us);
+    print_time_row(stdout, "Data Download/Unmap", t->download_total_us, total_us);
+    print_time_row(stdout, "File Write", t->file_write_us, total_us);
+
+    printf("------------------------------------------------------------------------------\n");
+    printf("%-22s : %10.3f ms\n", "TOTAL INCLUSIVE", total_us / 1000.0);
+    printf("------------------------------------------------------------------------------\n");
+
+    size_t throughput_bytes = (operation == 'C') ? in_size : (size_t)t->out_size;
+    double in_mb = (double)throughput_bytes / (1024.0 * 1024.0);
+    if (total_us > 0) {
+        double mb_s = in_mb / ((double)total_us / 1000000.0);
+        printf("%-22s : %10.2f MB/s\n", "Inclusive Throughput", mb_s);
+    }
+    if (t->kernel_exec_us > 0) {
+        double mb_s = in_mb / ((double)t->kernel_exec_us / 1000000.0);
+        printf("%-22s : %10.2f MB/s\n", "Kernel Throughput", mb_s);
+    }
+    printf("==============================================================================\n\n");
 }

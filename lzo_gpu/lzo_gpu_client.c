@@ -62,15 +62,15 @@ static void parse_client_cli_opts(int argc, char** argv, request_t* req) {
             }
             continue;
         }
-        if (strncmp(a, "-B=", 3) == 0) { req->block_size = (int)(lzo_parse_block_size(a + 3) / 1024); argv[i] = "--"; continue; }
-        if (strcmp(a, "-B") == 0 && i + 1 < argc) { argv[i] = "--"; req->block_size = (int)(lzo_parse_block_size(argv[++i]) / 1024); argv[i] = "--"; continue; }
-        if (strncmp(a, "--block-size=", 13) == 0) { req->block_size = (int)(lzo_parse_block_size(a + 13) / 1024); argv[i] = "--"; continue; }
-        if (strcmp(a, "--block-size") == 0 && i + 1 < argc) { argv[i] = "--"; req->block_size = (int)(lzo_parse_block_size(argv[++i]) / 1024); argv[i] = "--"; continue; }
+        if (strncmp(a, "-B=", 3) == 0) { req->block_size = (int)lzo_parse_block_size(a + 3); argv[i] = "--"; continue; }
+        if (strcmp(a, "-B") == 0 && i + 1 < argc) { argv[i] = "--"; req->block_size = (int)lzo_parse_block_size(argv[++i]); argv[i] = "--"; continue; }
+        if (strncmp(a, "--block-size=", 13) == 0) { req->block_size = (int)lzo_parse_block_size(a + 13); argv[i] = "--"; continue; }
+        if (strcmp(a, "--block-size") == 0 && i + 1 < argc) { argv[i] = "--"; req->block_size = (int)lzo_parse_block_size(argv[++i]); argv[i] = "--"; continue; }
         if (strncmp(a, "--local=", 8) == 0) { req->local_size = atoi(a + 8); argv[i] = "--"; continue; }
         if (strcmp(a, "--local") == 0 && i + 1 < argc) { argv[i] = "--"; req->local_size = atoi(argv[++i]); argv[i] = "--"; continue; }
         if (strcmp(a, "--zero-copy") == 0) { req->standard_copy = 0; argv[i] = "--"; continue; }
         if (strcmp(a, "--standard-copy") == 0) { req->standard_copy = 1; argv[i] = "--"; continue; }
-
+        if (strcmp(a, "-v") == 0 || strcmp(a, "--verbose") == 0) { g_verbose = 1; argv[i] = "--"; continue; }
     }
 }
 
@@ -168,60 +168,15 @@ int decompress_with_daemon(const char* input, const char* output, int alg)
 
     // 处理响应
     if (resp.status == 0) {
-        if (resp.timing.kernel_exec_us > 0) {
-            /* Decompression path: output format matching lzo_gpu standalone */
-            double orig_mb = resp.out_size / (1024.0 * 1024.0);
-            double comp_mb = st.st_size / (1024.0 * 1024.0);
-            double total_ms = resp.time_us / 1000.0;
-            double kernel_ms = resp.timing.kernel_exec_us / 1000.0;
-            double throughput = total_ms > 0 ? orig_mb / (total_ms / 1000.0) : 0;
-            double kernel_throughput = kernel_ms > 0 ? orig_mb / (kernel_ms / 1000.0) : 0;
-
-            fprintf(stderr, "\n=== Decompression Statistics ===\n");
-            fprintf(stderr, "Compressed size  : %zu bytes (%.2f MB)\n", (size_t)st.st_size, comp_mb);
-            fprintf(stderr, "Output size      : %zu bytes (%.2f MB)\n", (size_t)resp.out_size, orig_mb);
-            fprintf(stderr, "Block size       : %lu bytes/%lu KB\n",
-                (unsigned long)resp.timing.blk_size_bytes,
-                (unsigned long)(resp.timing.blk_size_bytes / 1024UL));
-            fprintf(stderr, "Kernel           : %s\n",
-                resp.timing.kernel_name[0] ? resp.timing.kernel_name : "unknown");
-            fprintf(stderr, "Work groups      : global=%lu, local=%lu\n",
-                (unsigned long)resp.timing.global_size,
-                (unsigned long)resp.timing.local_size);
-            fprintf(stderr, "Throughput       : %.2f MB/s (kernel: %.2f MB/s)\n", throughput, kernel_throughput);
-            fprintf(stderr, "==============================\n\n");
-
-            fprintf(stderr, "=== Timing Breakdown ===\n");
-            fprintf(stderr, "1. File Read       : %.2f ms (%.1f%%)\n",
-                    resp.timing.file_read_us / 1000.0,
-                    resp.time_us > 0 ? 100.0 * resp.timing.file_read_us / resp.time_us : 0);
-            fprintf(stderr, "2. Buffer Alloc    : %.2f ms (%.1f%%)\n",
-                    resp.timing.buffer_alloc_us / 1000.0,
-                    resp.time_us > 0 ? 100.0 * resp.timing.buffer_alloc_us / resp.time_us : 0);
-            fprintf(stderr, "3. Data Upload     : %.2f ms (%.1f%%)\n",
-                    resp.timing.data_upload_us / 1000.0,
-                    resp.time_us > 0 ? 100.0 * resp.timing.data_upload_us / resp.time_us : 0);
-            fprintf(stderr, "4. Setup Args      : %.2f ms (%.1f%%)\n",
-                    resp.timing.setup_args_us / 1000.0,
-                    resp.time_us > 0 ? 100.0 * resp.timing.setup_args_us / resp.time_us : 0);
-            fprintf(stderr, "5. Kernel Exec     : %.2f ms (%.1f%%)\n",
-                    resp.timing.kernel_exec_us / 1000.0,
-                    resp.time_us > 0 ? 100.0 * resp.timing.kernel_exec_us / resp.time_us : 0);
-            fprintf(stderr, "6. Data Download   : %.2f ms (%.1f%%)\n",
-                    resp.timing.download_total_us / 1000.0,
-                    resp.time_us > 0 ? 100.0 * resp.timing.download_total_us / resp.time_us : 0);
-            fprintf(stderr, "7. File Write      : %.2f ms (%.1f%%)\n",
-                    resp.timing.file_write_us / 1000.0,
-                    resp.time_us > 0 ? 100.0 * resp.timing.file_write_us / resp.time_us : 0);
-            fprintf(stderr, "------------------------\n");
-            fprintf(stderr, "TOTAL              : %.2f ms\n", total_ms);
-            fprintf(stderr, "Throughput         : %.2f MB/s (kernel: %.2f MB/s)\n", throughput, kernel_throughput);
+        if (g_verbose) {
+            lzo_print_response_stats(&resp, input, 'D', alg);
         } else {
             printf("Decompressed %zu -> %zu in %.2f ms\n", (size_t)st.st_size, (size_t)resp.out_size, resp.time_us / 1000.0);
         }
         return 0;
     } else {
         fprintf(stderr, "解压缩失败: %s\n", resp.message);
+        close(sock);
         return -1;
     }
 }
@@ -309,57 +264,8 @@ int compress_with_daemon(const char* input, const char* output, int alg, int lev
 
     // 处理响应
     if (resp.status == 0) {
-        if (resp.timing.kernel_exec_us > 0) {
-            double orig_mb = req.input_size / (1024.0 * 1024.0);
-            double comp_mb = resp.out_size / (1024.0 * 1024.0);
-            double total_ms = resp.time_us / 1000.0;
-            double kernel_ms = resp.timing.kernel_exec_us / 1000.0;
-            double throughput = total_ms > 0 ? orig_mb / (total_ms / 1000.0) : 0;
-            double kernel_throughput = kernel_ms > 0 ? orig_mb / (kernel_ms / 1000.0) : 0;
-            double ratio = resp.out_size > 0 ? (double)req.input_size / resp.out_size : 0;
-            double ratio_pct = req.input_size > 0 ? 100.0 * resp.out_size / req.input_size : 0;
-
-            fprintf(stderr, "\n=== Compression Statistics ===\n");
-            fprintf(stderr, "Input size       : %zu bytes (%.2f MB)\n", (size_t)req.input_size, orig_mb);
-            fprintf(stderr, "Compressed size  : %zu bytes (%.2f MB)\n", (size_t)resp.out_size, comp_mb);
-            fprintf(stderr, "Compression ratio: %.2f:1 (%.2f%% of original)\n", ratio, ratio_pct);
-            fprintf(stderr, "Block size (blocks): %lu bytes/%lu KB (%lu)\n",
-                (unsigned long)resp.timing.blk_size_bytes,
-                (unsigned long)(resp.timing.blk_size_bytes / 1024UL),
-                (unsigned long)resp.timing.nblk);
-            fprintf(stderr, "Kernel           : %s\n",
-                resp.timing.kernel_name[0] ? resp.timing.kernel_name : "unknown");
-            fprintf(stderr, "Work groups      : global=%lu, local=%lu\n",
-                (unsigned long)resp.timing.global_size,
-                (unsigned long)resp.timing.local_size);
-            fprintf(stderr, "Throughput       : %.2f MB/s (kernel: %.2f MB/s)\n", throughput, kernel_throughput);
-            fprintf(stderr, "==============================\n\n");
-
-            fprintf(stderr, "=== Timing Breakdown ===\n");
-            fprintf(stderr, "1. File Read       : %.2f ms (%.1f%%)\n",
-                    resp.timing.file_read_us / 1000.0,
-                    resp.time_us > 0 ? 100.0 * resp.timing.file_read_us / resp.time_us : 0);
-            fprintf(stderr, "2. Blocking Calc   : %.2f ms (%.1f%%)\n",
-                    resp.timing.blocking_calc_us / 1000.0,
-                    resp.time_us > 0 ? 100.0 * resp.timing.blocking_calc_us / resp.time_us : 0);
-            fprintf(stderr, "3. Buffer Alloc    : %.2f ms (%.1f%%)\n",
-                    resp.timing.buffer_alloc_us / 1000.0,
-                    resp.time_us > 0 ? 100.0 * resp.timing.buffer_alloc_us / resp.time_us : 0);
-            fprintf(stderr, "4. Data Upload     : %.2f ms (%.1f%%)\n",
-                    resp.timing.data_upload_us / 1000.0,
-                    resp.time_us > 0 ? 100.0 * resp.timing.data_upload_us / resp.time_us : 0);
-            fprintf(stderr, "5. Kernel Exec     : %.2f ms (%.1f%%)\n",
-                    resp.timing.kernel_exec_us / 1000.0,
-                    resp.time_us > 0 ? 100.0 * resp.timing.kernel_exec_us / resp.time_us : 0);
-            fprintf(stderr, "6. Data Download   : %.2f ms (%.1f%%)\n",
-                    resp.timing.download_total_us / 1000.0,
-                    resp.time_us > 0 ? 100.0 * resp.timing.download_total_us / resp.time_us : 0);
-            fprintf(stderr, "7. File Write      : %.2f ms (%.1f%%)\n",
-                    resp.timing.file_write_us / 1000.0,
-                    resp.time_us > 0 ? 100.0 * resp.timing.file_write_us / resp.time_us : 0);
-            fprintf(stderr, "------------------------\n");
-            fprintf(stderr, "TOTAL              : %.2f ms\n", total_ms);
-            fprintf(stderr, "Throughput         : %.2f MB/s (kernel: %.2f MB/s)\n", throughput, kernel_throughput);
+        if (g_verbose) {
+            lzo_print_response_stats(&resp, input, 'C', alg);
         } else {
              double ratio = resp.out_size > 0 ? (double)req.input_size / (double)resp.out_size : 0.0;
              printf("Compressed %zu -> %zu (%.2f:1) in %.2f ms\n", (size_t)req.input_size, (size_t)resp.out_size, ratio, resp.time_us / 1000.0);

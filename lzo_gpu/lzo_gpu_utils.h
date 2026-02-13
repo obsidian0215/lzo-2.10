@@ -16,6 +16,15 @@
 extern "C" {
 #endif
 
+#include <time.h>
+#include <stdint.h>
+
+static inline uint64_t lzo_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 /* Locate a file by name with priority: exe_dir, exe_dir/../lzo_gpu, LZO_GPU_DIR, OUT_DIR, cwd, raw
  * Returns 0 on success and writes resolved path to out. Returns -1 on failure.
  */
@@ -80,6 +89,8 @@ int lzo_write_compressed_file(const char* path,
  * returns -1 if no configuration file was found.
  */
 int lzo_apply_autotune_config(request_t* req);
+
+void lzo_print_response_stats(const response_t* resp, const char* input_path, int operation, int alg);
 
 #ifdef __cplusplus
 }

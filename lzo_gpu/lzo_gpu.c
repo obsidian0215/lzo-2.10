@@ -22,16 +22,14 @@
 #include "lzo_gpu_core.h"
 
 /* Forward declarations for daemon and client modules */
+#include "lzo_gpu_utils.h"
+
+#define now_ns lzo_now_ns
+
 int run_lzo_daemon(int argc, char** argv);
 int run_lzo_client(int argc, char** argv);
 
 /* Helper for multi-threaded pread into a destination buffer.
- * Each thread handles a subrange (off,len) of the destination.
- */
-/* forward declaration of now_ns used below by the reaper */
-static inline uint64_t now_ns(void);
-
-/*
 * 压缩文件格式：
 uint16  magic     = 0x4C5A   // 'L''Z'
 uint32  orig_size               (≤4 GiB)
@@ -47,33 +45,12 @@ uint32  len[nblk]               // 每块压缩长度
 #define ENABLE_COMPRESSION_RATIO_TRACKING 1
 
 #if defined(_WIN32) || defined(_WIN64)
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-
-static inline uint64_t now_ns(void)
-{
-    static LARGE_INTEGER freq = { 0 };
-    if (freq.QuadPart == 0)
-        QueryPerformanceFrequency(&freq);
-
-    LARGE_INTEGER counter;
-    QueryPerformanceCounter(&counter);
-    /*   counter / freq = 秒
      * → counter * 1e9 / freq = 纳秒
      */
     return (uint64_t)counter.QuadPart * (uint64_t)1000000000ULL /
         (uint64_t)freq.QuadPart;
 }
 
-#else
-#include <time.h>
-
-static inline uint64_t now_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
 #endif
 
 static inline void print_ns(const char* tag, uint64_t ns) {
@@ -102,6 +79,7 @@ static cl_device_id dev;
 
 static void ocl_init(void)
 {
+    uint64_t t1 = now_ns();
     cl_platform_id pf;
     cl_device_type dtype = CL_DEVICE_TYPE_GPU;
     CHECK(clGetPlatformIDs(1, &pf, NULL));
@@ -111,6 +89,8 @@ static void ocl_init(void)
         CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0
     };
     q = clCreateCommandQueueWithProperties(ctx, dev, props, NULL);
+    uint64_t t2 = now_ns();
+    g_ocl_init_us = (unsigned long)((t2 - t1) / 1000);
 }
 
 void print_buildlog(cl_program program, cl_device_id device) {
@@ -207,14 +187,17 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
     cl_kernel krn_c = NULL;
     char build_log[8192] = {0};
     int kernel_has_dbg = 0;
+    uint64_t tk1 = now_ns();
     if (lzo_load_comp_kernel(ctx, dev, alg_name, comp_level, 0, &prog_c, &krn_c, &kernel_has_dbg, build_log, sizeof(build_log)) != 0) {
         if (build_log[0]) fprintf(stderr, "error: failed to load kernel for %s bits=%d: %s\n", alg_name, comp_level, build_log);
         else fprintf(stderr, "error: failed to load kernel for %s bits=%d\n", alg_name, comp_level);
         return 1;
     }
+    uint64_t tk2 = now_ns();
+    g_kernel_load_us = (unsigned long)((tk2 - tk1) / 1000);
 
     int standard_copy = (getenv("LZO_STANDARD_COPY") && atoi(getenv("LZO_STANDARD_COPY")) == 1) ? 1 : 0;
-    int block_size = (g_cli_fixed_block_bytes > 0) ? (int)(g_cli_fixed_block_bytes / 1024) : 0;
+    size_t block_size = g_cli_fixed_block_bytes;
     int alg_id = (strcmp(alg_name, "lzo1y") == 0) ? 1 : 0;
 
     lzo_gpu_workspace_t ws;
@@ -236,7 +219,19 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
 
     int ret = lzo_compress_core(ctx, q, dev, krn_c, in_path, output_path, &params, &ws, &time_us, &output_size, &t_out);
 
-    lzo_gpu_workspace_free(&ws);
+    if (ret == 0) {
+        if (g_verbose) {
+            response_t r = {0};
+            r.status = 0;
+            r.time_us = time_us;
+            r.out_size = output_size;
+            r.timing = t_out;
+            lzo_print_response_stats(&r, in_path, 'C', alg_id);
+        } else {
+            double ratio = (double)t_out.in_size / (t_out.out_size > 0 ? t_out.out_size : 1);
+            printf("%s : %zu -> %zu (%.2f:1) in %.2f ms\n", in_path, t_out.in_size, t_out.out_size, ratio, time_us / 1000.0);
+        }
+    }
     if (krn_c) clReleaseKernel(krn_c);
     if (prog_c) clReleaseProgram(prog_c);
     if (q) { clReleaseCommandQueue(q); q = NULL; }
@@ -264,7 +259,7 @@ static int do_decompress_mode(const char* lz_path, const char* output_path, int 
     cl_int err;
     char build_log[8192] = {0};
 
-
+    uint64_t tk1 = now_ns();
     /* Fallback to base decompressor */
     if (!prog_d) {
         prog_d = lzo_load_program_with_dbits(ctx, dev, decomp_base, 0, build_log, sizeof(build_log));
@@ -274,12 +269,26 @@ static int do_decompress_mode(const char* lz_path, const char* output_path, int 
     char krn_name[64]; snprintf(krn_name, sizeof(krn_name), "%s_block_decompress", alg_name);
     cl_kernel krn_d = clCreateKernel(prog_d, krn_name, &err);
     if (err != CL_SUCCESS) { fprintf(stderr, "clCreateKernel failed for %s (err=%d)\n", krn_name, err); clReleaseProgram(prog_d); return 1; }
+    uint64_t tk2 = now_ns();
+    g_kernel_load_us = (unsigned long)((tk2 - tk1) / 1000);
 
     lzo_gpu_workspace_t ws;
     lzo_gpu_workspace_init(&ws);
     unsigned long time_us = 0; size_t output_size = 0; timing_t t_out = {0};
 
     int rc = lzo_decompress_core(ctx, q, dev, krn_d, lz_path, output_path, &ws, standard_copy, (int)g_cli_local_size, 0, &time_us, &output_size, &t_out);
+    if (rc == 0) {
+        if (g_verbose) {
+            response_t r = {0};
+            r.status = 0;
+            r.time_us = time_us;
+            r.out_size = output_size;
+            r.timing = t_out;
+            lzo_print_response_stats(&r, lz_path, 'D', (strcmp(alg_name, "lzo1y") == 0) ? 1 : 0);
+        } else {
+            printf("%s : %zu -> %zu in %.2f ms\n", lz_path, t_out.in_size, t_out.out_size, time_us / 1000.0);
+        }
+    }
     lzo_gpu_workspace_free(&ws);
 
     if (krn_d) clReleaseKernel(krn_d);
@@ -312,27 +321,20 @@ int run_lzo_standalone(int argc, char** argv)
     const char *alg_name = "lzo1x";
     int alg_specified = 0;
 
-    /* pass 1: detect mode, help, verbose */
+    /* parse options and positionals */
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+        const char* arg = argv[i];
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
             show_help(argv[0]);
             return 0;
         }
-        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) {
-             decompress_mode = 1;
-        }
-        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
             g_verbose = 1;
+            continue;
         }
-    }
-
-    /* pass 2: parse options and positionals with knowledge of mode */
-    for (int i = 1; i < argc; ++i) {
-        const char* arg = argv[i];
-        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) { continue; }
         if (strcmp(arg, "-o") == 0 || strcmp(arg, "--output") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "missing argument for %s\n", arg);
+                fprintf(stderr, "Error: missing argument for %s\n", arg);
                 return 1;
             }
             output_path = argv[++i];
@@ -342,7 +344,7 @@ int run_lzo_standalone(int argc, char** argv)
         }
         if (strcmp(arg, "-L") == 0 || strcmp(arg, "-l") == 0 || strcmp(arg, "--level") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "missing argument for %s\n", arg);
+                fprintf(stderr, "Error: missing argument for %s\n", arg);
                 return 1;
             }
             comp_level = atoi(argv[++i]);
@@ -355,7 +357,7 @@ int run_lzo_standalone(int argc, char** argv)
         }
         if (strcmp(arg, "-a") == 0 || strcmp(arg, "--alg") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "missing argument for %s\n", arg);
+                fprintf(stderr, "Error: missing argument for %s\n", arg);
                 return 1;
             }
             alg_name = argv[++i];
@@ -371,7 +373,6 @@ int run_lzo_standalone(int argc, char** argv)
             continue;
         }
         if (strcmp(arg, "-c") == 0) {
-            /* -c means compress mode (default, explicit flag for clarity) */
             decompress_mode = 0;
             continue;
         }
@@ -379,32 +380,51 @@ int run_lzo_standalone(int argc, char** argv)
             decompress_mode = 1;
             continue;
         }
-        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
-            g_verbose = 1;
+        if (strcmp(arg, "-B") == 0 || strcmp(arg, "--block-size") == 0) {
+            if (i + 1 < argc) {
+                const char* s = argv[++i];
+                g_cli_fixed_block_exact = lzo_specified_unit_is_bytes(s);
+                size_t b = lzo_parse_block_size(s);
+                if (b > 0) g_cli_fixed_block_bytes = b;
+            } else {
+                fprintf(stderr, "Error: -B requires an argument\n");
+                return 1;
+            }
             continue;
         }
-        if (strncmp(arg, "-B=", 3) == 0) { /* short shorthand -B=value */
-            const char* s = arg + 3;
+        if (strncmp(arg, "--block-size=", 13) == 0) {
+            const char* s = arg + 13;
             g_cli_fixed_block_exact = lzo_specified_unit_is_bytes(s);
             size_t b = lzo_parse_block_size(s);
             if (b > 0) g_cli_fixed_block_bytes = b;
             continue;
         }
-        if (strcmp(arg, "-B") == 0) { if (i + 1 < argc) { const char* s = argv[++i]; g_cli_fixed_block_exact = lzo_specified_unit_is_bytes(s); size_t b = lzo_parse_block_size(s); if (b > 0) g_cli_fixed_block_bytes = b; } continue; }
-        if (strncmp(arg, "--block-size=", 13) == 0) { const char* s = arg + 13; g_cli_fixed_block_exact = lzo_specified_unit_is_bytes(s); size_t b = lzo_parse_block_size(s); if (b > 0) g_cli_fixed_block_bytes = b; continue; }
-        if (strcmp(arg, "--block-size") == 0) { if (i + 1 < argc) { const char* s = argv[++i]; g_cli_fixed_block_exact = lzo_specified_unit_is_bytes(s); size_t b = lzo_parse_block_size(s); if (b > 0) g_cli_fixed_block_bytes = b; } continue; }
-        if (strncmp(arg, "--local=", 8) == 0) { g_cli_local_size = (size_t)atoi(arg + 8); if (g_cli_local_size == 0) g_cli_local_size = 0; continue; }
-        if (strcmp(arg, "--local") == 0) { if (i + 1 < argc) { g_cli_local_size = (size_t)atoi(argv[++i]); if (g_cli_local_size == 0) g_cli_local_size = 0; } continue; }
-        /* positional */
-        if (arg[0] != '-') {
-            if (decompress_mode) {
-                if (!lz_path) { lz_path = arg; continue; }
+        if (strncmp(arg, "--local=", 8) == 0) {
+            g_cli_local_size = (size_t)atoi(arg + 8);
+            continue;
+        }
+        if (strcmp(arg, "--local") == 0) {
+            if (i + 1 < argc) g_cli_local_size = (size_t)atoi(argv[++i]);
+            else { fprintf(stderr, "Error: --local requires an argument\n"); return 1; }
+            continue;
+        }
+        /* positional or error */
+        if (arg[0] == '-') {
+            fprintf(stderr, "Error: Unknown option %s\n", arg);
+            fprintf(stderr, "Tips: Use -h or --help for help. Standard positional usage: %s <input> [output]\n", argv[0]);
+            return 1;
+        } else {
+            if (!in_path && !lz_path) {
+                if (decompress_mode) lz_path = arg; else in_path = arg;
+            } else if (!output_explicit) {
+                output_path = arg;
+                output_explicit = 1;
             } else {
-                if (!in_path) { in_path = arg; continue; }
+                fprintf(stderr, "Error: Too many positional arguments\n");
+                return 1;
             }
         }
     }
-
     /* Set default output names if not specified */
     char default_output[512];
     if (output_explicit == 0 || output_path == NULL) {

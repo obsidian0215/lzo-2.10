@@ -84,7 +84,7 @@ typedef long           lzo_int;
 #define lzo_int32_t                 lzo_int32e_t
 #define lzo_uint32_t                lzo_uint32e_t
 
-#define lzo_sizeof_dict_t     ((unsigned)sizeof(lzo_bytep))
+#define lzo_sizeof_dict_t     ((unsigned)sizeof(lzo_uint32_t))
 
 typedef union {
         lzo_voidp a00; lzo_bytep a01; lzo_uint a02; lzo_xint a03; lzo_uintptr_t a04;
@@ -111,7 +111,7 @@ typedef union {
 #define LZO1X_MEM_DECOMPRESS    (0)
 
 #ifndef lzo_dict_t
-#define lzo_dict_t lzo_uint16_t
+#define lzo_dict_t lzo_uint32_t
 #endif
 
 #ifndef lzo_dict_p

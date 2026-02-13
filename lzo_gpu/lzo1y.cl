@@ -6,7 +6,6 @@
 typedef __generic unsigned char * lzo_bytep;
 typedef __generic void *          lzo_voidp;
 typedef __generic unsigned int *  lzo_uintp;
-#define lzo_dict_p __generic unsigned short *
 
 #include "lzo_gpu.h"
 
@@ -78,6 +77,13 @@ static inline void LZO_MEMOPS_COPYN_FAST(__generic void *dd, const __generic voi
 {
     __generic uchar *d = (__generic uchar*)dd;
     __generic const uchar *s = (__generic const uchar*)ss;
+    while (nn >= 32) {
+        uchar16 c0 = vload16(0, s);
+        uchar16 c1 = vload16(1, s);
+        vstore16(c0, 0, d);
+        vstore16(c1, 0, d + 16);
+        d += 32; s += 32; nn -= 32;
+    }
     while (nn >= 16) {
         uchar16 chunk = vload16(0, s);
         vstore16(chunk, 0, d);
@@ -147,7 +153,8 @@ static inline uint lzo1y_hash32(uint dv)
 }
 
 #define DINDEX(dv,p)        ((lzo1y_hash32(dv)) >> (32 - D_BITS))
-#define DENTRY(p,in)        ((lzo_dict_t) pd(p, in))
+/* Fingerprinting: 12 bits high for data, 20 bits low for offset (up to 1MB) */
+#define DENTRY(p,in,dv)     ((lzo_dict_t)(((lzo_uint)pd(p, in) & 0xFFFFF) | ((dv) & 0xFFF00000)))
 
 static lzo_uint
 lzo1y_compress_core(__generic const lzo_bytep in , lzo_uint  in_len,
@@ -172,11 +179,10 @@ lzo1y_compress_core(__generic const lzo_bytep in , lzo_uint  in_len,
         __generic const lzo_bytep m_pos;
         lzo_uint m_off;
         lzo_uint m_len;
+        uint dv = 0;
+        uint dindex = 0;
         lzo_uint saved_dindex = 0;
         {
-            uint dv;
-            uint dindex;
-
     literal:
             ip += 1 + ((ip - ii) >> 5);
     next:
@@ -191,56 +197,57 @@ lzo1y_compress_core(__generic const lzo_bytep in , lzo_uint  in_len,
                 uint4 h_b = dvs_b ^ (dvs_b >> 7); h_b ^= (h_b >> 3); h_b *= 0x9e3779b1u; h_b ^= (h_b >> 16);
                 uint4 idx_a = (h_a >> (32 - D_BITS));
                 uint4 idx_b = (h_b >> (32 - D_BITS));
+                lzo_dict_t m_val;
 
                 // Iter 1-4
-                m_off = dict[idx_a.s0]; m_pos = in + m_off;
-                if (m_off != 0 && dvs_a.s0 == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
+                m_val = dict[idx_a.s0]; m_off = m_val & 0xFFFFF; m_pos = in + m_off;
+                if (m_off != 0 && (m_val & 0xFFF00000) == (dvs_a.s0 & 0xFFF00000) && dvs_a.s0 == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
                     dv = dvs_a.s0; saved_dindex = idx_a.s0; goto match_found;
                 }
-                dict[idx_a.s0] = DENTRY(ip, in);
+                dict[idx_a.s0] = DENTRY(ip, in, dvs_a.s0);
 
-                ip++; m_off = dict[idx_a.s1]; m_pos = in + m_off;
-                if (m_off != 0 && dvs_a.s1 == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
+                ip++; m_val = dict[idx_a.s1]; m_off = m_val & 0xFFFFF; m_pos = in + m_off;
+                if (m_off != 0 && (m_val & 0xFFF00000) == (dvs_a.s1 & 0xFFF00000) && dvs_a.s1 == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
                     dv = dvs_a.s1; saved_dindex = idx_a.s1; goto match_found;
                 }
-                dict[idx_a.s1] = DENTRY(ip, in);
+                dict[idx_a.s1] = DENTRY(ip, in, dvs_a.s1);
 
-                ip++; m_off = dict[idx_a.s2]; m_pos = in + m_off;
-                if (m_off != 0 && dvs_a.s2 == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
+                ip++; m_val = dict[idx_a.s2]; m_off = m_val & 0xFFFFF; m_pos = in + m_off;
+                if (m_off != 0 && (m_val & 0xFFF00000) == (dvs_a.s2 & 0xFFF00000) && dvs_a.s2 == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
                     dv = dvs_a.s2; saved_dindex = idx_a.s2; goto match_found;
                 }
-                dict[idx_a.s2] = DENTRY(ip, in);
+                dict[idx_a.s2] = DENTRY(ip, in, dvs_a.s2);
 
-                ip++; m_off = dict[idx_a.s3]; m_pos = in + m_off;
-                if (m_off != 0 && dvs_a.s3 == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
+                ip++; m_val = dict[idx_a.s3]; m_off = m_val & 0xFFFFF; m_pos = in + m_off;
+                if (m_off != 0 && (m_val & 0xFFF00000) == (dvs_a.s3 & 0xFFF00000) && dvs_a.s3 == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
                     dv = dvs_a.s3; saved_dindex = idx_a.s3; goto match_found;
                 }
-                dict[idx_a.s3] = DENTRY(ip, in);
+                dict[idx_a.s3] = DENTRY(ip, in, dvs_a.s3);
 
                 // Iter 5-8
-                ip++; m_off = dict[idx_b.s0]; m_pos = in + m_off;
-                if (m_off != 0 && dvs_b.s0 == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
+                ip++; m_val = dict[idx_b.s0]; m_off = m_val & 0xFFFFF; m_pos = in + m_off;
+                if (m_off != 0 && (m_val & 0xFFF00000) == (dvs_b.s0 & 0xFFF00000) && dvs_b.s0 == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
                     dv = dvs_b.s0; saved_dindex = idx_b.s0; goto match_found;
                 }
-                dict[idx_b.s0] = DENTRY(ip, in);
+                dict[idx_b.s0] = DENTRY(ip, in, dvs_b.s0);
 
-                ip++; m_off = dict[idx_b.s1]; m_pos = in + m_off;
-                if (m_off != 0 && dvs_b.s1 == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
+                ip++; m_val = dict[idx_b.s1]; m_off = m_val & 0xFFFFF; m_pos = in + m_off;
+                if (m_off != 0 && (m_val & 0xFFF00000) == (dvs_b.s1 & 0xFFF00000) && dvs_b.s1 == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
                     dv = dvs_b.s1; saved_dindex = idx_b.s1; goto match_found;
                 }
-                dict[idx_b.s1] = DENTRY(ip, in);
+                dict[idx_b.s1] = DENTRY(ip, in, dvs_b.s1);
 
-                ip++; m_off = dict[idx_b.s2]; m_pos = in + m_off;
-                if (m_off != 0 && dvs_b.s2 == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
+                ip++; m_val = dict[idx_b.s2]; m_off = m_val & 0xFFFFF; m_pos = in + m_off;
+                if (m_off != 0 && (m_val & 0xFFF00000) == (dvs_b.s2 & 0xFFF00000) && dvs_b.s2 == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
                     dv = dvs_b.s2; saved_dindex = idx_b.s2; goto match_found;
                 }
-                dict[idx_b.s2] = DENTRY(ip, in);
+                dict[idx_b.s2] = DENTRY(ip, in, dvs_b.s2);
 
-                ip++; m_off = dict[idx_b.s3]; m_pos = in + m_off;
-                if (m_off != 0 && dvs_b.s3 == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
+                ip++; m_val = dict[idx_b.s3]; m_off = m_val & 0xFFFFF; m_pos = in + m_off;
+                if (m_off != 0 && (m_val & 0xFFF00000) == (dvs_b.s3 & 0xFFF00000) && dvs_b.s3 == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
                     dv = dvs_b.s3; saved_dindex = idx_b.s3; goto match_found;
                 }
-                dict[idx_b.s3] = DENTRY(ip, in);
+                dict[idx_b.s3] = DENTRY(ip, in, dvs_b.s3);
 
                 ip++;
                 goto literal;
@@ -251,14 +258,15 @@ lzo1y_compress_core(__generic const lzo_bytep in , lzo_uint  in_len,
                 break;
             dv = UA_GET_LE32(ip);
             dindex = DINDEX(dv,ip);
-            m_off = dict[dindex];
+            lzo_dict_t m_val = dict[dindex];
+            m_off = m_val & 0xFFFFF;
             m_pos = in + m_off;
 
-            if (m_off != 0 && dv == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
+            if (m_off != 0 && (m_val & 0xFFF00000) == (dv & 0xFFF00000) && dv == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
                 saved_dindex = dindex;
                 goto match_found;
             }
-            dict[dindex] = DENTRY(ip,in);
+            dict[dindex] = DENTRY(ip,in,dv);
             goto literal;
         }
 
@@ -301,7 +309,7 @@ lzo1y_compress_core(__generic const lzo_bytep in , lzo_uint  in_len,
         while (ip + m_len < ip_end && ip[m_len] == m_pos[m_len]) m_len++;
 
 m_len_done:
-        dict[saved_dindex] = DENTRY(ip,in);
+        dict[saved_dindex] = DENTRY(ip,in,dv);
         m_off = pd(ip,m_pos);
         ip += m_len;
         ii = ip;
@@ -382,14 +390,13 @@ static __generic uchar* lzo1y_compress_terminate(__generic const uchar* ip, uint
 }
 
 static inline void dict_clear_global(__global lzo_dict_t* dict) {
-    __global ulong *p = (__global ulong *) dict;
+    __global uint16 *p = (__global uint16 *) dict;
     uint tid = get_local_id(0);
     uint sz = get_local_size(0);
-    // Each lzo_dict_t is 2 bytes. ulong is 8 bytes = 4 entries.
-    // Total entries = (1 << D_BITS). Total ulongs = (1 << D_BITS) / 4.
-    uint n = (1 << D_BITS) >> 2;
+    // entries = (1 << D_BITS). Each uint16 is 16 * 4 bytes = 64 bytes = 16 entries.
+    uint n = (1 << D_BITS) >> 4;
     for (uint i = tid; i < n; i += sz) {
-        p[i] = 0;
+        p[i] = (uint16)0;
     }
     barrier(CLK_GLOBAL_MEM_FENCE);
 }

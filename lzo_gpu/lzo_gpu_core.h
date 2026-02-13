@@ -36,6 +36,8 @@ void lzo_gpu_workspace_free(lzo_gpu_workspace_t* ws);
 
 /* Global verbosity control */
 extern int g_verbose;
+extern unsigned long g_ocl_init_us;
+extern unsigned long g_kernel_load_us;
 
 /* Parameter object to reduce lzo_compress_core argument count from 18 to 6 */
 typedef struct {
@@ -45,7 +47,7 @@ typedef struct {
 
     /* I/O and memory settings */
     int standard_copy;      /* 0=zero-copy (map), 1=standard copy */
-    int block_size;      /* Fixed block size in KB (0=adaptive) */
+    size_t block_size;      /* Fixed block size in Bytes (0=adaptive) */
 
     /* Debug and profiling */
     int local_size_param;   /* OpenCL local work-group size */

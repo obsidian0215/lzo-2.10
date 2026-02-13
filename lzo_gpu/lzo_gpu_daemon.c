@@ -33,6 +33,8 @@
 #include <stddef.h>
 #include <libgen.h>
 
+#define core_now_ns lzo_now_ns
+
 /* Decompress is implemented in lzo_gpu_core: use lzo_decompress_core() */
 
 #define SOCKET_PATH "/tmp/lzo_gpu_daemon.sock"
@@ -198,6 +200,7 @@ int init_opencl_resources(void)
     printf("[DAEMON]    - 解压缩kernel: 1x/1y\n");
     printf("[DAEMON]    - 缓冲区: 预分配 (常驻 %.1f MB/Worker)\n", MAX_BUFFER_SIZE / 1024.0 / 1024.0);
     printf("[DAEMON]    - 初始化耗时: %lu ms\n", g_state.init_time_ms);
+    g_ocl_init_us = g_state.init_time_ms * 1000;
 
     return 0;
 }
@@ -225,6 +228,7 @@ static cl_program get_compress_program(int alg, int bits)
 
     snprintf(bin_name, sizeof(bin_name), "%s_%d.clbin", alg_names[alg], bits);
 
+    uint64_t tk1 = core_now_ns();
     bin = (unsigned char*)lzo_read_file(bin_name, &bin_sz);
     if (bin) {
         printf("[DAEMON] 加载预编译Kernel Program: %s\n", bin_name);
@@ -234,6 +238,8 @@ static cl_program get_compress_program(int alg, int bits)
         free(bin);
         if (err == CL_SUCCESS && binary_status == CL_SUCCESS) {
             clBuildProgram(*p_prog, 1, &g_state.device, "-cl-std=CL2.0", NULL, NULL);
+            uint64_t tk2 = core_now_ns();
+            g_kernel_load_us += (unsigned long)((tk2 - tk1) / 1000);
             pthread_mutex_unlock(&g_state.compile_lock);
             return *p_prog;
         }
@@ -260,6 +266,8 @@ static cl_program get_compress_program(int alg, int bits)
             char build_opts_with_inc[512];
             snprintf(build_opts_with_inc, sizeof(build_opts_with_inc), "-cl-std=CL2.0 -I.%s -D D_BITS=%d -D LZO_USE_UNROLL2", include_opt, bits);
             err = clBuildProgram(*p_prog, 1, &g_state.device, build_opts_with_inc, NULL, NULL);
+            uint64_t tk2_src = core_now_ns();
+            g_kernel_load_us += (unsigned long)((tk2_src - tk1) / 1000);
             if (err == CL_SUCCESS) {
                 pthread_mutex_unlock(&g_state.compile_lock);
                 return *p_prog;
@@ -313,6 +321,7 @@ static cl_program get_decompress_program(int alg)
     char bin_name[64];
     snprintf(bin_name, sizeof(bin_name), "%s_decomp.clbin", alg_names[alg]);
     size_t bin_sz;
+    uint64_t tk1 = core_now_ns();
     unsigned char* bin = (unsigned char*)lzo_read_file(bin_name, &bin_sz);
 
     if (bin) {
@@ -323,6 +332,8 @@ static cl_program get_decompress_program(int alg)
         free(bin);
         if (err == CL_SUCCESS && binary_status == CL_SUCCESS) {
              err = clBuildProgram(g_state.prog_decomp[alg], 1, &g_state.device, "-cl-std=CL2.0", NULL, NULL);
+             uint64_t tk2 = core_now_ns();
+             g_kernel_load_us += (unsigned long)((tk2 - tk1) / 1000);
              if (err == CL_SUCCESS) {
                  pthread_mutex_unlock(&g_state.compile_lock);
                  return g_state.prog_decomp[alg];
@@ -351,6 +362,8 @@ static cl_program get_decompress_program(int alg)
 
     if (err == CL_SUCCESS) {
         err = clBuildProgram(g_state.prog_decomp[alg], 1, &g_state.device, "-cl-std=CL2.0 -I.", NULL, NULL);
+        uint64_t tk2 = core_now_ns();
+        g_kernel_load_us += (unsigned long)((tk2 - tk1) / 1000);
         if (err == CL_SUCCESS) {
             pthread_mutex_unlock(&g_state.compile_lock);
             return g_state.prog_decomp[alg];
@@ -436,27 +449,18 @@ int handle_compress_request(request_t* req, response_t* resp, worker_res_t* work
     if (ret == 0) {
         resp->status = 0;
         resp->out_size = output_size;
-        /* Ensure OCL init time is not part of the per-request total.  The daemon
-         * initialises OpenCL at startup, and we explicitly zero that field for
-         * per-request timings; but in case some implementation fills it, subtract it.
-         */
-        unsigned long effective_time_us = time_us;
-        if (t.ocl_init_us > 0 && effective_time_us >= t.ocl_init_us) {
-            effective_time_us -= t.ocl_init_us;
-        }
-        resp->time_us = effective_time_us;
+        /* Inclusive total time for this request (daemon mode excludes global init) */
+        resp->time_us = time_us;
         resp->timing = t;
-        /* annotate kernel name into the timing struct so clients can print it (include variant) */
-        if (sizeof(resp->timing.kernel_name) > 0) {
-            memset(resp->timing.kernel_name, 0, sizeof(resp->timing.kernel_name));
-            snprintf(resp->timing.kernel_name, sizeof(resp->timing.kernel_name)-1, "%s_%d", alg_names[req->alg], req->level);
-        }
+        /* Per user request: in daemon mode, ocl_setup_us is always 0 for all requests */
+        resp->timing.ocl_setup_us = 0;
+
         snprintf(resp->message, sizeof(resp->message),
                 "Success (saved ~%lums init)", g_state.init_time_ms);
 
         pthread_mutex_lock(&g_state.stats_lock);
         g_state.requests++;
-        g_state.total_time_ms += effective_time_us / 1000;  // 统计用毫秒
+        g_state.total_time_ms += resp->time_us / 1000;  // 统计用毫秒
         pthread_mutex_unlock(&g_state.stats_lock);
     } else {
         resp->status = -1;
@@ -529,21 +533,17 @@ int handle_decompress_request(request_t* req, response_t* resp, worker_res_t* wo
 
     if (ret == 0) {
         resp->status = 0;
-        /* Subtract any OCL init time from total so client-facing totals don't include startup init */
-        unsigned long effective_time_us = time_us;
-        if (t.ocl_init_us > 0 && effective_time_us >= t.ocl_init_us) {
-            effective_time_us -= t.ocl_init_us;
-        }
-        resp->time_us = effective_time_us;
         resp->out_size = output_size;
-        /* copy the compact timing structure into the response */
+        resp->time_us = time_us;
         resp->timing = t;
+        resp->timing.ocl_setup_us = 0;
+
         snprintf(resp->message, sizeof(resp->message), "OK");
-        printf("[DAEMON] 解压缩成功: %zu bytes, %.2f ms\n", output_size, effective_time_us/1000.0);
+        printf("[DAEMON] 解压缩成功: %zu bytes, %.2f ms\n", output_size, resp->time_us/1000.0);
 
         pthread_mutex_lock(&g_state.stats_lock);
         g_state.requests++;
-        g_state.total_time_ms += effective_time_us / 1000;
+        g_state.total_time_ms += resp->time_us / 1000;
         pthread_mutex_unlock(&g_state.stats_lock);
     } else {
         resp->status = -1;

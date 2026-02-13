@@ -135,6 +135,15 @@ static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos,
             op += 64; m_pos += 64; len -= 64;
         }
     }
+    if (offset >= 32) {
+        while (len >= 32) {
+            uchar16 v0 = vload16(0, m_pos);
+            uchar16 v1 = vload16(1, m_pos);
+            vstore16(v0, 0, op);
+            vstore16(v1, 0, op + 16);
+            op += 32; m_pos += 32; len -= 32;
+        }
+    }
     if (offset >= 16) {
         while (len >= 16) {
             vstore16(vload16(0, m_pos), 0, op);

@@ -1,5 +1,65 @@
 # LZO GPU 性能优化摘要与实验报告 (LZO GPU Optimization & Performance Report)
 
+## 0. 2026-02-13 更新（口径修正 + 重测 + 同算法对比）
+
+### 0.1 吞吐口径已校准
+
+- 已确认并修正基准语义：
+  - `lzo_cpu` 为 **overall/wall-clock** 吞吐；
+  - `lzo_gpu` 同时记录 **kernel** 与 **inclusive(overall)** 吞吐。
+- 口径审计文档：`/root/lzo-2.10/exp_results/THROUGHPUT_AUDIT.md`
+
+### 0.2 本轮内核改动（已进入主干）
+
+- 解压匹配拷贝新增 32B 向量化路径：
+  - `lzo_gpu/lzo1x_decomp.cl`
+  - `lzo_gpu/lzo1y_decomp.cl`
+- 压缩字面量拷贝新增 32B 向量化路径：
+  - `lzo_gpu/lzo1x.cl`
+  - `lzo_gpu/lzo1y.cl`
+
+### 0.3 重测结果（按文件取“CPU最佳 overall vs GPU最佳 overall”）
+
+- 覆盖文件：110
+- 分文件对比：`/root/lzo-2.10/exp_results/lzo_cpu_gpu_per_file_compare.csv`
+- 超参汇总：`/root/lzo-2.10/exp_results/lzo_hyperparam_summary.csv`
+
+| 算法 | 压缩 speedup 中位数（overall） | 解压 speedup 中位数（overall） |
+| --- | ---: | ---: |
+| lzo1x_gpu vs lzo_cpu | 4.6776x | 5.5762x |
+| lzo1y_gpu vs lzo_cpu | 4.3734x | 5.5672x |
+
+### 0.4 同算法超参数最优（当前搜索空间）
+
+- `lzo1x_gpu`：
+  - 压缩 overall 中位数最优：`L=11, B=16KB, LS=1`（348.32 MB/s）
+  - 解压 overall 中位数最优：`L=11, B=16KB, LS=4`（390.72 MB/s）
+- `lzo1y_gpu`：
+  - 压缩 overall 中位数最优：`L=11, B=16KB, LS=16`（328.04 MB/s）
+  - 解压 overall 中位数最优：`L=11, B=16KB, LS=4`（391.33 MB/s）
+
+### 0.5 结论（当前阶段）
+
+- 在现有内核结构下，继续微调 copy 路径带来的收益已趋于平台期。
+- 下一优先内核方向建议：
+  1. 降低 `dict_clear` 成本（如代际标记/惰性清理）；
+  2. 再考虑块级与 local-size 的联合调优（已输出可复现 CSV）。
+
+### 0.6 收口总结与后续计划（按当前指令不再追加跑测）
+
+#### 阶段总结
+
+- 吞吐口径已完成源码级核对，CPU 与 GPU 指标语义已分离，避免“CPU 吞吐被误读为 kernel 吞吐”。
+- 基于已落盘数据，LZO 在同算法对比下已稳定体现出 GPU overall 优势（压缩与解压中位数均显著高于 CPU）。
+- 当前 copy 路径微优化已进入收益递减区，继续做同类微改的性价比偏低。
+
+#### 后续计划（按优先级）
+
+1. **内核结构优化优先**：实现 `dict_clear` 降本（代际标记 / 惰性清理）并验证正确性。
+2. **参数收敛**：以 `B=16KB` 为中心做小范围二次扫描（`LS`、`level` 联合），收敛默认配置。
+3. **工程化固化**：将已验证默认参数同步到 CLI 默认值与文档，确保“开箱即用”性能一致。
+4. **回归门禁**：保留按文件 CPU/GPU 对比表，后续改动统一以同算法指标回归，避免口径漂移。
+
 ## 1. 主机端优化 (Host-side Optimizations)
 
 主机端优化的目标是消除系统调用开销、减少数据拷贝瓶颈，并实现高并发下的资源最大化利用。
