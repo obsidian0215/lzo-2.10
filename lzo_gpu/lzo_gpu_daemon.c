@@ -248,7 +248,7 @@ static cl_program get_compress_program(int alg, int bits)
     /* 2. Fallback: Compile from source */
     char src_file[64];
     snprintf(src_file, sizeof(src_file), "%s.cl", alg_names[alg]);
-    printf("[DAEMON] 尝试编译 Kernel Program: %s (D_BITS=%d + LZO_USE_UNROLL2)...\n", src_file, bits);
+    printf("[DAEMON] 尝试编译 Kernel Program: %s (D_BITS=%d)...\n", src_file, bits);
 
     size_t src_len;
     char* src = lzo_read_file(src_file, &src_len);
@@ -264,7 +264,7 @@ static cl_program get_compress_program(int alg, int bits)
         free(src);
         if (err == CL_SUCCESS) {
             char build_opts_with_inc[512];
-            snprintf(build_opts_with_inc, sizeof(build_opts_with_inc), "-cl-std=CL2.0 -I.%s -D D_BITS=%d -D LZO_USE_UNROLL2", include_opt, bits);
+            snprintf(build_opts_with_inc, sizeof(build_opts_with_inc), "-cl-std=CL2.0 -I.%s -D D_BITS=%d", include_opt, bits);
             err = clBuildProgram(*p_prog, 1, &g_state.device, build_opts_with_inc, NULL, NULL);
             uint64_t tk2_src = core_now_ns();
             g_kernel_load_us += (unsigned long)((tk2_src - tk1) / 1000);
@@ -473,6 +473,32 @@ int handle_compress_request(request_t* req, response_t* resp, worker_res_t* work
     return ret;
 }
 
+static int detect_alg_from_lzo_header(const char* input_path)
+{
+    FILE* f = fopen(input_path, "rb");
+    if (!f) return -1;
+
+    uint16_t magic = 0;
+    uint32_t hdr[4] = {0}; /* orig_sz, blk_sz, nblk, alg_id */
+
+    if (fread(&magic, sizeof(magic), 1, f) != 1) {
+        fclose(f);
+        return -1;
+    }
+    if (magic != 0x4C5A) {
+        fclose(f);
+        return -1;
+    }
+    if (fread(hdr, sizeof(uint32_t), 4, f) != 4) {
+        fclose(f);
+        return -1;
+    }
+
+    fclose(f);
+    if (hdr[3] <= 1u) return (int)hdr[3];
+    return -1;
+}
+
 /*
  * 处理解压缩请求 (使用预加载的解压缩kernel)
  */
@@ -500,16 +526,28 @@ int handle_decompress_request(request_t* req, response_t* resp, worker_res_t* wo
     size_t output_size;
     timing_t t = {0};
 
-    cl_kernel kernel = get_decompress_kernel_for_worker(worker, req->alg);
+    int alg = req->alg;
+    if (alg < 0 || alg > 1) {
+        alg = detect_alg_from_lzo_header(req->input_path);
+        if (alg < 0 || alg > 1) {
+            resp->status = -1;
+            snprintf(resp->message, sizeof(resp->message),
+                     "Failed to detect algorithm from input header (req alg=%d)", req->alg);
+            return -1;
+        }
+        printf("[DAEMON]    - 自动检测算法: %s (req alg=%d)\n", alg == 0 ? "lzo1x" : "lzo1y", req->alg);
+    }
+
+    cl_kernel kernel = get_decompress_kernel_for_worker(worker, alg);
     const char* alg_names[] = {"lzo1x", "lzo1y"};
 
     if (!kernel) {
         resp->status = -1;
-        snprintf(resp->message, sizeof(resp->message), "Failed to get decompress kernel for alg=%d", req->alg);
+        snprintf(resp->message, sizeof(resp->message), "Failed to get decompress kernel for alg=%d", alg);
         return -1;
     }
 
-    printf("[DAEMON]    - 使用解压kernel: %s_decomp\n", alg_names[req->alg]);
+    printf("[DAEMON]    - 使用解压kernel: %s_decomp\n", alg_names[alg]);
 
     int ret = lzo_decompress_core(
         g_state.context,

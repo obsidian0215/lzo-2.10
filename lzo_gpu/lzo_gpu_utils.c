@@ -647,12 +647,10 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
         prog = clCreateProgramWithSource(ctx, 1, (const char**)&src, &src_len, &err);
         if (err != CL_SUCCESS) { if (build_log) snprintf(build_log, build_log_len, "clCreateProgramWithSource failed (err=%d)", err); free(src); return NULL; }
 
-        /* Build with appropriate macros based on variant flags.
-         * LZO_USE_UNROLL2 is now enabled by default for all kernel builds.
-         */
+        /* Build with appropriate macros based on variant flags. */
         char build_opts[256];
         /* Debug compilation flags removed; always build production kernels */
-        snprintf(build_opts, sizeof(build_opts), "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I. -I./lzo_gpu -I.. -D D_BITS=%d -D LZO_USE_UNROLL2", bits);
+        snprintf(build_opts, sizeof(build_opts), "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I. -I./lzo_gpu -I.. -D D_BITS=%d", bits);
         err = clBuildProgram(prog, 1, &dev, build_opts, NULL, NULL);
         if (err != CL_SUCCESS) {
             size_t log_sz = 0; clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);

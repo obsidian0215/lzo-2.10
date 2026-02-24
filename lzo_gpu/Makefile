@@ -32,7 +32,7 @@ precompile-combos: build_kernel
 	@for alg in lzo1x lzo1y; do \
 		for bits in 11 12 13 14 15; do \
 			echo "Building $${alg}_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits})..."; \
-			./build_kernel $${alg}.cl $${alg}_$${bits}.clbin "-I. -D D_BITS=$${bits} -D LZO_USE_UNROLL2" || exit 1; \
+			./build_kernel $${alg}.cl $${alg}_$${bits}.clbin "-I. -D D_BITS=$${bits}" || exit 1; \
 		done; \
 	done
 	@echo "Building decompression kernels"

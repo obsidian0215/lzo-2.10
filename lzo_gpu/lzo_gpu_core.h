@@ -2,6 +2,7 @@
 #define LZO_GPU_CORE_H
 
 #include <CL/cl.h>
+#include <stdint.h>
 #include "timing.h"
 
 #ifdef __cplusplus
@@ -19,6 +20,7 @@ typedef struct {
     size_t out_size;
     size_t len_size;
     size_t dict_size;
+    uint32_t comp_epoch_base;
 
     /* Decompression buffers */
     cl_mem d_comp;

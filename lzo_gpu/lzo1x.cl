@@ -14,6 +14,14 @@
 #define D_BITS 14
 #endif
 
+#ifndef LZO_USE_UNALIGNED
+#define LZO_USE_UNALIGNED 1
+#endif
+
+#ifndef LZO_USE_UNROLL2
+#define LZO_USE_UNROLL2 0
+#endif
+
 /* Debug instrumentation removed in production build. */
 
 /* Standard macros */
@@ -173,7 +181,7 @@ static inline uint lzo1x_hash32(uint dv)
 {
     dv ^= dv >> 7;
     dv ^= dv >> 3;
-    dv *= 0x9e3779b1u;  /* golden ratio prime, good bit spread */
+    dv *= 0x9e3779b1u;
     dv ^= dv >> 16;
     return dv;
 }
@@ -182,21 +190,32 @@ static inline uint lzo1x_hash32(uint dv)
 
 /* Fingerprinting: 12 bits high for data, 20 bits low for offset (up to 1MB) */
 #define DENTRY(p,in,dv)                       ((lzo_dict_t)(((lzo_uint)pd(p, in) & 0xFFFFF) | ((dv) & 0xFFF00000)))
+#define DENTRY_OFF(off,dv)                    ((lzo_dict_t)(((lzo_uint)(off) & 0xFFFFF) | ((dv) & 0xFFF00000)))
 #define UPDATE_I(dict,index,p,in,dv)          dict[index] = DENTRY(p,in,dv)
+
+static inline void dict_store_packed(__global ulong* dict, uint idx, lzo_dict_t entry, uint epoch)
+{
+    dict[idx] = (((ulong)epoch) << 32) | (ulong)entry;
+}
+
+static inline lzo_dict_t dict_load_packed(__global const ulong* dict, uint idx, uint epoch, uint* valid)
+{
+    ulong packed = dict[idx];
+    *valid = ((uint)(packed >> 32) == epoch);
+    return (lzo_dict_t)packed;
+}
 
 
 static lzo_uint
 lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
                    LZO_ADDR_GLOBAL lzo_bytep out, lzo_uintp out_len,
-                    lzo_uint ti, lzo_voidp wrkmem)
+                    lzo_uint ti, __global ulong *dict, uint epoch)
 {
     LZO_ADDR_GLOBAL const lzo_bytep ip;
     LZO_ADDR_GLOBAL lzo_bytep op;
     const LZO_ADDR_GLOBAL lzo_bytep in_end = in + in_len;
     const LZO_ADDR_GLOBAL lzo_bytep ip_end = in + in_len - 20;
     LZO_ADDR_GLOBAL const lzo_bytep ii;
-    lzo_dict_p const dict = (lzo_dict_p) wrkmem;
-
     op = out;
     ip = in;
     ii = ip;
@@ -220,6 +239,7 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
                 ulong v8b = UA_GET_LE64(ip + 4);
                 uint4 dvs_a = (uint4)((uint)v8a, (uint)(v8a >> 8), (uint)(v8a >> 16), (uint)(v8a >> 24));
                 uint4 dvs_b = (uint4)((uint)v8b, (uint)(v8b >> 8), (uint)(v8b >> 16), (uint)(v8b >> 24));
+                lzo_uint ip_off = pd(ip, in);
 
                 // Vectorized hashes
                 uint4 h_a = dvs_a ^ (dvs_a >> 7); h_a ^= (h_a >> 3); h_a *= 0x9e3779b1u; h_a ^= (h_a >> 16);
@@ -229,24 +249,28 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
 
                 // Iter 1-8 with Fingerprinting
                 lzo_dict_t ent;
+                uint valid;
 #define CHECK_MATCH(idx, current_dv) \
-                ent = dict[idx]; \
-                if (ent != 0 && (ent & 0xFFF00000) == (current_dv & 0xFFF00000)) { \
-                    m_off = ent & 0xFFFFF; m_pos = in + m_off; \
-                    if (current_dv == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) { \
-                        dv = current_dv; saved_dindex = idx; goto match_found; \
+                ent = dict_load_packed(dict, idx, epoch, &valid); \
+                if (valid && ent != 0 && (ent & 0xFFF00000) == (current_dv & 0xFFF00000)) { \
+                    m_off = ent & 0xFFFFF; \
+                    if (ip_off > m_off && (ip_off - m_off) <= M4_MAX_OFFSET) { \
+                        m_pos = in + m_off; \
+                        if (current_dv == UA_GET_LE32(m_pos)) { \
+                            dv = current_dv; saved_dindex = idx; goto match_found; \
+                        } \
                     } \
                 } \
-                dict[idx] = DENTRY(ip, in, current_dv);
+                dict_store_packed(dict, idx, DENTRY_OFF(ip_off, current_dv), epoch);
 
                 CHECK_MATCH(idx_a.s0, dvs_a.s0);
-                ip++; CHECK_MATCH(idx_a.s1, dvs_a.s1);
-                ip++; CHECK_MATCH(idx_a.s2, dvs_a.s2);
-                ip++; CHECK_MATCH(idx_a.s3, dvs_a.s3);
-                ip++; CHECK_MATCH(idx_b.s0, dvs_b.s0);
-                ip++; CHECK_MATCH(idx_b.s1, dvs_b.s1);
-                ip++; CHECK_MATCH(idx_b.s2, dvs_b.s2);
-                ip++; CHECK_MATCH(idx_b.s3, dvs_b.s3);
+                ip++; ip_off++; CHECK_MATCH(idx_a.s1, dvs_a.s1);
+                ip++; ip_off++; CHECK_MATCH(idx_a.s2, dvs_a.s2);
+                ip++; ip_off++; CHECK_MATCH(idx_a.s3, dvs_a.s3);
+                ip++; ip_off++; CHECK_MATCH(idx_b.s0, dvs_b.s0);
+                ip++; ip_off++; CHECK_MATCH(idx_b.s1, dvs_b.s1);
+                ip++; ip_off++; CHECK_MATCH(idx_b.s2, dvs_b.s2);
+                ip++; ip_off++; CHECK_MATCH(idx_b.s3, dvs_b.s3);
 #undef CHECK_MATCH
 
                 ip++;
@@ -257,19 +281,23 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
             if (ip >= ip_end)
                 break;
             dv = UA_GET_LE32(ip);
+            lzo_uint ip_off = pd(ip, in);
             dindex = DINDEX(dv,ip);
 
-            lzo_dict_t ent = dict[dindex];
-            if (ent != 0 && (ent & 0xFFF00000) == (dv & 0xFFF00000)) {
+            uint valid = 0;
+            lzo_dict_t ent = dict_load_packed(dict, dindex, epoch, &valid);
+            if (valid && ent != 0 && (ent & 0xFFF00000) == (dv & 0xFFF00000)) {
                 m_off = ent & 0xFFFFF;
-                m_pos = in + m_off;
-                if (dv == UA_GET_LE32(m_pos) && pd(ip, m_pos) <= M4_MAX_OFFSET) {
-                    saved_dindex = dindex;
-                    goto match_found;
+                if (ip_off > m_off && (ip_off - m_off) <= M4_MAX_OFFSET) {
+                    m_pos = in + m_off;
+                    if (dv == UA_GET_LE32(m_pos)) {
+                        saved_dindex = dindex;
+                        goto match_found;
+                    }
                 }
             }
 
-            dict[dindex] = DENTRY(ip,in,dv);
+            dict_store_packed(dict, dindex, DENTRY_OFF(ip_off,dv), epoch);
 
             goto literal;
         }
@@ -354,29 +382,21 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
         }
 #endif
 
-        if (ip[m_len] == m_pos[m_len]) {
-            do {
-                m_len += 1;
-                if (ip[m_len] != m_pos[m_len]) break;
-                m_len += 1;
-                if (ip[m_len] != m_pos[m_len]) break;
-                m_len += 1;
-                if (ip[m_len] != m_pos[m_len]) break;
-                m_len += 1;
-                if (ip[m_len] != m_pos[m_len]) break;
-                m_len += 1;
-                if (ip[m_len] != m_pos[m_len]) break;
-                m_len += 1;
-                if (ip[m_len] != m_pos[m_len]) break;
-                m_len += 1;
-                if (ip[m_len] != m_pos[m_len]) break;
-                m_len += 1;
-                if (ip + m_len >= ip_end) goto m_len_done;
-            } while (ip[m_len] == m_pos[m_len]);
+        while (ip + m_len + 4 <= ip_end) {
+            uint ip32 = UA_GET_LE32(ip + m_len);
+            uint mp32 = UA_GET_LE32(m_pos + m_len);
+            if (ip32 != mp32) {
+                m_len += (ctz((ulong)(ip32 ^ mp32)) >> 3);
+                goto m_len_done;
+            }
+            m_len += 4;
+        }
+        while (ip + m_len < ip_end && ip[m_len] == m_pos[m_len]) {
+            m_len += 1;
         }
 m_len_done:
         /* Update dictionary entry with current position */
-        dict[saved_dindex] = DENTRY(ip,in,dv);
+        dict_store_packed(dict, saved_dindex, DENTRY(ip,in,dv), epoch);
 
         m_off = pd(ip,m_pos);
         ip += m_len;
@@ -456,41 +476,18 @@ static __global uchar* lzo1x_compress_terminate(__global const uchar* ip, uint i
     return op;
 }
 
-static inline void dict_clear(lzo_voidp wrkmem) {
-    __global uint16 *p = (__global uint16 *) wrkmem;
-    uint tid = get_local_id(0);
-    uint sz = get_local_size(0);
-    // Each lzo_dict_t is 4 bytes. uint16 is 64 bytes = 16 entries.
-    // Total entries = (1 << D_BITS). Total uint16 = (1 << D_BITS) / 16.
-    uint n = (1 << D_BITS) >> 4;
-    uint16 zero = (uint16)0;
-    for (uint i = tid; i < n; i += sz) {
-        p[i] = zero;
-    }
-    // Handle remainders if D_BITS < 4 (unlikely) or not multiple of 16
-    if (n == 0 && tid == 0) {
-        __global uint* p32 = (__global uint*)wrkmem;
-        for (uint i=0; i<(1<<D_BITS); i++) p32[i] = 0;
-    }
-    barrier(CLK_GLOBAL_MEM_FENCE);
-}
-
-static void do_compress(__global const uchar* in, uint in_len, __global uchar* out, lzo_uintp out_len, lzo_uint ti, lzo_voidp wrkmem)
+static void do_compress(__global const uchar* in, uint in_len, __global uchar* out, lzo_uintp out_len, lzo_uint ti, __global ulong *dict, uint epoch)
 {
     lzo_uint t = ti;
     __global uchar* op = out;
 
-    dict_clear(wrkmem);
+    lzo_uint olen = 0;
+    t = lzo1x_compress_core(in, in_len, op, &olen, t, dict, epoch);
+    op += olen;
+    // Terminate the block
+    op = lzo1x_compress_terminate(in + in_len, 0, op, t);
 
-    if (get_local_id(0) == 0) {
-        lzo_uint olen = 0;
-        t = lzo1x_compress_core(in, in_len, op, &olen, t, wrkmem);
-        op += olen;
-        // Terminate the block
-        op = lzo1x_compress_terminate(in + in_len, 0, op, t);
-
-        *out_len = (lzo_uint)(op - out);
-    }
+    *out_len = (lzo_uint)(op - out);
 }
 
 __kernel void lzo1x_block_compress(__global const uchar *in ,
@@ -499,26 +496,28 @@ __kernel void lzo1x_block_compress(__global const uchar *in ,
                                    const uint  in_sz,
                                    const uint  blk_size,
                                    const uint  worst_blk,
-                                   __global lzo_dict_t *dict_pool,
-                                   const uint  dict_pool_size)
+                                   __global ulong *dict_pool,
+                                   const uint  dict_pool_size,
+                                   const uint  epoch_base)
 {
-    const uint gid = get_group_id(0); // This workgroup will use dict_pool[gid]
-    const uint num_groups = get_num_groups(0);
+    const uint wi = get_global_id(0);
+    const uint total_wi = get_global_size(0);
     const uint total_blocks = (in_sz + blk_size - 1) / blk_size;
+    const uint dict_elems = (1u << D_BITS);
 
-    __global lzo_dict_t *dict = dict_pool + ((size_t)gid << D_BITS);
+    if (wi >= dict_pool_size) return;
 
-    for (uint b = gid; b < total_blocks; b += num_groups) {
+    __global ulong *dict = dict_pool + ((size_t)wi * dict_elems);
+
+    for (uint b = wi; b < total_blocks; b += total_wi) {
+        uint epoch = epoch_base + b + 1u;
         uint in_off = b * blk_size;
         __global const uchar* ip = in + in_off;
         __global uchar* op = out + b * worst_blk;
         uint in_len = (in_off + blk_size <= in_sz) ? blk_size : (in_sz - in_off);
 
         lzo_uint olen;
-        do_compress(ip, in_len, op, &olen, 0, dict);
-
-        if (get_local_id(0) == 0) {
-            out_len[b] = (uint)olen;
-        }
+        do_compress(ip, in_len, op, &olen, 0, dict, epoch);
+        out_len[b] = (uint)olen;
     }
 }

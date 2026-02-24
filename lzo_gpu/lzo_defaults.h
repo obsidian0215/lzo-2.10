@@ -33,7 +33,7 @@
 
 /* OpenCL configuration */
 /* Default work-group size. Set to 4 (empirically best balance in our param-scan) */
-#define LZO_LOCAL_SIZE_DEFAULT 4
+#define LZO_LOCAL_SIZE_DEFAULT 1
 
 /* Memory alignment */
 #ifndef ALIGN_BYTES
