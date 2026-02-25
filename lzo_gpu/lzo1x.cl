@@ -236,21 +236,17 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
             if (ip + 8 < ip_end)
             {
                 ulong v8a = UA_GET_LE64(ip);
-                ulong v8b = UA_GET_LE64(ip + 4);
                 uint4 dvs_a = (uint4)((uint)v8a, (uint)(v8a >> 8), (uint)(v8a >> 16), (uint)(v8a >> 24));
-                uint4 dvs_b = (uint4)((uint)v8b, (uint)(v8b >> 8), (uint)(v8b >> 16), (uint)(v8b >> 24));
                 lzo_uint ip_off = pd(ip, in);
 
                 // Vectorized hashes
                 uint4 h_a = dvs_a ^ (dvs_a >> 7); h_a ^= (h_a >> 3); h_a *= 0x9e3779b1u; h_a ^= (h_a >> 16);
-                uint4 h_b = dvs_b ^ (dvs_b >> 7); h_b ^= (h_b >> 3); h_b *= 0x9e3779b1u; h_b ^= (h_b >> 16);
                 uint4 idx_a = (h_a >> (32 - D_BITS));
-                uint4 idx_b = (h_b >> (32 - D_BITS));
 
                 // Iter 1-8 with Fingerprinting
                 lzo_dict_t ent;
                 uint valid;
-#define CHECK_MATCH(idx, current_dv) \
+#define CHECK_MATCH_STORE(idx, current_dv) \
                 ent = dict_load_packed(dict, idx, epoch, &valid); \
                 if (valid && ent != 0 && (ent & 0xFFF00000) == (current_dv & 0xFFF00000)) { \
                     m_off = ent & 0xFFFFF; \
@@ -263,15 +259,24 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
                 } \
                 dict_store_packed(dict, idx, DENTRY_OFF(ip_off, current_dv), epoch);
 
-                CHECK_MATCH(idx_a.s0, dvs_a.s0);
-                ip++; ip_off++; CHECK_MATCH(idx_a.s1, dvs_a.s1);
-                ip++; ip_off++; CHECK_MATCH(idx_a.s2, dvs_a.s2);
-                ip++; ip_off++; CHECK_MATCH(idx_a.s3, dvs_a.s3);
-                ip++; ip_off++; CHECK_MATCH(idx_b.s0, dvs_b.s0);
-                ip++; ip_off++; CHECK_MATCH(idx_b.s1, dvs_b.s1);
-                ip++; ip_off++; CHECK_MATCH(idx_b.s2, dvs_b.s2);
-                ip++; ip_off++; CHECK_MATCH(idx_b.s3, dvs_b.s3);
-#undef CHECK_MATCH
+#define CHECK_MATCH_ONLY(idx, current_dv) \
+                ent = dict_load_packed(dict, idx, epoch, &valid); \
+                if (valid && ent != 0 && (ent & 0xFFF00000) == (current_dv & 0xFFF00000)) { \
+                    m_off = ent & 0xFFFFF; \
+                    if (ip_off > m_off && (ip_off - m_off) <= M4_MAX_OFFSET) { \
+                        m_pos = in + m_off; \
+                        if (current_dv == UA_GET_LE32(m_pos)) { \
+                            dv = current_dv; saved_dindex = idx; goto match_found; \
+                        } \
+                    } \
+                }
+
+                CHECK_MATCH_STORE(idx_a.s0, dvs_a.s0);
+                ip++; ip_off++; CHECK_MATCH_STORE(idx_a.s1, dvs_a.s1);
+                ip++; ip_off++; CHECK_MATCH_STORE(idx_a.s2, dvs_a.s2);
+                ip++; ip_off++; CHECK_MATCH_STORE(idx_a.s3, dvs_a.s3);
+#undef CHECK_MATCH_STORE
+#undef CHECK_MATCH_ONLY
 
                 ip++;
                 goto literal;
