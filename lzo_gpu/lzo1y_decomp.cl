@@ -227,8 +227,16 @@ lzo1y_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
             }
         copy_match:
 
-            COPY_MATCH(op, m_pos, t + 2);
-            op += t + 2;
+            {
+                uint mlen = t + 2;
+                uint moff = (uint)(op - m_pos);
+                if (moff >= mlen) {
+                    UA_COPYN(op, m_pos, mlen);
+                } else {
+                    COPY_MATCH(op, m_pos, mlen);
+                }
+                op += mlen;
+            }
         match_done:
             t = ip[-2] & 3;
             if (t == 0) break;
