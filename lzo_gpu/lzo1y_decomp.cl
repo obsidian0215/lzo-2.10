@@ -46,6 +46,10 @@ static inline void UA_COPYN(__generic uchar *d, const __generic uchar *s, uint n
 static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos, uint len)
 {
     uint offset = op - m_pos;
+    if (offset >= len) {
+        UA_COPYN(op, m_pos, len);
+        return;
+    }
     if (offset <= 4) {
         if (offset == 1) {
             uchar c = *m_pos;
