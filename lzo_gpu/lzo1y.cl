@@ -30,7 +30,7 @@ typedef __generic unsigned int *  lzo_uintp;
 #endif
 
 #ifndef LZO_USE_UNROLL2
-#define LZO_USE_UNROLL2 0
+#define LZO_USE_UNROLL2 1
 #endif
 
 /* Debug instrumentation removed in production build. */

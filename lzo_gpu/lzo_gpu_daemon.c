@@ -135,7 +135,15 @@ int init_opencl_resources(void)
     err = clGetDeviceIDs(g_state.platform, CL_DEVICE_TYPE_GPU, 1,
                          &g_state.device, NULL);
     if (err != CL_SUCCESS) {
-        fprintf(stderr, "获取GPU设备失败: %d\n", err);
+        err = clGetDeviceIDs(g_state.platform, CL_DEVICE_TYPE_DEFAULT, 1,
+                             &g_state.device, NULL);
+    }
+    if (err != CL_SUCCESS) {
+        err = clGetDeviceIDs(g_state.platform, CL_DEVICE_TYPE_ALL, 1,
+                             &g_state.device, NULL);
+    }
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "获取OpenCL设备失败: %d\n", err);
         return -1;
     }
 

@@ -612,7 +612,7 @@ static int lzo_compress_core_pipeline(
         }
 
         {
-            unsigned sched_wi_per_cu = lzo_env_u32("LZO_GPU_WI_PER_CU", 256U);
+            unsigned sched_wi_per_cu = lzo_env_u32("LZO_GPU_WI_PER_CU", 384U);
             if (sched_wi_per_cu < 32U) sched_wi_per_cu = 32U;
             if (sched_wi_per_cu > 1024U) sched_wi_per_cu = 1024U;
             occ_cap = (cus > 0) ? ((size_t)cus * (size_t)sched_wi_per_cu) : 4096U;
@@ -1127,7 +1127,7 @@ int lzo_compress_core(
         }
         if (local_size == 0) local_size = 1;
 
-        sched_wi_per_cu = lzo_env_u32("LZO_GPU_WI_PER_CU", 256U);
+        sched_wi_per_cu = lzo_env_u32("LZO_GPU_WI_PER_CU", 384U);
         if (sched_wi_per_cu < 32U) sched_wi_per_cu = 32U;
         if (sched_wi_per_cu > 1024U) sched_wi_per_cu = 1024U;
         occ_cap = (cus > 0) ? ((size_t)cus * (size_t)sched_wi_per_cu) : 4096U;

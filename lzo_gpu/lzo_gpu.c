@@ -80,15 +80,48 @@ static cl_device_id dev;
 static void ocl_init(void)
 {
     uint64_t t1 = now_ns();
-    cl_platform_id pf;
-    cl_device_type dtype = CL_DEVICE_TYPE_GPU;
-    CHECK(clGetPlatformIDs(1, &pf, NULL));
-    CHECK(clGetDeviceIDs(pf, dtype, 1, &dev, NULL));
-    ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, NULL);
+    cl_int err;
+    cl_platform_id pf = NULL;
+    err = clGetPlatformIDs(1, &pf, NULL);
+    if (err != CL_SUCCESS || pf == NULL) {
+        fprintf(stderr, "OpenCL init failed: clGetPlatformIDs err=%d\n", err);
+        ctx = NULL;
+        q = NULL;
+        return;
+    }
+
+    err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_GPU, 1, &dev, NULL);
+    if (err != CL_SUCCESS) {
+        err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_DEFAULT, 1, &dev, NULL);
+    }
+    if (err != CL_SUCCESS) {
+        err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_ALL, 1, &dev, NULL);
+    }
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "OpenCL init failed: clGetDeviceIDs err=%d\n", err);
+        ctx = NULL;
+        q = NULL;
+        return;
+    }
+
+    ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, &err);
+    if (err != CL_SUCCESS || ctx == NULL) {
+        fprintf(stderr, "OpenCL init failed: clCreateContext err=%d\n", err);
+        ctx = NULL;
+        q = NULL;
+        return;
+    }
     cl_queue_properties props[] = {
         CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0
     };
-    q = clCreateCommandQueueWithProperties(ctx, dev, props, NULL);
+    q = clCreateCommandQueueWithProperties(ctx, dev, props, &err);
+    if (err != CL_SUCCESS || q == NULL) {
+        fprintf(stderr, "OpenCL init failed: clCreateCommandQueueWithProperties err=%d\n", err);
+        if (ctx) clReleaseContext(ctx);
+        ctx = NULL;
+        q = NULL;
+        return;
+    }
     uint64_t t2 = now_ns();
     g_ocl_init_us = (unsigned long)((t2 - t1) / 1000);
 }
@@ -181,6 +214,10 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
     if (comp_level < 0) comp_level = LZO_DEFAULT_COMP_LEVEL;
 
     ocl_init();
+    if (!ctx || !q) {
+        fprintf(stderr, "error: failed to initialize OpenCL runtime\n");
+        return 1;
+    }
 
     /* load compression kernel */
     cl_program prog_c = NULL;
@@ -255,6 +292,10 @@ static int do_decompress_mode(const char* lz_path, const char* output_path, int 
     char decomp_base[64]; snprintf(decomp_base, sizeof(decomp_base), "%s_decomp", alg_name);
 
     ocl_init();
+    if (!ctx || !q) {
+        fprintf(stderr, "error: failed to initialize OpenCL runtime\n");
+        return 1;
+    }
     cl_program prog_d = NULL;
     cl_int err;
     char build_log[8192] = {0};
