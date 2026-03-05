@@ -6,7 +6,7 @@ LDFLAGS ?= -lOpenCL -lm
 ## attempt to precompile kernels that aren't actually in the tree.
 CL_SOURCES := $(wildcard *.cl)
 
-all: build_kernel lzo_gpu
+all: build_kernel lzo_gpu precompile-combos
 
 build_kernel: build_kernel.c lzo_gpu_utils.c
 	$(CC) $(CFLAGS) -o build_kernel build_kernel.c lzo_gpu_utils.c $(LDFLAGS) -lpthread
@@ -34,11 +34,6 @@ precompile-combos: build_kernel
 			echo "Building $${alg}_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits})..."; \
 			./build_kernel $${alg}.cl $${alg}_$${bits}.clbin "-I. -D D_BITS=$${bits}" || exit 1; \
 		done; \
-	done
-	@echo "Building decompression kernels"
-	@for alg in lzo1x lzo1y; do \
-		echo "Building $${alg}_decomp.clbin..."; \
-		./build_kernel $${alg}_decomp.cl $${alg}_decomp.clbin "-I." || exit 1; \
 	done
 
 precompile-all: precompile-combos
@@ -100,4 +95,4 @@ clean-clbin:
 # remove everything including precompiled kernels
 distclean: clean clean-clbin
 
-.PHONY: all build_kernel lzo_gpu precompile precompile-all clean clean-clbin distclean
+.PHONY: all build_kernel lzo_gpu precompile precompile-combos precompile-all clean clean-clbin distclean

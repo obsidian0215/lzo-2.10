@@ -55,6 +55,92 @@ static double lzo_env_f64(const char* name, double defv) {
     return d;
 }
 
+enum {
+    LZO_DBG_COMP_SEARCH_ITERS = 0,
+    LZO_DBG_COMP_MATCH_FOUND,
+    LZO_DBG_COMP_LITERAL_BYTES,
+    LZO_DBG_COMP_MATCH_BYTES,
+    LZO_DBG_COMP_INPUT_BYTES,
+    LZO_DBG_COMP_OUTPUT_BYTES,
+    LZO_DBG_COMP_N
+};
+
+enum {
+    LZO_DBG_DEC_TOKENS = 0,
+    LZO_DBG_DEC_LITERAL_BYTES,
+    LZO_DBG_DEC_MATCH_BYTES,
+    LZO_DBG_DEC_SMALL_OFFSETS,
+    LZO_DBG_DEC_OUTPUT_ERROR,
+    LZO_DBG_DEC_N
+};
+
+static int lzo_debug_counters_enabled(void) {
+    const char* env = getenv("LZO_GPU_DEBUG_COUNTERS");
+    if (!env || !*env) return 0;
+    return strcmp(env, "0") != 0;
+}
+
+static void lzo_print_comp_debug_stats(const uint32_t* stats, size_t num_blocks, const char* tag) {
+    unsigned long long search_iters = 0;
+    unsigned long long match_found = 0;
+    unsigned long long literal_bytes = 0;
+    unsigned long long match_bytes = 0;
+    unsigned long long input_bytes = 0;
+    unsigned long long output_bytes = 0;
+
+    if (!stats || num_blocks == 0) return;
+
+    for (size_t i = 0; i < num_blocks; ++i) {
+        const size_t base = i * LZO_DBG_COMP_N;
+        search_iters += stats[base + LZO_DBG_COMP_SEARCH_ITERS];
+        match_found += stats[base + LZO_DBG_COMP_MATCH_FOUND];
+        literal_bytes += stats[base + LZO_DBG_COMP_LITERAL_BYTES];
+        match_bytes += stats[base + LZO_DBG_COMP_MATCH_BYTES];
+        input_bytes += stats[base + LZO_DBG_COMP_INPUT_BYTES];
+        output_bytes += stats[base + LZO_DBG_COMP_OUTPUT_BYTES];
+    }
+
+    fprintf(stderr,
+            "%s blocks=%zu search_iters=%llu match_found=%llu literal_bytes=%llu match_bytes=%llu input_bytes=%llu output_bytes=%llu\n",
+            (tag ? tag : "[LZO-DBG][COMP]"),
+            num_blocks,
+            search_iters,
+            match_found,
+            literal_bytes,
+            match_bytes,
+            input_bytes,
+            output_bytes);
+}
+
+static void lzo_print_dec_debug_stats(const uint32_t* stats, size_t num_blocks, const char* tag) {
+    unsigned long long tokens = 0;
+    unsigned long long literal_bytes = 0;
+    unsigned long long match_bytes = 0;
+    unsigned long long small_offsets = 0;
+    unsigned long long output_errors = 0;
+
+    if (!stats || num_blocks == 0) return;
+
+    for (size_t i = 0; i < num_blocks; ++i) {
+        const size_t base = i * LZO_DBG_DEC_N;
+        tokens += stats[base + LZO_DBG_DEC_TOKENS];
+        literal_bytes += stats[base + LZO_DBG_DEC_LITERAL_BYTES];
+        match_bytes += stats[base + LZO_DBG_DEC_MATCH_BYTES];
+        small_offsets += stats[base + LZO_DBG_DEC_SMALL_OFFSETS];
+        output_errors += stats[base + LZO_DBG_DEC_OUTPUT_ERROR];
+    }
+
+    fprintf(stderr,
+            "%s blocks=%zu tokens=%llu literal_bytes=%llu match_bytes=%llu small_offsets=%llu output_errors=%llu\n",
+            (tag ? tag : "[LZO-DBG][DECOMP]"),
+            num_blocks,
+            tokens,
+            literal_bytes,
+            match_bytes,
+            small_offsets,
+            output_errors);
+}
+
 static double lzo_estimate_file_entropy_prefix(const char* path, size_t sample_bytes) {
     int fd = -1;
     unsigned char* buf = NULL;
@@ -584,12 +670,12 @@ static int lzo_compress_core_pipeline(
     {
         cl_uint cus = 0;
         cl_ulong global_mem = 0;
-        size_t preferred_wg = 0;
-        size_t max_wg = 0;
+        cl_ulong max_alloc = 0;
         size_t dict_per_block = (1ULL << params->level) * sizeof(uint64_t);
         size_t occ_cap = 0;
         size_t mem_cap = 0;
         size_t safe_mem = 0;
+        size_t safe_alloc = 0;
 
         if (params->local_size_param > 0) {
             local_size = (size_t)params->local_size_param;
@@ -600,16 +686,7 @@ static int lzo_compress_core_pipeline(
 
         (void)clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cus), &cus, NULL);
         (void)clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem), &global_mem, NULL);
-        (void)clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, sizeof(preferred_wg), &preferred_wg, NULL);
-        (void)clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(max_wg), &max_wg, NULL);
-
-        if (params->local_size_param <= 0) {
-            size_t auto_lws = (preferred_wg > 0) ? preferred_wg : 1;
-            if (max_wg > 0 && auto_lws > max_wg) auto_lws = max_wg;
-            if (auto_lws > 8) auto_lws = 8;
-            if (target_items < auto_lws * 2) auto_lws = 1;
-            local_size = auto_lws;
-        }
+        (void)clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, NULL);
 
         {
             unsigned sched_wi_per_cu = lzo_env_u32("LZO_GPU_WI_PER_CU", 384U);
@@ -619,9 +696,20 @@ static int lzo_compress_core_pipeline(
             if (occ_cap < 1024U) occ_cap = 1024U;
         }
 
-        if (global_mem > 0 && dict_per_block > 0) {
-            safe_mem = (size_t)(global_mem / 6ULL);
-            mem_cap = safe_mem / dict_per_block;
+        if (dict_per_block > 0) {
+            size_t cap_by_global = SIZE_MAX;
+            size_t cap_by_alloc = SIZE_MAX;
+
+            if (global_mem > 0) {
+                safe_mem = (size_t)(global_mem / 6ULL);
+                cap_by_global = safe_mem / dict_per_block;
+            }
+            if (max_alloc > 0) {
+                /* Reserve headroom to avoid hitting driver hard limits exactly. */
+                safe_alloc = (size_t)(max_alloc * 9ULL / 10ULL);
+                cap_by_alloc = safe_alloc / dict_per_block;
+            }
+            mem_cap = (cap_by_global < cap_by_alloc) ? cap_by_global : cap_by_alloc;
         }
         if (mem_cap == 0) mem_cap = 1;
 
@@ -858,14 +946,6 @@ static int lzo_compress_core_pipeline(
             t_out->local_size = (unsigned long)local_size;
         }
 
-        if (g_verbose) {
-            response_t r;
-            memset(&r, 0, sizeof(r));
-            if (t_out) r.timing = *t_out;
-            r.time_us = total_us;
-            r.status = 0;
-            lzo_print_response_stats(&r, input_path, 'C', params->alg_id);
-        }
     }
 
     ret = 0;
@@ -902,6 +982,7 @@ int lzo_compress_core(
     cl_int err;
     uint64_t t_total_start = core_now_ns();
     int debug_sched = lzo_env_flag_enabled("LZO_GPU_DEBUG_SCHED");
+    int debug_counters = lzo_debug_counters_enabled();
 
     int use_standard_copy = params->standard_copy ? 1 : 0;
 
@@ -935,7 +1016,11 @@ int lzo_compress_core(
         if (entropy_max < 0.0) entropy_max = 0.0;
         if (entropy_max > 8.0) entropy_max = 8.0;
 
-        allow_pipeline = (pipeline_enabled && in_sz >= pipeline_threshold && nblk_probe >= 2);
+        allow_pipeline = (pipeline_enabled && in_sz >= pipeline_threshold && nblk_probe >= 2 && !debug_counters);
+
+        if (debug_counters && debug_sched) {
+            fprintf(stderr, "[LZO-PIPE-GATE] disabled because LZO_GPU_DEBUG_COUNTERS=1\n");
+        }
 
         if (allow_pipeline && entropy_gate_enabled) {
             double entropy = lzo_estimate_file_entropy_prefix(input_path, entropy_sample_kb * 1024ULL);
@@ -1085,6 +1170,18 @@ int lzo_compress_core(
         return -1;
     }
 
+    cl_uint kernel_num_args = 0;
+    int kernel_has_dbg = 0;
+    cl_mem dbg_comp_buf = NULL;
+    int dbg_comp_enabled = 0;
+    if (clGetKernelInfo(kernel, CL_KERNEL_NUM_ARGS, sizeof(kernel_num_args), &kernel_num_args, NULL) == CL_SUCCESS) {
+        kernel_has_dbg = (kernel_num_args >= 11U);
+    }
+    dbg_comp_enabled = (debug_counters && kernel_has_dbg);
+    if (debug_counters && !kernel_has_dbg) {
+        fprintf(stderr, "[LZO-DBG][COMP] warning: kernel has no debug args, counters disabled\n");
+    }
+
     cl_uint in_sz_cl = (cl_uint)in_sz, blk_cl = (cl_uint)blk, worst_blk_cl = (cl_uint)worst_blk;
     CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_in));
     CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_out));
@@ -1106,25 +1203,16 @@ int lzo_compress_core(
     {
         cl_uint cus = 0;
         cl_ulong global_mem = 0;
+        cl_ulong max_alloc = 0;
         size_t dict_per_block = (1ULL << params->level) * sizeof(uint64_t);
-        size_t preferred_wg = 0;
-        size_t max_wg = 0;
         size_t occ_cap = 0;
         size_t mem_cap = 0;
         size_t safe_mem = 0;
+        size_t safe_alloc = 0;
 
         (void)clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cus), &cus, NULL);
         (void)clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem), &global_mem, NULL);
-        (void)clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, sizeof(preferred_wg), &preferred_wg, NULL);
-        (void)clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(max_wg), &max_wg, NULL);
-
-        if (params->local_size_param <= 0) {
-            size_t auto_lws = (preferred_wg > 0) ? preferred_wg : 1;
-            if (max_wg > 0 && auto_lws > max_wg) auto_lws = max_wg;
-            if (auto_lws > 8) auto_lws = 8;
-            if (target_items < auto_lws * 2) auto_lws = 1;
-            local_size = auto_lws;
-        }
+        (void)clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, NULL);
         if (local_size == 0) local_size = 1;
 
         sched_wi_per_cu = lzo_env_u32("LZO_GPU_WI_PER_CU", 384U);
@@ -1133,10 +1221,21 @@ int lzo_compress_core(
         occ_cap = (cus > 0) ? ((size_t)cus * (size_t)sched_wi_per_cu) : 4096U;
         if (occ_cap < 1024U) occ_cap = 1024U;
 
-        if (global_mem > 0 && dict_per_block > 0) {
-            /* Reserve ~1/6 global memory for dict pool to avoid OOM. */
-            safe_mem = (size_t)(global_mem / 6ULL);
-            mem_cap = safe_mem / dict_per_block;
+        if (dict_per_block > 0) {
+            size_t cap_by_global = SIZE_MAX;
+            size_t cap_by_alloc = SIZE_MAX;
+
+            if (global_mem > 0) {
+                /* Reserve ~1/6 global memory for dict pool to avoid OOM. */
+                safe_mem = (size_t)(global_mem / 6ULL);
+                cap_by_global = safe_mem / dict_per_block;
+            }
+            if (max_alloc > 0) {
+                /* Reserve headroom to avoid hitting driver hard limits exactly. */
+                safe_alloc = (size_t)(max_alloc * 9ULL / 10ULL);
+                cap_by_alloc = safe_alloc / dict_per_block;
+            }
+            mem_cap = (cap_by_global < cap_by_alloc) ? cap_by_global : cap_by_alloc;
         }
         if (mem_cap == 0) mem_cap = 1;
 
@@ -1191,7 +1290,22 @@ int lzo_compress_core(
         CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uint), &pool_size));
         CHECK(clSetKernelArg(kernel, 8, sizeof(cl_uint), &epoch_base));
 
-        /* Debug instrumentation removed in production build: no debug buffer is created */
+        if (dbg_comp_enabled) {
+            size_t dbg_comp_bytes = nblk * LZO_DBG_COMP_N * sizeof(uint32_t);
+            dbg_comp_buf = clCreateBuffer(ctx, CL_MEM_READ_WRITE, dbg_comp_bytes, NULL, &err);
+            if (err != CL_SUCCESS || !dbg_comp_buf || lzo_zero_buffer(queue, dbg_comp_buf, dbg_comp_bytes) != 0) {
+                if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
+                dbg_comp_buf = NULL;
+                dbg_comp_enabled = 0;
+                fprintf(stderr, "[LZO-DBG][COMP] warning: failed to enable debug counters\n");
+            }
+        }
+        if (kernel_has_dbg) {
+            cl_mem dbg_arg = dbg_comp_enabled ? dbg_comp_buf : d_len;
+            cl_uint dbg_flag = dbg_comp_enabled ? 1U : 0U;
+            CHECK(clSetKernelArg(kernel, 9, sizeof(cl_mem), &dbg_arg));
+            CHECK(clSetKernelArg(kernel, 10, sizeof(cl_uint), &dbg_flag));
+        }
     }
 
     uint64_t t_exec_start = core_now_ns();
@@ -1225,17 +1339,25 @@ int lzo_compress_core(
     CHECK(clEnqueueUnmapMemObject(queue, d_len, mapped_len, 0, NULL, NULL));
 
     size_t comp_total = 0;
-    cl_uint* off_arr = malloc(nblk * sizeof(cl_uint));
     for (size_t i = 0; i < nblk; i++) {
-        off_arr[i] = (cl_uint)comp_total;
         comp_total += len_arr[i];
+    }
+
+    if (dbg_comp_enabled && dbg_comp_buf) {
+        size_t dbg_comp_bytes = nblk * LZO_DBG_COMP_N * sizeof(uint32_t);
+        uint32_t* dbg_comp_stats = (uint32_t*)malloc(dbg_comp_bytes);
+        if (dbg_comp_stats) {
+            if (clEnqueueReadBuffer(queue, dbg_comp_buf, CL_TRUE, 0, dbg_comp_bytes, dbg_comp_stats, 0, NULL, NULL) == CL_SUCCESS) {
+                lzo_print_comp_debug_stats(dbg_comp_stats, nblk, "[LZO-DBG][COMP]");
+            }
+            free(dbg_comp_stats);
+        }
     }
 
     unsigned long download_us = 0;
     void* host_comp = NULL;
 
     /* Map the whole output buffer */
-    if (off_arr) free(off_arr);
     uint64_t t_down_start = core_now_ns();
     void* mapped_out = clEnqueueMapBuffer(queue, d_out, CL_TRUE, CL_MAP_READ, 0, out_needed, 0, NULL, NULL, &err); CHECK(err);
     host_comp = mapped_out;
@@ -1260,6 +1382,7 @@ int lzo_compress_core(
     if (write_ret != 0) {
         fprintf(stderr, "[CORE] Failed to write compressed file\n");
         CHECK(clEnqueueUnmapMemObject(queue, d_out, host_comp, 0, NULL, NULL));
+        if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
         free(len_arr);
         return -1;
     }
@@ -1267,6 +1390,7 @@ int lzo_compress_core(
     CHECK(clEnqueueUnmapMemObject(queue, d_out, host_comp, 0, NULL, NULL));
 
     free(len_arr);
+    if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
     clFlush(queue);
     clFinish(queue);
 
@@ -1294,13 +1418,9 @@ int lzo_compress_core(
     }
 
     if (g_verbose) {
-        response_t r;
-        memset(&r, 0, sizeof(r));
-        if (t_out) r.timing = *t_out;
-        r.time_us = total_us;
-        r.status = 0;
-        lzo_print_response_stats(&r, input_path, 'C', params->alg_id);
-    } else {
+        /* verbose output is handled by lzo_gpu.c wrapper to ensure
+         * standalone total includes OpenCL init/kernel load.
+         */
     }
 
     return write_ret;
@@ -1327,9 +1447,9 @@ int lzo_decompress_core(
     /* Resource tracking for cleanup */
     FILE* f_in = NULL;
     uint32_t* len_arr = NULL;
-    uint32_t* off_arr = NULL;
     void* comp_host = NULL;
     void* mapped_out = NULL;
+    cl_mem dbg_dec_buf = NULL;
     FILE* fout = NULL;
     int ret = -1; /* Default failure */
 
@@ -1370,17 +1490,9 @@ int lzo_decompress_core(
 
     long current_pos = ftell(f_in); fseek(f_in, 0, SEEK_END); long file_sz = ftell(f_in); fseek(f_in, current_pos, SEEK_SET);
     size_t comp_sz = file_sz - current_pos;
-
     if (g_verbose) {
         fprintf(stderr, "[DECOMP] file summary: orig=%u blk=%u nblk=%u comp=%zu\n", orig_sz, blk_sz, nblk, comp_sz);
     }
-
-    off_arr = malloc((nblk + 1) * sizeof(uint32_t));
-    off_arr[0] = 0;
-    for (uint32_t i = 0; i < nblk; ++i)
-        off_arr[i+1] = off_arr[i] + len_arr[i];
-    free(len_arr);
-    len_arr = NULL; /* Mark as freed */
 
     int use_standard_copy_decomp = standard_copy ? 1 : 0;
 
@@ -1393,6 +1505,30 @@ int lzo_decompress_core(
 
     /* Buffer Alloc (off) timing removed per request; keep allocation but don't time it */
     cl_mem d_off = core_get_or_create_buffer(ctx, &ws->d_off, &ws->off_size, (nblk + 1) * sizeof(cl_uint), CL_MEM_READ_ONLY, &err); CHECK(err);
+
+    /* Build offsets directly into device-backed buffer to avoid host off_arr allocation/upload. */
+    {
+        void* mapped_off = clEnqueueMapBuffer(queue, d_off, CL_TRUE, CL_MAP_WRITE,
+                                              0, (nblk + 1) * sizeof(cl_uint),
+                                              0, NULL, NULL, &err);
+        if (err != CL_SUCCESS || !mapped_off) {
+            fprintf(stderr, "[DECOMP] clEnqueueMapBuffer d_off failed: %d\n", err);
+            goto cleanup;
+        }
+        {
+            cl_uint* off_dev = (cl_uint*)mapped_off;
+            off_dev[0] = 0;
+            for (uint32_t i = 0; i < nblk; ++i)
+                off_dev[i + 1] = off_dev[i] + len_arr[i];
+        }
+        err = clEnqueueUnmapMemObject(queue, d_off, mapped_off, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "[DECOMP] clEnqueueUnmapMemObject d_off failed: %d\n", err);
+            goto cleanup;
+        }
+    }
+    free(len_arr);
+    len_arr = NULL;
 
     uint64_t t_buf_out_start = core_now_ns();
     cl_mem d_out = core_get_or_create_buffer(ctx, &ws->d_decomp_out, &ws->decomp_out_size, orig_sz, CL_MEM_WRITE_ONLY, &err); CHECK(err);
@@ -1441,20 +1577,9 @@ int lzo_decompress_core(
             goto cleanup;
         }
 
-        /* Upload offset array with async write */
-        cl_event evt_write_off;
-        err = clEnqueueWriteBuffer(queue, d_off, CL_FALSE, 0, (nblk + 1) * sizeof(cl_uint), off_arr, 0, NULL, &evt_write_off);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr, "[DECOMP] clEnqueueWriteBuffer d_off failed: %d\n", err);
-            clReleaseEvent(evt_write_comp);
-            goto cleanup;
-        }
-
-        /* Wait for both uploads to complete */
-        cl_event upload_events[2] = {evt_write_comp, evt_write_off};
-        clWaitForEvents(2, upload_events);
+        /* Wait for compressed payload upload to complete */
+        clWaitForEvents(1, &evt_write_comp);
         clReleaseEvent(evt_write_comp);
-        clReleaseEvent(evt_write_off);
     } else {
         /* Zero-copy: data is already in pinned memory, just unmap */
         err = clEnqueueUnmapMemObject(queue, d_comp, comp_host, 0, NULL, NULL);
@@ -1463,19 +1588,6 @@ int lzo_decompress_core(
             goto cleanup;
         }
         comp_host = NULL; /* Unmapped, no longer valid */
-
-        /* For offset array, also use zero-copy: map, copy, unmap */
-        void* mapped_off = clEnqueueMapBuffer(queue, d_off, CL_TRUE, CL_MAP_WRITE, 0, (nblk + 1) * sizeof(cl_uint), 0, NULL, NULL, &err);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr, "[DECOMP] clEnqueueMapBuffer d_off failed: %d\n", err);
-            goto cleanup;
-        }
-        memcpy(mapped_off, off_arr, (nblk + 1) * sizeof(cl_uint));
-        err = clEnqueueUnmapMemObject(queue, d_off, mapped_off, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr, "[DECOMP] clEnqueueUnmapMemObject d_off failed: %d\n", err);
-            goto cleanup;
-        }
     }
 
 /* Free comp_host only if we allocated it (standard copy mode) */
@@ -1483,8 +1595,6 @@ int lzo_decompress_core(
         free(comp_host);
     }
     comp_host = NULL;
-    free(off_arr);
-    off_arr = NULL;
 
     uint64_t t_upload_end = core_now_ns();
 
@@ -1496,18 +1606,40 @@ int lzo_decompress_core(
     CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uint), &orig_sz));
     CHECK(clSetKernelArg(kernel, 6, sizeof(cl_uint), &nblk));
 
+    {
+        cl_uint kernel_num_args = 0;
+        int kernel_has_dbg = 0;
+        int dbg_dec_enabled = lzo_debug_counters_enabled();
+        if (clGetKernelInfo(kernel, CL_KERNEL_NUM_ARGS, sizeof(kernel_num_args), &kernel_num_args, NULL) == CL_SUCCESS) {
+            kernel_has_dbg = (kernel_num_args >= 9U);
+        }
+        if (dbg_dec_enabled && !kernel_has_dbg) {
+            fprintf(stderr, "[LZO-DBG][DECOMP] warning: kernel has no debug args, counters disabled\n");
+            dbg_dec_enabled = 0;
+        }
+        if (dbg_dec_enabled) {
+            size_t dbg_dec_bytes = (size_t)nblk * LZO_DBG_DEC_N * sizeof(uint32_t);
+            dbg_dec_buf = clCreateBuffer(ctx, CL_MEM_READ_WRITE, dbg_dec_bytes, NULL, &err);
+            if (err != CL_SUCCESS || !dbg_dec_buf || lzo_zero_buffer(queue, dbg_dec_buf, dbg_dec_bytes) != 0) {
+                if (dbg_dec_buf) clReleaseMemObject(dbg_dec_buf);
+                dbg_dec_buf = NULL;
+                dbg_dec_enabled = 0;
+                fprintf(stderr, "[LZO-DBG][DECOMP] warning: failed to enable debug counters\n");
+            }
+        }
+        if (kernel_has_dbg) {
+            cl_mem dbg_arg = dbg_dec_enabled ? dbg_dec_buf : d_out_lens;
+            cl_uint dbg_flag = dbg_dec_enabled ? 1U : 0U;
+            CHECK(clSetKernelArg(kernel, 7, sizeof(cl_mem), &dbg_arg));
+            CHECK(clSetKernelArg(kernel, 8, sizeof(cl_uint), &dbg_flag));
+        }
+    }
+
     size_t local_size = 1;
     if (local_size_param > 0) {
         local_size = (size_t)local_size_param;
     } else {
-        size_t preferred_wg = 0;
-        size_t max_wg = 0;
-        (void)clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, sizeof(preferred_wg), &preferred_wg, NULL);
-        (void)clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(max_wg), &max_wg, NULL);
-        local_size = (preferred_wg > 0) ? preferred_wg : 1;
-        if (max_wg > 0 && local_size > max_wg) local_size = max_wg;
-        if (local_size > 16) local_size = 16;
-        if ((size_t)nblk < local_size * 2) local_size = 1;
+        local_size = 1;
     }
     if (local_size == 0) local_size = 1;
     if (local_size > (size_t)nblk) local_size = 1;
@@ -1518,6 +1650,17 @@ int lzo_decompress_core(
     CHECK(err);
     clFinish(queue);
     uint64_t t_exec_end = core_now_ns();
+
+    if (dbg_dec_buf) {
+        size_t dbg_dec_bytes = (size_t)nblk * LZO_DBG_DEC_N * sizeof(uint32_t);
+        uint32_t* dbg_dec_stats = (uint32_t*)malloc(dbg_dec_bytes);
+        if (dbg_dec_stats) {
+            if (clEnqueueReadBuffer(queue, dbg_dec_buf, CL_TRUE, 0, dbg_dec_bytes, dbg_dec_stats, 0, NULL, NULL) == CL_SUCCESS) {
+                lzo_print_dec_debug_stats(dbg_dec_stats, (size_t)nblk, "[LZO-DBG][DECOMP]");
+            }
+            free(dbg_dec_stats);
+        }
+    }
 
     uint64_t t_download_start = core_now_ns();
     mapped_out = clEnqueueMapBuffer(queue, d_out, CL_TRUE, CL_MAP_READ, 0, orig_sz, 0, NULL, NULL, &err);
@@ -1562,9 +1705,6 @@ int lzo_decompress_core(
         }
     }
 
-    free(off_arr);
-    off_arr = NULL;
-
     uint64_t t_end = core_now_ns();
     *time_us_out = (t_end - t_start) / 1000;
     *output_size_out = orig_sz;
@@ -1589,13 +1729,9 @@ int lzo_decompress_core(
     }
 
     if (g_verbose) {
-        response_t r;
-        memset(&r, 0, sizeof(r));
-        if (t_out) r.timing = *t_out;
-        r.time_us = *time_us_out;
-        r.status = 0;
-        lzo_print_response_stats(&r, input_path, 'D', 0);
-    } else {
+        /* verbose output is handled by lzo_gpu.c wrapper to ensure
+         * standalone total includes OpenCL init/kernel load.
+         */
     }
 
     ret = 0; /* Success */
@@ -1604,7 +1740,6 @@ cleanup:
     /* Unified cleanup: close files, free resources, unmap buffers */
     if (f_in) fclose(f_in);
     if (len_arr) free(len_arr);
-    if (off_arr) free(off_arr);
     if (comp_host) {
         /* Only free if we allocated it ourselves (standard copy) */
         if (use_standard_copy_decomp) {
@@ -1615,6 +1750,7 @@ cleanup:
     }
     if (fout) fclose(fout);
     if (mapped_out) clEnqueueUnmapMemObject(queue, d_out, mapped_out, 0, NULL, NULL);
+    if (dbg_dec_buf) clReleaseMemObject(dbg_dec_buf);
 
     return ret;
 }

@@ -161,6 +161,25 @@ static void format_ms_or_us(char *buf, size_t buflen, double ms) {
     }
 }
 
+static int cmp_double_asc(const void *a, const void *b) {
+    double da = *(const double *)a;
+    double db = *(const double *)b;
+    if (da < db) return -1;
+    if (da > db) return 1;
+    return 0;
+}
+
+static double median_double(const double *vals, size_t n) {
+    if (!vals || n == 0) return 0.0;
+    double *tmp = (double *)malloc(n * sizeof(double));
+    if (!tmp) return 0.0;
+    memcpy(tmp, vals, n * sizeof(double));
+    qsort(tmp, n, sizeof(double), cmp_double_asc);
+    double out = (n % 2 == 0) ? (tmp[n / 2 - 1] + tmp[n / 2]) / 2.0 : tmp[n / 2];
+    free(tmp);
+    return out;
+}
+
 static size_t g_cli_fixed_block_bytes = 0;
 
 static size_t choose_block_size(size_t total_bytes, int threads) {
@@ -584,104 +603,352 @@ static void run_benchmark(const unsigned char *data, size_t size,
     fprintf(stderr, "\n== Benchmark ==\n");
 
     struct timespec t0, t1;
-    unsigned char *single_comp = NULL;
-    size_t single_comp_len = 0;
 #ifdef CLOCK_MONOTONIC_RAW
     const clockid_t clk = CLOCK_MONOTONIC_RAW;
 #else
     const clockid_t clk = CLOCK_MONOTONIC;
 #endif
-    clock_gettime(clk, &t0);
+
     alg_t use_alg = g_alg;
-    variant_t use_var = g_variant;
-
-    size_t cap = size + size / 16u + 64u + 3u;
-    single_comp = (unsigned char *)malloc(cap);
-    if (!single_comp) {
-        fprintf(stderr, "malloc failed\n");
-        return;
-    }
-    int rc = compress_block_into(data, size, single_comp, cap, &single_comp_len, use_alg, use_var, NULL);
-    clock_gettime(clk, &t1);
-    if (rc != LZO_E_OK) {
-        fprintf(stderr, "single-block compress failed: %d\n", rc);
-        return;
-    }
-    double single_comp_ms = diff_ms_ts(&t0, &t1);
-
-    unsigned char *single_out = (unsigned char *)malloc(size ? size : 1u);
-    if (!single_out) {
-        fprintf(stderr, "malloc failed\n");
-        free(single_comp);
-        return;
-    }
-    clock_gettime(clk, &t0);
-    rc = decompress_block(single_comp, single_comp_len, single_out, size, use_alg);
-    clock_gettime(clk, &t1);
-    double single_decomp_ms = diff_ms_ts(&t0, &t1);
-    {
-        char s[32];
-        format_ms_or_us(s, sizeof(s), single_comp_ms);
-        fprintf(stderr, "Single  Compress : %s (%.2f MB/s)\n",
-                s, (single_comp_ms > 0.0) ? (size / 1048576.0) / (single_comp_ms / 1000.0) : 0.0);
-    }
-    {
-        char s[32];
-        format_ms_or_us(s, sizeof(s), single_decomp_ms);
-        fprintf(stderr, "Single  Decompress: %s (%.2f MB/s) verify=%s\n",
-                s,
-                (single_decomp_ms > 0.0) ? (size / 1048576.0) / (single_decomp_ms / 1000.0) : 0.0,
-                (rc == LZO_E_OK && memcmp(single_out, data, size) == 0) ? "OK" : "FAIL");
-    }
-
-    free(single_out);
 
     size_t block_size = choose_block_size(size, threads);
     chunk_t *chunks = NULL;
     size_t chunk_count = 0;
     double multi_comp_ms = 0.0;
     size_t total_comp = 0;
-    rc = compress_multi(data, size, block_size, threads, level,
-                        &chunks, &chunk_count, &multi_comp_ms, &total_comp);
+    double comp_total_ms = 0.0;
+    double comp_io_ms = 0.0;
+    double multi_decomp_ms = 0.0;
+    double decomp_total_ms = 0.0;
+    int verify_ok = 0;
+    unsigned char *container = NULL;
+    unsigned char *container_read = NULL;
+    chunk_t *dchunks = NULL;
+    unsigned char *multi_out = NULL;
+    FILE *comp_tmp = NULL;
+    FILE *out_tmp = NULL;
+
+    clock_gettime(clk, &t0);
+    int rc = compress_multi(data, size, block_size, threads, level,
+                            &chunks, &chunk_count, &multi_comp_ms, &total_comp);
+    clock_gettime(clk, &t1);
+    comp_total_ms = diff_ms_ts(&t0, &t1);
+
     if (rc != LZO_E_OK) {
         fprintf(stderr, "multi compress failed: %d\n", rc);
-        free(single_comp);
         return;
     }
 
     {
-        char s[32];
-        format_ms_or_us(s, sizeof(s), multi_comp_ms);
-        fprintf(stderr, "Multi   Compress : %s (%zu blocks, %.2f MB/s)\n",
-                s,
-                chunk_count,
-                (multi_comp_ms > 0.0) ? (size / 1048576.0) / (multi_comp_ms / 1000.0) : 0.0);
+        size_t header_size = 2u + 4u + 4u + 4u + 4u + chunk_count * 4u;
+        size_t container_size = header_size + total_comp;
+        size_t cursor = 0;
+
+        container = (unsigned char *)malloc(container_size ? container_size : 1u);
+        if (!container) {
+            fprintf(stderr, "malloc failed\n");
+            free_compression_chunks(chunks, chunk_count);
+            return;
+        }
+
+        write_u16(container + cursor, MAGIC_TAG); cursor += 2u;
+        write_u32(container + cursor, (uint32_t)size); cursor += 4u;
+        write_u32(container + cursor, (uint32_t)block_size); cursor += 4u;
+        write_u32(container + cursor, (uint32_t)chunk_count); cursor += 4u;
+        write_u32(container + cursor, (uint32_t)use_alg); cursor += 4u;
+        for (size_t i = 0; i < chunk_count; ++i) {
+            write_u32(container + cursor, (uint32_t)chunks[i].comp_size);
+            cursor += 4u;
+        }
+        for (size_t i = 0; i < chunk_count; ++i) {
+            memcpy(container + cursor, chunks[i].comp, chunks[i].comp_size);
+            cursor += chunks[i].comp_size;
+        }
+
+        comp_tmp = tmpfile();
+        if (!comp_tmp) {
+            fprintf(stderr, "tmpfile failed\n");
+            free(container);
+            free_compression_chunks(chunks, chunk_count);
+            return;
+        }
+
+        clock_gettime(clk, &t0);
+        if (fwrite(container, 1u, container_size, comp_tmp) != container_size) {
+            fprintf(stderr, "benchmark tmp write failed\n");
+            fclose(comp_tmp);
+            free(container);
+            free_compression_chunks(chunks, chunk_count);
+            return;
+        }
+        fflush(comp_tmp);
+        rewind(comp_tmp);
+        clock_gettime(clk, &t1);
+        comp_io_ms = diff_ms_ts(&t0, &t1);
+        comp_total_ms += comp_io_ms;
+
+        container_read = (unsigned char *)malloc(container_size ? container_size : 1u);
+        if (!container_read) {
+            fprintf(stderr, "malloc failed\n");
+            fclose(comp_tmp);
+            free(container);
+            free_compression_chunks(chunks, chunk_count);
+            return;
+        }
+
+        clock_gettime(clk, &t0);
+        if (fread(container_read, 1u, container_size, comp_tmp) != container_size) {
+            fprintf(stderr, "benchmark tmp read failed\n");
+            clock_gettime(clk, &t1);
+            decomp_total_ms = diff_ms_ts(&t0, &t1);
+        } else {
+            uint16_t magic = 0;
+            uint32_t orig_sz = 0, blk_sz = 0, nblk = 0, alg_val = 0;
+            size_t rcur = 0;
+            int parse_ok = 1;
+
+            magic = read_u16(container_read + rcur); rcur += 2u;
+            orig_sz = read_u32(container_read + rcur); rcur += 4u;
+            blk_sz = read_u32(container_read + rcur); rcur += 4u;
+            nblk = read_u32(container_read + rcur); rcur += 4u;
+            alg_val = read_u32(container_read + rcur); rcur += 4u;
+
+            if (magic != MAGIC_TAG || orig_sz != (uint32_t)size || alg_val != (uint32_t)use_alg) {
+                parse_ok = 0;
+            }
+
+            if (parse_ok) {
+                size_t lens_bytes = (size_t)nblk * 4u;
+                if (rcur + lens_bytes > container_size) parse_ok = 0;
+
+                if (parse_ok) {
+                    const unsigned char *lens_ptr = container_read + rcur;
+                    const unsigned char *payload = lens_ptr + lens_bytes;
+                    const unsigned char *payload_end = container_read + container_size;
+                    size_t out_off = 0;
+
+                    dchunks = (chunk_t *)calloc((size_t)nblk ? (size_t)nblk : 1u, sizeof(chunk_t));
+                    multi_out = (unsigned char *)malloc(size ? size : 1u);
+                    if (!dchunks || !multi_out) {
+                        parse_ok = 0;
+                    } else {
+                        const unsigned char *p = payload;
+                        for (uint32_t i = 0; i < nblk; ++i) {
+                            uint32_t clen = read_u32(lens_ptr + i * 4u);
+                            size_t orig_chunk = (i == nblk - 1u) ? ((size_t)orig_sz - out_off) : (size_t)blk_sz;
+                            if (p + clen > payload_end) {
+                                parse_ok = 0;
+                                break;
+                            }
+                            dchunks[i].comp = (unsigned char *)p;
+                            dchunks[i].comp_size = (size_t)clen;
+                            dchunks[i].in_size = orig_chunk;
+                            dchunks[i].offset = out_off;
+                            dchunks[i].out = multi_out + out_off;
+                            out_off += orig_chunk;
+                            p += clen;
+                        }
+
+                        if (parse_ok) {
+                            rc = decompress_multi(dchunks, (size_t)nblk, threads, use_alg, &multi_decomp_ms);
+                            verify_ok = (rc == LZO_E_OK && memcmp(multi_out, data, size) == 0);
+
+                            out_tmp = tmpfile();
+                            if (out_tmp) {
+                                if (fwrite(multi_out, 1u, size, out_tmp) != size) {
+                                    verify_ok = 0;
+                                }
+                                fflush(out_tmp);
+                            } else {
+                                verify_ok = 0;
+                            }
+                        }
+                    }
+                }
+            }
+
+            clock_gettime(clk, &t1);
+            decomp_total_ms = diff_ms_ts(&t0, &t1);
+            if (!parse_ok) {
+                fprintf(stderr, "benchmark parse/decompress setup failed\n");
+            }
+        }
     }
 
-    unsigned char *multi_out = (unsigned char *)malloc(size ? size : 1u);
-    if (!multi_out) {
-        fprintf(stderr, "malloc failed\n");
-        free(single_comp);
-        free_compression_chunks(chunks, chunk_count);
-        return;
-    }
-    for (size_t i = 0; i < chunk_count; ++i)
-        chunks[i].out = multi_out + chunks[i].offset;
-
-    double multi_decomp_ms = 0.0;
-    rc = decompress_multi(chunks, chunk_count, threads, use_alg, &multi_decomp_ms);
     {
-        char s[32];
-        format_ms_or_us(s, sizeof(s), multi_decomp_ms);
-        fprintf(stderr, "Multi   Decompress: %s (%.2f MB/s) verify=%s\n",
-                s,
-                (multi_decomp_ms > 0.0) ? (size / 1048576.0) / (multi_decomp_ms / 1000.0) : 0.0,
-                (rc == LZO_E_OK && memcmp(multi_out, data, size) == 0) ? "OK" : "FAIL");
+        char comp_k_s[32], comp_t_s[32], dec_k_s[32], dec_t_s[32];
+        double comp_kernel_tp = (multi_comp_ms > 0.0) ? (size / 1048576.0) / (multi_comp_ms / 1000.0) : 0.0;
+        double comp_total_tp  = (comp_total_ms > 0.0) ? (size / 1048576.0) / (comp_total_ms / 1000.0) : 0.0;
+        double dec_kernel_tp  = (multi_decomp_ms > 0.0) ? (size / 1048576.0) / (multi_decomp_ms / 1000.0) : 0.0;
+        double dec_total_tp   = (decomp_total_ms > 0.0) ? (size / 1048576.0) / (decomp_total_ms / 1000.0) : 0.0;
+
+        format_ms_or_us(comp_k_s, sizeof(comp_k_s), multi_comp_ms);
+        format_ms_or_us(comp_t_s, sizeof(comp_t_s), comp_total_ms);
+        format_ms_or_us(dec_k_s, sizeof(dec_k_s), multi_decomp_ms);
+        format_ms_or_us(dec_t_s, sizeof(dec_t_s), decomp_total_ms);
+
+        fprintf(stderr,
+                "Compress   : kernel=%s total=%s kernel_tp=%.2f MB/s total_tp=%.2f MB/s blocks=%zu\n",
+                comp_k_s, comp_t_s, comp_kernel_tp, comp_total_tp, chunk_count);
+        fprintf(stderr,
+                "Decompress : kernel=%s total=%s kernel_tp=%.2f MB/s total_tp=%.2f MB/s verify=%s\n",
+                dec_k_s, dec_t_s, dec_kernel_tp, dec_total_tp, verify_ok ? "OK" : "FAIL");
     }
 
+    if (out_tmp) fclose(out_tmp);
+    if (comp_tmp) fclose(comp_tmp);
     free(multi_out);
-    free(single_comp);
+    free(dchunks);
+    free(container_read);
+    free(container);
     free_compression_chunks(chunks, chunk_count);
+}
+
+static int run_stable_kernel_bench(const unsigned char *data, size_t size,
+                                   int level, int threads, double bench_seconds) {
+    if (!data || size == 0) {
+        fprintf(stderr, "Bench error: empty input\n");
+        return 1;
+    }
+    if (bench_seconds <= 0.0) bench_seconds = 3.0;
+
+#ifdef CLOCK_MONOTONIC_RAW
+    const clockid_t clk = CLOCK_MONOTONIC_RAW;
+#else
+    const clockid_t clk = CLOCK_MONOTONIC;
+#endif
+
+    size_t cap = 16;
+    size_t n = 0;
+    double *comp_tp = (double *)malloc(cap * sizeof(double));
+    double *dec_tp = (double *)malloc(cap * sizeof(double));
+    double *ratio_pct = (double *)malloc(cap * sizeof(double));
+    if (!comp_tp || !dec_tp || !ratio_pct) {
+        free(comp_tp);
+        free(dec_tp);
+        free(ratio_pct);
+        fprintf(stderr, "Bench error: malloc failed\n");
+        return 1;
+    }
+
+    int verify_ok = 1;
+    struct timespec ts_start, ts_now;
+    clock_gettime(clk, &ts_start);
+
+    while (1) {
+        size_t block_size = choose_block_size(size, threads);
+        chunk_t *chunks = NULL;
+        size_t chunk_count = 0;
+        double comp_ms = 0.0;
+        size_t total_comp = 0;
+
+        int rc = compress_multi(data, size, block_size, threads, level,
+                                &chunks, &chunk_count, &comp_ms, &total_comp);
+        if (rc != LZO_E_OK) {
+            fprintf(stderr, "Bench error: compress failed (%d)\n", rc);
+            free_compression_chunks(chunks, chunk_count);
+            verify_ok = 0;
+            break;
+        }
+
+        unsigned char *out = (unsigned char *)malloc(size ? size : 1u);
+        if (!out) {
+            fprintf(stderr, "Bench error: malloc failed\n");
+            free_compression_chunks(chunks, chunk_count);
+            verify_ok = 0;
+            break;
+        }
+
+        for (size_t i = 0; i < chunk_count; ++i) {
+            chunks[i].out = out + chunks[i].offset;
+        }
+
+        double decomp_ms = 0.0;
+        rc = decompress_multi(chunks, chunk_count, threads, g_alg, &decomp_ms);
+        if (rc != LZO_E_OK || memcmp(out, data, size) != 0) {
+            verify_ok = 0;
+        }
+
+        if (n == cap) {
+            size_t new_cap = cap * 2;
+            double *new_comp = (double *)realloc(comp_tp, new_cap * sizeof(double));
+            if (!new_comp) {
+                free(out);
+                free_compression_chunks(chunks, chunk_count);
+                verify_ok = 0;
+                break;
+            }
+            comp_tp = new_comp;
+
+            double *new_dec = (double *)realloc(dec_tp, new_cap * sizeof(double));
+            if (!new_dec) {
+                free(out);
+                free_compression_chunks(chunks, chunk_count);
+                verify_ok = 0;
+                break;
+            }
+            dec_tp = new_dec;
+
+            double *new_ratio = (double *)realloc(ratio_pct, new_cap * sizeof(double));
+            if (!new_ratio) {
+                free(out);
+                free_compression_chunks(chunks, chunk_count);
+                verify_ok = 0;
+                break;
+            }
+            ratio_pct = new_ratio;
+            cap = new_cap;
+        }
+
+        comp_tp[n] = (comp_ms > 0.0) ? (size / 1048576.0) / (comp_ms / 1000.0) : 0.0;
+        dec_tp[n] = (decomp_ms > 0.0) ? (size / 1048576.0) / (decomp_ms / 1000.0) : 0.0;
+        ratio_pct[n] = size ? (100.0 * (double)total_comp / (double)size) : 0.0;
+        n++;
+
+        free(out);
+        free_compression_chunks(chunks, chunk_count);
+
+        if (!verify_ok) break;
+
+        clock_gettime(clk, &ts_now);
+        double elapsed = diff_ms_ts(&ts_start, &ts_now) / 1000.0;
+        if (elapsed >= bench_seconds && n > 0) break;
+    }
+
+    clock_gettime(clk, &ts_now);
+    double elapsed = diff_ms_ts(&ts_start, &ts_now) / 1000.0;
+
+    if (n == 0) {
+        free(comp_tp);
+        free(dec_tp);
+        free(ratio_pct);
+        fprintf(stderr, "Bench error: no valid iterations\n");
+        return 1;
+    }
+
+    double comp_med = median_double(comp_tp, n);
+    double dec_med = median_double(dec_tp, n);
+    double ratio_med = median_double(ratio_pct, n);
+
+    fprintf(stderr, "Bench Compress : kernel_tp=%.2f MB/s ratio=%.2f%%\n", comp_med, ratio_med);
+    fprintf(stderr, "Bench Decompress : kernel_tp=%.2f MB/s verify=%s\n", dec_med, verify_ok ? "OK" : "FAIL");
+    fprintf(stderr, "Bench Summary : iterations=%zu seconds=%.2f\n", n, elapsed);
+
+    free(comp_tp);
+    free(dec_tp);
+    free(ratio_pct);
+    return verify_ok ? 0 : 1;
+}
+
+static int run_stable_kernel_bench_file(const char *input_path,
+                                        int level, int threads, double bench_seconds) {
+    size_t input_size = 0;
+    unsigned char *input = read_entire(input_path, &input_size);
+    if (!input && input_size != 0) return 1;
+
+    int rc = run_stable_kernel_bench(input, input_size, level, threads, bench_seconds);
+    free(input);
+    return rc;
 }
 
 static int compress_file(const char *input_path, const char *output_path,
@@ -806,7 +1073,7 @@ static int compress_file(const char *input_path, const char *output_path,
         clock_gettime(CLOCK_MONOTONIC, &t_total_end);
     }
 
-    {
+    if (!do_bench) {
         alg_t used_alg = g_alg;
 
         // Calculate prepare time (time between compression and write)
@@ -1083,6 +1350,8 @@ static void print_usage(const char *prog) {
             "  -a <alg>        Select algorithm (1x, 1y). Default 1x.\n"
             "  -l <level>      Select level/variant for 1x (1, 1k, 1l, 1o). Default 1.\n"
             "  -o <path>       Output path (- for stdout). If omitted a default is generated from input\n"
+            "  --bench         Run stable kernel benchmark for several seconds\n"
+            "  --bench-seconds <s>  Benchmark duration in seconds (default 3)\n"
             "  --benchmark     Run benchmark metrics after operation\n"
             "  --debug-metrics Enable per-block CPU timing/metrics (debug only)\n"
             "  -h, --help      Show this help\n"
@@ -1102,6 +1371,7 @@ int main(int argc, char **argv) {
     int threads = DEFAULT_THREAD_COUNT;
     int do_bench = 0;
     int bench_mode = 0; /* concise bench output (compression ratio, throughput) */
+    double bench_seconds = 3.0;
     int verbose = 0;
     int verify_only = 0;
     char *kernel_spec = NULL;
@@ -1142,6 +1412,25 @@ int main(int argc, char **argv) {
             verbose = 1;
         } else if (strcmp(arg, "--bench") == 0) {
             bench_mode = 1;
+        } else if (strcmp(arg, "--bench-seconds") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--bench-seconds requires an argument\n");
+                free(auto_output);
+                return 1;
+            }
+            bench_seconds = atof(argv[++i]);
+            if (bench_seconds <= 0.0) {
+                fprintf(stderr, "invalid --bench-seconds value\n");
+                free(auto_output);
+                return 1;
+            }
+        } else if (strncmp(arg, "--bench-seconds=", 16) == 0) {
+            bench_seconds = atof(arg + 16);
+            if (bench_seconds <= 0.0) {
+                fprintf(stderr, "invalid --bench-seconds value\n");
+                free(auto_output);
+                return 1;
+            }
         } else if (strcmp(arg, "-B") == 0 || strcmp(arg, "--block-size") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "-B requires an argument\n");
@@ -1271,11 +1560,17 @@ int main(int argc, char **argv) {
     }
 
     int rc;
+
+    if (bench_mode && do_bench) {
+        fprintf(stderr, "--bench and --benchmark are mutually exclusive\n");
+        free(auto_output);
+        return 1;
+    }
     /* Only set a default algorithm label when compressing; do not set/print
      * a default when in decompress mode, otherwise decompress runs without
      * an explicit -L will still print a misleading default label. */
 
-    if (!mode_decompress) {
+    if (!mode_decompress && !do_bench && !bench_mode) {
         fprintf(stderr, "Using algorithm: %s, variant: %s\n",
             alg_to_str(g_alg),
             (g_variant == VAR_1) ? "1" :
@@ -1286,51 +1581,10 @@ int main(int argc, char **argv) {
 
     if (mode_decompress) {
         rc = decompress_file(input, output, threads, verify_only);
+    } else if (bench_mode) {
+        rc = run_stable_kernel_bench_file(input, level, threads, bench_seconds);
     } else {
         rc = compress_file(input, output, level, threads, do_bench, verify_only);
-        /* concise bench mode: if requested and not already covered by --benchmark,
-         * run a single-block measure and print a compact benchmark summary.
-         */
-        if (bench_mode && !do_bench) {
-            size_t input_size = 0;
-            unsigned char *input_buf = read_entire(input, &input_size);
-            if (input_buf) {
-                struct timespec t0, t1;
-                unsigned char *comp = NULL; size_t comp_len = 0;
-#ifdef CLOCK_MONOTONIC_RAW
-                const clockid_t clk = CLOCK_MONOTONIC_RAW;
-#else
-                const clockid_t clk = CLOCK_MONOTONIC;
-#endif
-                clock_gettime(clk, &t0);
-                alg_t use_alg = g_alg;
-                variant_t use_var = g_variant;
-                size_t cap = input_size + input_size / 16u + 64u + 3u;
-                comp = (unsigned char *)malloc(cap);
-                int r = LZO_E_OUT_OF_MEMORY;
-                if (comp) {
-                    r = compress_block_into(input_buf, input_size, comp, cap, &comp_len, use_alg, use_var, NULL);
-                }
-                clock_gettime(clk, &t1);
-                if (r == LZO_E_OK) {
-                    double comp_ms = diff_ms_ts(&t0, &t1);
-                    unsigned char *out = malloc(input_size ? input_size : 1u);
-                    struct timespec dt0, dt1;
-                    clock_gettime(clk, &dt0);
-                    r = decompress_block(comp, comp_len, out, input_size, use_alg);
-                    clock_gettime(clk, &dt1);
-                    double decomp_ms = diff_ms_ts(&dt0, &dt1);
-                    double comp_mb_s = input_size ? (input_size / 1048576.0) / (comp_ms / 1000.0) : 0.0;
-                    double decomp_mb_s = input_size ? (input_size / 1048576.0) / (decomp_ms / 1000.0) : 0.0;
-                    fprintf(stderr, "BENCH: in=%zu out=%zu ratio=%.2f%% comp=%.3fms(%.2fMB/s) decomp=%.3fms(%.2fMB/s)\n",
-                            input_size, comp_len, input_size ? (100.0 * comp_len / input_size) : 0.0,
-                            comp_ms, comp_mb_s, decomp_ms, decomp_mb_s);
-                    free(out);
-                }
-                free(comp);
-                free(input_buf);
-            }
-        }
     }
 
     free(auto_output);

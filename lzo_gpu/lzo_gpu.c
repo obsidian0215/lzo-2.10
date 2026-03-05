@@ -16,6 +16,7 @@
 #include <libgen.h>
 #include <linux/limits.h>
 #include <signal.h>
+#include <time.h>
 #include "lzo_defaults.h"
 #include "timing.h"
 #include "lzo_gpu_utils.h"
@@ -178,10 +179,12 @@ static inline void show_help(char *prog_name)
     fprintf(stderr, "  -d, --decompress     Decompress mode\n");
     fprintf(stderr, "  -o, --output FILE    Output file (use '-' for stdout)\n");
     fprintf(stderr, "  -a, --alg ALG        Algorithm (lzo1x, lzo1y) (default: lzo1x)\n");
-    fprintf(stderr, "  -L, --level LEVEL    Dictionary bits (10-15) (default: 11)\n");
+    fprintf(stderr, "  -L, --level LEVEL    Dictionary bits (10-15) (default: 12)\n");
     fprintf(stderr, "  -B, --block-size N   Block size (B/KB/MB) (default: 16KB)\n");
     fprintf(stderr, "  -v, --verbose        Enable performance statistics\n");
-    fprintf(stderr, "  --local N            Local work-group size (default: 4)\n");
+    fprintf(stderr, "  --local N            Local work-group size (default: 1)\n");
+    fprintf(stderr, "  --bench [SECONDS]    Stable benchmark (compress+decompress+verify)\n");
+    fprintf(stderr, "  --bench-seconds N    Benchmark duration in seconds (default: 3)\n");
     fprintf(stderr, "Detailed Help:\n");
     fprintf(stderr, "  %s --daemon -h           # Daemon-specific settings\n", prog_name);
     fprintf(stderr, "  %s --use-daemon -h       # Client-specific settings\n\n", prog_name);
@@ -193,6 +196,36 @@ static inline void show_help(char *prog_name)
     fprintf(stderr, "  %s -h|--help                                 # show this help\n", prog_name);
     fprintf(stderr, "\nEnvironment variables (grouped — standalone / client->daemon / advanced):\n");
     fprintf(stderr, "    LZO_STANDARD_COPY=0|1    0=zero-copy (map into pinned buffer), 1=standard host->device copy (explicit upload). Applies to both compression and decompression.\n");
+}
+
+static int cmp_double_asc(const void *a, const void *b) {
+    double da = *(const double *)a;
+    double db = *(const double *)b;
+    if (da < db) return -1;
+    if (da > db) return 1;
+    return 0;
+}
+
+static double median_double(const double *vals, size_t n) {
+    if (!vals || n == 0) return 0.0;
+    double *tmp = (double *)malloc(n * sizeof(double));
+    if (!tmp) return 0.0;
+    memcpy(tmp, vals, n * sizeof(double));
+    qsort(tmp, n, sizeof(double), cmp_double_asc);
+    double out = (n % 2 == 0) ? (tmp[n / 2 - 1] + tmp[n / 2]) / 2.0 : tmp[n / 2];
+    free(tmp);
+    return out;
+}
+
+static double elapsed_sec(const struct timespec *start, const struct timespec *end) {
+    return (double)(end->tv_sec - start->tv_sec) +
+           (double)(end->tv_nsec - start->tv_nsec) / 1000000000.0;
+}
+
+static int lzo_debug_counters_enabled_cli(void) {
+    const char* env = getenv("LZO_GPU_DEBUG_COUNTERS");
+    if (!env || !*env) return 0;
+    return strcmp(env, "0") != 0;
 }
 
 
@@ -213,6 +246,8 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
 
     if (comp_level < 0) comp_level = LZO_DEFAULT_COMP_LEVEL;
 
+    uint64_t t_total_start = now_ns();
+
     ocl_init();
     if (!ctx || !q) {
         fprintf(stderr, "error: failed to initialize OpenCL runtime\n");
@@ -224,8 +259,9 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
     cl_kernel krn_c = NULL;
     char build_log[8192] = {0};
     int kernel_has_dbg = 0;
+    int debug_counters = lzo_debug_counters_enabled_cli();
     uint64_t tk1 = now_ns();
-    if (lzo_load_comp_kernel(ctx, dev, alg_name, comp_level, 0, &prog_c, &krn_c, &kernel_has_dbg, build_log, sizeof(build_log)) != 0) {
+    if (lzo_load_comp_kernel(ctx, dev, alg_name, comp_level, debug_counters, &prog_c, &krn_c, &kernel_has_dbg, build_log, sizeof(build_log)) != 0) {
         if (build_log[0]) fprintf(stderr, "error: failed to load kernel for %s bits=%d: %s\n", alg_name, comp_level, build_log);
         else fprintf(stderr, "error: failed to load kernel for %s bits=%d\n", alg_name, comp_level);
         return 1;
@@ -247,7 +283,7 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
         .standard_copy = standard_copy,
         .block_size = block_size,
         .local_size_param = (int)g_cli_local_size,
-        .debug = 0
+        .debug = debug_counters
     };
 
     unsigned long time_us = 0;
@@ -255,18 +291,20 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
     timing_t t_out = {0};
 
     int ret = lzo_compress_core(ctx, q, dev, krn_c, in_path, output_path, &params, &ws, &time_us, &output_size, &t_out);
+    uint64_t t_total_end = now_ns();
+    unsigned long overall_us = (unsigned long)((t_total_end - t_total_start) / 1000ULL);
 
     if (ret == 0) {
         if (g_verbose) {
             response_t r = {0};
             r.status = 0;
-            r.time_us = time_us;
+            r.time_us = overall_us;
             r.out_size = output_size;
             r.timing = t_out;
             lzo_print_response_stats(&r, in_path, 'C', alg_id);
         } else {
             double ratio = (double)t_out.in_size / (t_out.out_size > 0 ? t_out.out_size : 1);
-            printf("%s : %zu -> %zu (%.2f:1) in %.2f ms\n", in_path, t_out.in_size, t_out.out_size, ratio, time_us / 1000.0);
+            printf("%s : %zu -> %zu (%.2f:1) in %.2f ms\n", in_path, t_out.in_size, t_out.out_size, ratio, overall_us / 1000.0);
         }
     }
     if (krn_c) clReleaseKernel(krn_c);
@@ -289,7 +327,14 @@ static int do_decompress_mode(const char* lz_path, const char* output_path, int 
     fclose(f);
 
     const char* alg_name = (a[3] == 1) ? "lzo1y" : "lzo1x";
-    char decomp_base[64]; snprintf(decomp_base, sizeof(decomp_base), "%s_decomp", alg_name);
+    int debug_counters = lzo_debug_counters_enabled_cli();
+    char decomp_base[64];
+    if (debug_counters)
+        snprintf(decomp_base, sizeof(decomp_base), "%s_debug", alg_name);
+    else
+        snprintf(decomp_base, sizeof(decomp_base), "%s", alg_name);
+
+    uint64_t t_total_start = now_ns();
 
     ocl_init();
     if (!ctx || !q) {
@@ -299,17 +344,33 @@ static int do_decompress_mode(const char* lz_path, const char* output_path, int 
     cl_program prog_d = NULL;
     cl_int err;
     char build_log[8192] = {0};
+    const int decomp_bits = LZO_DEFAULT_COMP_LEVEL;
 
     uint64_t tk1 = now_ns();
     /* Fallback to base decompressor */
     if (!prog_d) {
-        prog_d = lzo_load_program_with_dbits(ctx, dev, decomp_base, 0, build_log, sizeof(build_log));
-        if (!prog_d) { fprintf(stderr, "error: unable to load decompressor for %s\n", decomp_base); return 1; }
+        prog_d = lzo_load_program_with_dbits(ctx, dev, decomp_base, decomp_bits, build_log, sizeof(build_log));
+        if (!prog_d) {
+            if (build_log[0]) {
+                fprintf(stderr, "error: unable to load decompressor for %s (D_BITS=%d): %s\n", decomp_base, decomp_bits, build_log);
+            } else {
+                fprintf(stderr, "error: unable to load decompressor for %s (D_BITS=%d)\n", decomp_base, decomp_bits);
+            }
+            return 1;
+        }
     }
 
-    char krn_name[64]; snprintf(krn_name, sizeof(krn_name), "%s_block_decompress", alg_name);
-    cl_kernel krn_d = clCreateKernel(prog_d, krn_name, &err);
-    if (err != CL_SUCCESS) { fprintf(stderr, "clCreateKernel failed for %s (err=%d)\n", krn_name, err); clReleaseProgram(prog_d); return 1; }
+    char krn_name[64];
+    cl_kernel krn_d = NULL;
+
+    snprintf(krn_name, sizeof(krn_name), "%s_block_decompress", alg_name);
+    krn_d = clCreateKernel(prog_d, krn_name, &err);
+    if (err != CL_SUCCESS || !krn_d) {
+        fprintf(stderr, "clCreateKernel failed for %s (err=%d)\n", krn_name, err);
+        clReleaseProgram(prog_d);
+        return 1;
+    }
+
     uint64_t tk2 = now_ns();
     g_kernel_load_us = (unsigned long)((tk2 - tk1) / 1000);
 
@@ -317,17 +378,19 @@ static int do_decompress_mode(const char* lz_path, const char* output_path, int 
     lzo_gpu_workspace_init(&ws);
     unsigned long time_us = 0; size_t output_size = 0; timing_t t_out = {0};
 
-    int rc = lzo_decompress_core(ctx, q, dev, krn_d, lz_path, output_path, &ws, standard_copy, (int)g_cli_local_size, 0, &time_us, &output_size, &t_out);
+    int rc = lzo_decompress_core(ctx, q, dev, krn_d, lz_path, output_path, &ws, standard_copy, (int)g_cli_local_size, debug_counters, &time_us, &output_size, &t_out);
+    uint64_t t_total_end = now_ns();
+    unsigned long overall_us = (unsigned long)((t_total_end - t_total_start) / 1000ULL);
     if (rc == 0) {
         if (g_verbose) {
             response_t r = {0};
             r.status = 0;
-            r.time_us = time_us;
+            r.time_us = overall_us;
             r.out_size = output_size;
             r.timing = t_out;
             lzo_print_response_stats(&r, lz_path, 'D', (strcmp(alg_name, "lzo1y") == 0) ? 1 : 0);
         } else {
-            printf("%s : %zu -> %zu in %.2f ms\n", lz_path, t_out.in_size, t_out.out_size, time_us / 1000.0);
+            printf("%s : %zu -> %zu in %.2f ms\n", lz_path, t_out.in_size, t_out.out_size, overall_us / 1000.0);
         }
     }
     lzo_gpu_workspace_free(&ws);
@@ -337,6 +400,418 @@ static int do_decompress_mode(const char* lz_path, const char* output_path, int 
     if (q) { clReleaseCommandQueue(q); q = NULL; }
     if (ctx) { clReleaseContext(ctx); ctx = NULL; }
     return rc;
+}
+
+static int run_lzo_bench(const char *in_path,
+                         const char *alg_name,
+                         int comp_level,
+                         double bench_seconds) {
+    struct stat st;
+    if (!in_path || stat(in_path, &st) != 0 || st.st_size <= 0) {
+        fprintf(stderr, "bench error: invalid input file\n");
+        return 1;
+    }
+    if (bench_seconds <= 0.0) bench_seconds = 3.0;
+    if (comp_level < 0) comp_level = LZO_DEFAULT_COMP_LEVEL;
+
+    size_t in_size_ref = 0;
+    unsigned char* input_ref = (unsigned char*)lzo_read_file(in_path, &in_size_ref);
+    if (!input_ref || in_size_ref == 0) {
+        free(input_ref);
+        fprintf(stderr, "bench error: failed to read input\n");
+        return 1;
+    }
+
+    int standard_copy = (getenv("LZO_STANDARD_COPY") && atoi(getenv("LZO_STANDARD_COPY")) == 1) ? 1 : 0;
+    int alg_id = (strcmp(alg_name, "lzo1y") == 0) ? 1 : 0;
+    int debug_counters = lzo_debug_counters_enabled_cli();
+
+    ocl_init();
+    if (!ctx || !q) {
+        fprintf(stderr, "bench error: failed to initialize OpenCL runtime\n");
+        free(input_ref);
+        return 1;
+    }
+
+    cl_program prog_c = NULL;
+    cl_kernel krn_c = NULL;
+    int kernel_has_dbg = 0;
+    char build_log[8192] = {0};
+    if (lzo_load_comp_kernel(ctx, dev, alg_name, comp_level, debug_counters,
+                             &prog_c, &krn_c, &kernel_has_dbg,
+                             build_log, sizeof(build_log)) != 0 || !prog_c || !krn_c) {
+        fprintf(stderr, "bench error: failed to load compression kernel\n");
+        if (prog_c) clReleaseProgram(prog_c);
+        if (q) { clReleaseCommandQueue(q); q = NULL; }
+        if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+        free(input_ref);
+        return 1;
+    }
+
+    char decomp_base[64];
+    if (debug_counters)
+        snprintf(decomp_base, sizeof(decomp_base), "%s_debug", alg_name);
+    else
+        snprintf(decomp_base, sizeof(decomp_base), "%s", alg_name);
+    cl_program prog_d = lzo_load_program_with_dbits(ctx, dev, decomp_base, comp_level, build_log, sizeof(build_log));
+    if (!prog_d) {
+        if (build_log[0]) {
+            fprintf(stderr, "bench error: failed to load decompressor program (D_BITS=%d): %s\n", comp_level, build_log);
+        } else {
+            fprintf(stderr, "bench error: failed to load decompressor program (D_BITS=%d)\n", comp_level);
+        }
+        clReleaseKernel(krn_c);
+        clReleaseProgram(prog_c);
+        if (q) { clReleaseCommandQueue(q); q = NULL; }
+        if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+        free(input_ref);
+        return 1;
+    }
+
+    char krn_name[64];
+    cl_int err = CL_SUCCESS;
+    cl_kernel krn_d = NULL;
+
+    snprintf(krn_name, sizeof(krn_name), "%s_block_decompress", alg_name);
+    krn_d = clCreateKernel(prog_d, krn_name, &err);
+    if (err != CL_SUCCESS || !krn_d) {
+        fprintf(stderr, "bench error: failed to create decompressor kernel (%s, err=%d)\n", krn_name, err);
+        clReleaseProgram(prog_d);
+        clReleaseKernel(krn_c);
+        clReleaseProgram(prog_c);
+        if (q) { clReleaseCommandQueue(q); q = NULL; }
+        if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+        free(input_ref);
+        return 1;
+    }
+
+    cl_uint krn_num_args = 0;
+    int kernel_has_dbg_dec = 0;
+    if (clGetKernelInfo(krn_d, CL_KERNEL_NUM_ARGS, sizeof(krn_num_args), &krn_num_args, NULL) == CL_SUCCESS) {
+        kernel_has_dbg_dec = (krn_num_args >= 9U);
+    }
+
+    lzo_gpu_workspace_t ws;
+    lzo_gpu_workspace_init(&ws);
+
+    lzo_compress_params_t params = {
+        .level = comp_level,
+        .alg_id = alg_id,
+        .standard_copy = standard_copy,
+        .block_size = g_cli_fixed_block_bytes,
+        .local_size_param = (int)g_cli_local_size,
+        .debug = debug_counters
+    };
+
+    size_t cap = 16, n = 0;
+    double *comp_tp = (double *)malloc(cap * sizeof(double));
+    double *dec_tp = (double *)malloc(cap * sizeof(double));
+    double *ratio_pct = (double *)malloc(cap * sizeof(double));
+    int verify_ok = 1;
+    if (!comp_tp || !dec_tp || !ratio_pct) {
+        verify_ok = 0;
+    }
+
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+
+    unsigned long long dbg_dec_tokens_total = 0;
+    unsigned long long dbg_dec_literals_total = 0;
+    unsigned long long dbg_dec_matches_total = 0;
+    unsigned long long dbg_dec_small_offsets_total = 0;
+    unsigned long long dbg_dec_output_errors_total = 0;
+
+    while (verify_ok) {
+        timing_t tc = {0};
+        unsigned long time_us = 0;
+        size_t out_size = 0;
+        double dec_kernel_us = 0.0;
+
+        cl_uint *h_lens = NULL;
+        cl_uint *h_off = NULL;
+        cl_uint *h_out_lens = NULL;
+        cl_uint *h_dbg_dec = NULL;
+        unsigned char *packed = NULL;
+        cl_mem d_comp = NULL, d_off = NULL, d_out = NULL, d_out_lens = NULL, d_dbg_dec = NULL;
+
+        int rc = lzo_compress_core(ctx, q, dev, krn_c, in_path, "/dev/null",
+                                   &params, &ws, &time_us, &out_size, &tc);
+        if (rc != 0) {
+            verify_ok = 0;
+            break;
+        }
+
+        size_t nblk = (size_t)tc.nblk;
+        size_t blk = (size_t)tc.blk_size_bytes;
+        size_t worst_blk = lzo_worst(blk);
+        size_t comp_total = (size_t)tc.out_size;
+        size_t in_size = (size_t)tc.in_size;
+        if (nblk == 0 || blk == 0 || comp_total == 0 || in_size == 0 || in_size != in_size_ref || in_size > 0xFFFFFFFFu) {
+            verify_ok = 0;
+            break;
+        }
+
+        h_lens = (cl_uint*)malloc(nblk * sizeof(cl_uint));
+        h_off = (cl_uint*)malloc((nblk + 1) * sizeof(cl_uint));
+        h_out_lens = (cl_uint*)malloc(nblk * sizeof(cl_uint));
+        packed = (unsigned char*)malloc(comp_total);
+        if (!h_lens || !h_off || !h_out_lens || !packed) {
+            verify_ok = 0;
+            goto iter_cleanup;
+        }
+
+        void* map_len = clEnqueueMapBuffer(q, ws.d_len, CL_TRUE, CL_MAP_READ,
+                                           0, nblk * sizeof(cl_uint),
+                                           0, NULL, NULL, &err);
+        if (err != CL_SUCCESS || !map_len) {
+            verify_ok = 0;
+            goto iter_cleanup;
+        }
+        memcpy(h_lens, map_len, nblk * sizeof(cl_uint));
+        clEnqueueUnmapMemObject(q, ws.d_len, map_len, 0, NULL, NULL);
+        clFinish(q);
+
+        void* map_out = clEnqueueMapBuffer(q, ws.d_out, CL_TRUE, CL_MAP_READ,
+                                           0, nblk * worst_blk,
+                                           0, NULL, NULL, &err);
+        if (err != CL_SUCCESS || !map_out) {
+            verify_ok = 0;
+            goto iter_cleanup;
+        }
+
+        size_t co = 0;
+        h_off[0] = 0;
+        for (size_t i = 0; i < nblk; ++i) {
+            size_t csz = (size_t)h_lens[i];
+            if (co + csz > comp_total) {
+                verify_ok = 0;
+                break;
+            }
+            memcpy(packed + co, ((unsigned char*)map_out) + i * worst_blk, csz);
+            co += csz;
+            h_off[i + 1] = (cl_uint)co;
+        }
+        clEnqueueUnmapMemObject(q, ws.d_out, map_out, 0, NULL, NULL);
+        clFinish(q);
+        if (!verify_ok || co != comp_total) {
+            verify_ok = 0;
+            goto iter_cleanup;
+        }
+
+        d_comp = clCreateBuffer(ctx, CL_MEM_READ_ONLY, comp_total, NULL, &err);
+        if (err != CL_SUCCESS || !d_comp) {
+            verify_ok = 0;
+            goto iter_cleanup;
+        }
+        d_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY, (nblk + 1) * sizeof(cl_uint), NULL, &err);
+        if (err != CL_SUCCESS || !d_off) {
+            verify_ok = 0;
+            goto iter_cleanup;
+        }
+        d_out = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, in_size, NULL, &err);
+        if (err != CL_SUCCESS || !d_out) {
+            verify_ok = 0;
+            goto iter_cleanup;
+        }
+        d_out_lens = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, nblk * sizeof(cl_uint), NULL, &err);
+        if (err != CL_SUCCESS || !d_out_lens) {
+            verify_ok = 0;
+            goto iter_cleanup;
+        }
+
+        err  = clEnqueueWriteBuffer(q, d_comp, CL_TRUE, 0, comp_total, packed, 0, NULL, NULL);
+        err |= clEnqueueWriteBuffer(q, d_off, CL_TRUE, 0, (nblk + 1) * sizeof(cl_uint), h_off, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            verify_ok = 0;
+            goto iter_cleanup;
+        }
+
+        cl_uint blk_sz = (cl_uint)blk;
+        cl_uint orig_sz = (cl_uint)in_size;
+        cl_uint nblk_cl = (cl_uint)nblk;
+        int dbg_dec_enabled = 0;
+        CHECK(clSetKernelArg(krn_d, 0, sizeof(cl_mem), &d_comp));
+        CHECK(clSetKernelArg(krn_d, 1, sizeof(cl_mem), &d_off));
+        CHECK(clSetKernelArg(krn_d, 2, sizeof(cl_mem), &d_out));
+        CHECK(clSetKernelArg(krn_d, 3, sizeof(cl_mem), &d_out_lens));
+        CHECK(clSetKernelArg(krn_d, 4, sizeof(cl_uint), &blk_sz));
+        CHECK(clSetKernelArg(krn_d, 5, sizeof(cl_uint), &orig_sz));
+        CHECK(clSetKernelArg(krn_d, 6, sizeof(cl_uint), &nblk_cl));
+
+        dbg_dec_enabled = (debug_counters && kernel_has_dbg_dec);
+        if (dbg_dec_enabled) {
+            size_t dbg_bytes = nblk * 5 * sizeof(cl_uint);
+            d_dbg_dec = clCreateBuffer(ctx, CL_MEM_READ_WRITE, dbg_bytes, NULL, &err);
+            if (err != CL_SUCCESS || !d_dbg_dec) {
+                dbg_dec_enabled = 0;
+            } else {
+                h_dbg_dec = (cl_uint*)calloc(nblk * 5, sizeof(cl_uint));
+                if (!h_dbg_dec) {
+                    dbg_dec_enabled = 0;
+                } else {
+                    err = clEnqueueWriteBuffer(q, d_dbg_dec, CL_TRUE, 0, dbg_bytes, h_dbg_dec, 0, NULL, NULL);
+                    if (err != CL_SUCCESS) dbg_dec_enabled = 0;
+                }
+            }
+            if (!dbg_dec_enabled) {
+                if (d_dbg_dec) { clReleaseMemObject(d_dbg_dec); d_dbg_dec = NULL; }
+                free(h_dbg_dec); h_dbg_dec = NULL;
+            }
+        }
+        if (kernel_has_dbg_dec) {
+            cl_mem dbg_arg = dbg_dec_enabled ? d_dbg_dec : d_out_lens;
+            cl_uint dbg_flag = dbg_dec_enabled ? 1U : 0U;
+            CHECK(clSetKernelArg(krn_d, 7, sizeof(cl_mem), &dbg_arg));
+            CHECK(clSetKernelArg(krn_d, 8, sizeof(cl_uint), &dbg_flag));
+        }
+
+        size_t local_size = (g_cli_local_size > 0) ? g_cli_local_size : 1;
+        if (local_size > nblk) local_size = 1;
+        size_t target_items = (size_t)nblk;
+        if (target_items == 0) target_items = 1;
+        if (local_size > target_items) local_size = 1;
+        size_t global_size = ((target_items + local_size - 1) / local_size) * local_size;
+        if (global_size == 0) global_size = 1;
+
+        uint64_t td0 = now_ns();
+        err = clEnqueueNDRangeKernel(q, krn_d, 1, NULL, &global_size, &local_size, 0, NULL, NULL);
+        if (err == CL_SUCCESS) clFinish(q);
+        uint64_t td1 = now_ns();
+        dec_kernel_us = (double)(td1 - td0) / 1000.0;
+        if (err != CL_SUCCESS) {
+            verify_ok = 0;
+            goto iter_cleanup;
+        }
+
+        if (dbg_dec_enabled && d_dbg_dec && h_dbg_dec) {
+            size_t dbg_bytes = nblk * 5 * sizeof(cl_uint);
+            err = clEnqueueReadBuffer(q, d_dbg_dec, CL_TRUE, 0, dbg_bytes, h_dbg_dec, 0, NULL, NULL);
+            if (err == CL_SUCCESS) {
+                for (size_t i = 0; i < nblk; ++i) {
+                    size_t base = i * 5;
+                    dbg_dec_tokens_total += h_dbg_dec[base + 0];
+                    dbg_dec_literals_total += h_dbg_dec[base + 1];
+                    dbg_dec_matches_total += h_dbg_dec[base + 2];
+                    dbg_dec_small_offsets_total += h_dbg_dec[base + 3];
+                    dbg_dec_output_errors_total += h_dbg_dec[base + 4];
+                }
+            }
+        }
+
+        err = clEnqueueReadBuffer(q, d_out_lens, CL_TRUE, 0, nblk * sizeof(cl_uint), h_out_lens, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            verify_ok = 0;
+            goto iter_cleanup;
+        }
+        size_t out_total = 0;
+        for (size_t i = 0; i < nblk; ++i) {
+            if (h_out_lens[i] == 0xFFFFFFFFu) {
+                verify_ok = 0;
+                break;
+            }
+            out_total += (size_t)h_out_lens[i];
+        }
+        if (!verify_ok || out_total != in_size) {
+            verify_ok = 0;
+            goto iter_cleanup;
+        }
+
+        void* map_dec = clEnqueueMapBuffer(q, d_out, CL_TRUE, CL_MAP_READ, 0, in_size, 0, NULL, NULL, &err);
+        if (err != CL_SUCCESS || !map_dec) {
+            verify_ok = 0;
+            goto iter_cleanup;
+        }
+        if (memcmp(map_dec, input_ref, in_size) != 0) {
+            verify_ok = 0;
+        }
+        clEnqueueUnmapMemObject(q, d_out, map_dec, 0, NULL, NULL);
+        clFinish(q);
+        if (!verify_ok) {
+            goto iter_cleanup;
+        }
+
+        if (n == cap) {
+            size_t new_cap = cap * 2;
+            double *nc = (double *)realloc(comp_tp, new_cap * sizeof(double));
+            if (!nc) {
+                verify_ok = 0;
+                break;
+            }
+            comp_tp = nc;
+
+            double *nd = (double *)realloc(dec_tp, new_cap * sizeof(double));
+            if (!nd) {
+                verify_ok = 0;
+                break;
+            }
+            dec_tp = nd;
+
+            double *nr = (double *)realloc(ratio_pct, new_cap * sizeof(double));
+            if (!nr) {
+                verify_ok = 0;
+                break;
+            }
+            ratio_pct = nr;
+            cap = new_cap;
+        }
+
+        double in_mb = (double)tc.in_size / (1024.0 * 1024.0);
+        comp_tp[n] = (tc.kernel_exec_us > 0) ? (in_mb * 1000000.0 / (double)tc.kernel_exec_us) : 0.0;
+            dec_tp[n] = (dec_kernel_us > 0.0) ? (in_mb * 1000000.0 / dec_kernel_us) : 0.0;
+        ratio_pct[n] = (tc.in_size > 0) ? (100.0 * (double)tc.out_size / (double)tc.in_size) : 0.0;
+        n++;
+
+        iter_cleanup:
+            if (d_comp) clReleaseMemObject(d_comp);
+            if (d_off) clReleaseMemObject(d_off);
+            if (d_out) clReleaseMemObject(d_out);
+            if (d_out_lens) clReleaseMemObject(d_out_lens);
+            if (d_dbg_dec) clReleaseMemObject(d_dbg_dec);
+            free(h_lens);
+            free(h_off);
+            free(h_out_lens);
+            free(h_dbg_dec);
+            free(packed);
+            if (!verify_ok) break;
+
+        clock_gettime(CLOCK_MONOTONIC, &ts1);
+        if (elapsed_sec(&ts0, &ts1) >= bench_seconds && n > 0) break;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    double sec = elapsed_sec(&ts0, &ts1);
+
+    if (n > 0) {
+        printf("Bench Compress : kernel_tp=%.2f MB/s ratio=%.2f%%\n",
+               median_double(comp_tp, n), median_double(ratio_pct, n));
+        printf("Bench Decompress : kernel_tp=%.2f MB/s verify=%s\n",
+               median_double(dec_tp, n), verify_ok ? "OK" : "FAIL");
+        printf("Bench Summary : iterations=%zu seconds=%.2f\n", n, sec);
+         if (debug_counters) {
+             printf("[LZO-DBG][DECOMP] tokens=%llu literal_bytes=%llu match_bytes=%llu small_offsets=%llu output_errors=%llu\n",
+                 dbg_dec_tokens_total,
+                 dbg_dec_literals_total,
+                 dbg_dec_matches_total,
+                 dbg_dec_small_offsets_total,
+                 dbg_dec_output_errors_total);
+         }
+    } else {
+        fprintf(stderr, "bench error: no successful iteration\n");
+        verify_ok = 0;
+    }
+
+    free(comp_tp);
+    free(dec_tp);
+    free(ratio_pct);
+    free(input_ref);
+    lzo_gpu_workspace_free(&ws);
+    if (krn_d) clReleaseKernel(krn_d);
+    if (prog_d) clReleaseProgram(prog_d);
+    if (krn_c) clReleaseKernel(krn_c);
+    if (prog_c) clReleaseProgram(prog_c);
+    if (q) { clReleaseCommandQueue(q); q = NULL; }
+    if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+    return verify_ok ? 0 : 1;
 }
 
 
@@ -357,6 +832,8 @@ int run_lzo_standalone(int argc, char** argv)
     const char *output_path = NULL;
     int output_explicit = 0; /* whether -o/--output was explicitly provided */
     int suppress_non_data = 0; /* when writing to stdout (-), suppress non-data prints */
+    int bench_mode = 0;
+    double bench_seconds = 3.0;
     int comp_level = -1; /* -1 means adaptive (not explicitly specified by user) */
     int comp_level_specified = 0;
     const char *alg_name = "lzo1x";
@@ -368,6 +845,25 @@ int run_lzo_standalone(int argc, char** argv)
         if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
             show_help(argv[0]);
             return 0;
+        }
+        if (strcmp(arg, "--bench") == 0) {
+            bench_mode = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                bench_seconds = atof(argv[++i]);
+            }
+            continue;
+        }
+        if (strcmp(arg, "--bench-seconds") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: missing argument for %s\n", arg);
+                return 1;
+            }
+            bench_seconds = atof(argv[++i]);
+            continue;
+        }
+        if (strncmp(arg, "--bench-seconds=", 16) == 0) {
+            bench_seconds = atof(arg + 16);
+            continue;
         }
         if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
             g_verbose = 1;
@@ -466,6 +962,11 @@ int run_lzo_standalone(int argc, char** argv)
             }
         }
     }
+
+    if (bench_mode && decompress_mode) {
+        fprintf(stderr, "Error: --bench only supports compress mode input (it runs compress+decompress internally)\n");
+        return 1;
+    }
     /* Set default output names if not specified */
     char default_output[512];
     if (output_explicit == 0 || output_path == NULL) {
@@ -526,6 +1027,10 @@ int run_lzo_standalone(int argc, char** argv)
     /* Decompress mode */
     if (decompress_mode) {
         return do_decompress_mode(lz_path, output_path, output_explicit, suppress_non_data);
+    }
+
+    if (bench_mode) {
+        return run_lzo_bench(in_path, alg_name, comp_level, bench_seconds);
     }
 
     /* Compress path (simple, fast) */

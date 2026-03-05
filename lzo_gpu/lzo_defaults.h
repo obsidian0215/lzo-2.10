@@ -13,7 +13,7 @@
 #define DEFAULT_DECOMP_CACHE_MB 256
 
 /* Compression configuration */
-/* Default compression level (bits). Reduced to 11 based on param-scan aggregated results */
+/* Default compression level (bits). */
 #define LZO_DEFAULT_COMP_LEVEL 12
 
 /* Default block size (in KB) when no adaptive/training result is available */
