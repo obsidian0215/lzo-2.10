@@ -506,9 +506,11 @@ static int run_lzo_bench(const char *in_path,
     size_t cap = 16, n = 0;
     double *comp_tp = (double *)malloc(cap * sizeof(double));
     double *dec_tp = (double *)malloc(cap * sizeof(double));
+    double *comp_total_tp = (double *)malloc(cap * sizeof(double));
+    double *dec_total_tp = (double *)malloc(cap * sizeof(double));
     double *ratio_pct = (double *)malloc(cap * sizeof(double));
     int verify_ok = 1;
-    if (!comp_tp || !dec_tp || !ratio_pct) {
+    if (!comp_tp || !dec_tp || !comp_total_tp || !dec_total_tp || !ratio_pct) {
         verify_ok = 0;
     }
 
@@ -521,18 +523,27 @@ static int run_lzo_bench(const char *in_path,
     unsigned long long dbg_dec_small_offsets_total = 0;
     unsigned long long dbg_dec_output_errors_total = 0;
 
+    /* --- Host-side optimization: pre-allocate reusable resources --- */
+    /* Decompression CL buffers (reused across iterations, grown if needed) */
+    cl_mem bench_d_comp = NULL, bench_d_off = NULL, bench_d_out = NULL, bench_d_out_lens = NULL;
+    size_t bench_d_comp_cap = 0, bench_d_off_cap = 0, bench_d_out_cap = 0, bench_d_out_lens_cap = 0;
+    /* Reusable host arrays (grown if needed) */
+    cl_uint *bench_h_lens = NULL, *bench_h_off = NULL, *bench_h_out_lens = NULL;
+    unsigned char *bench_packed = NULL;
+    size_t bench_h_lens_cap = 0, bench_h_off_cap = 0, bench_h_out_lens_cap = 0, bench_packed_cap = 0;
+    /* Decompression kernel args that stay constant across iterations */
+    int bench_dec_kernel_set = 0;
+    /* Cached decompression dispatch sizes */
+    size_t bench_dec_global = 0, bench_dec_local = 0;
+
     while (verify_ok) {
         timing_t tc = {0};
         unsigned long time_us = 0;
         size_t out_size = 0;
         double dec_kernel_us = 0.0;
 
-        cl_uint *h_lens = NULL;
-        cl_uint *h_off = NULL;
-        cl_uint *h_out_lens = NULL;
         cl_uint *h_dbg_dec = NULL;
-        unsigned char *packed = NULL;
-        cl_mem d_comp = NULL, d_off = NULL, d_out = NULL, d_out_lens = NULL, d_dbg_dec = NULL;
+        cl_mem d_dbg_dec = NULL;
 
         int rc = lzo_compress_core(ctx, q, dev, krn_c, in_path, "/dev/null",
                                    &params, &ws, &time_us, &out_size, &tc);
@@ -551,11 +562,28 @@ static int run_lzo_bench(const char *in_path,
             break;
         }
 
-        h_lens = (cl_uint*)malloc(nblk * sizeof(cl_uint));
-        h_off = (cl_uint*)malloc((nblk + 1) * sizeof(cl_uint));
-        h_out_lens = (cl_uint*)malloc(nblk * sizeof(cl_uint));
-        packed = (unsigned char*)malloc(comp_total);
-        if (!h_lens || !h_off || !h_out_lens || !packed) {
+        /* Grow host arrays only when needed */
+        if (nblk * sizeof(cl_uint) > bench_h_lens_cap) {
+            free(bench_h_lens);
+            bench_h_lens = (cl_uint*)malloc(nblk * sizeof(cl_uint));
+            bench_h_lens_cap = bench_h_lens ? nblk * sizeof(cl_uint) : 0;
+        }
+        if ((nblk + 1) * sizeof(cl_uint) > bench_h_off_cap) {
+            free(bench_h_off);
+            bench_h_off = (cl_uint*)malloc((nblk + 1) * sizeof(cl_uint));
+            bench_h_off_cap = bench_h_off ? (nblk + 1) * sizeof(cl_uint) : 0;
+        }
+        if (nblk * sizeof(cl_uint) > bench_h_out_lens_cap) {
+            free(bench_h_out_lens);
+            bench_h_out_lens = (cl_uint*)malloc(nblk * sizeof(cl_uint));
+            bench_h_out_lens_cap = bench_h_out_lens ? nblk * sizeof(cl_uint) : 0;
+        }
+        if (comp_total > bench_packed_cap) {
+            free(bench_packed);
+            bench_packed = (unsigned char*)malloc(comp_total);
+            bench_packed_cap = bench_packed ? comp_total : 0;
+        }
+        if (!bench_h_lens || !bench_h_off || !bench_h_out_lens || !bench_packed) {
             verify_ok = 0;
             goto iter_cleanup;
         }
@@ -567,7 +595,7 @@ static int run_lzo_bench(const char *in_path,
             verify_ok = 0;
             goto iter_cleanup;
         }
-        memcpy(h_lens, map_len, nblk * sizeof(cl_uint));
+        memcpy(bench_h_lens, map_len, nblk * sizeof(cl_uint));
         clEnqueueUnmapMemObject(q, ws.d_len, map_len, 0, NULL, NULL);
         clFinish(q);
 
@@ -580,16 +608,16 @@ static int run_lzo_bench(const char *in_path,
         }
 
         size_t co = 0;
-        h_off[0] = 0;
+        bench_h_off[0] = 0;
         for (size_t i = 0; i < nblk; ++i) {
-            size_t csz = (size_t)h_lens[i];
+            size_t csz = (size_t)bench_h_lens[i];
             if (co + csz > comp_total) {
                 verify_ok = 0;
                 break;
             }
-            memcpy(packed + co, ((unsigned char*)map_out) + i * worst_blk, csz);
+            memcpy(bench_packed + co, ((unsigned char*)map_out) + i * worst_blk, csz);
             co += csz;
-            h_off[i + 1] = (cl_uint)co;
+            bench_h_off[i + 1] = (cl_uint)co;
         }
         clEnqueueUnmapMemObject(q, ws.d_out, map_out, 0, NULL, NULL);
         clFinish(q);
@@ -598,83 +626,104 @@ static int run_lzo_bench(const char *in_path,
             goto iter_cleanup;
         }
 
-        d_comp = clCreateBuffer(ctx, CL_MEM_READ_ONLY, comp_total, NULL, &err);
-        if (err != CL_SUCCESS || !d_comp) {
-            verify_ok = 0;
-            goto iter_cleanup;
+        /* Time the total decompression (upload + kernel + verify) */
+        uint64_t dec_total_start = now_ns();
+
+        /* Grow decompression CL buffers only when capacity is insufficient */
+        if (comp_total > bench_d_comp_cap) {
+            if (bench_d_comp) clReleaseMemObject(bench_d_comp);
+            bench_d_comp = clCreateBuffer(ctx, CL_MEM_READ_ONLY, comp_total, NULL, &err);
+            if (err != CL_SUCCESS || !bench_d_comp) { bench_d_comp = NULL; bench_d_comp_cap = 0; verify_ok = 0; goto iter_cleanup; }
+            bench_d_comp_cap = comp_total;
+            bench_dec_kernel_set = 0; /* kernel args need re-binding */
         }
-        d_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY, (nblk + 1) * sizeof(cl_uint), NULL, &err);
-        if (err != CL_SUCCESS || !d_off) {
-            verify_ok = 0;
-            goto iter_cleanup;
+        if ((nblk + 1) * sizeof(cl_uint) > bench_d_off_cap) {
+            if (bench_d_off) clReleaseMemObject(bench_d_off);
+            bench_d_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY, (nblk + 1) * sizeof(cl_uint), NULL, &err);
+            if (err != CL_SUCCESS || !bench_d_off) { bench_d_off = NULL; bench_d_off_cap = 0; verify_ok = 0; goto iter_cleanup; }
+            bench_d_off_cap = (nblk + 1) * sizeof(cl_uint);
+            bench_dec_kernel_set = 0;
         }
-        d_out = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, in_size, NULL, &err);
-        if (err != CL_SUCCESS || !d_out) {
-            verify_ok = 0;
-            goto iter_cleanup;
+        if (in_size > bench_d_out_cap) {
+            if (bench_d_out) clReleaseMemObject(bench_d_out);
+            bench_d_out = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, in_size, NULL, &err);
+            if (err != CL_SUCCESS || !bench_d_out) { bench_d_out = NULL; bench_d_out_cap = 0; verify_ok = 0; goto iter_cleanup; }
+            bench_d_out_cap = in_size;
+            bench_dec_kernel_set = 0;
         }
-        d_out_lens = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, nblk * sizeof(cl_uint), NULL, &err);
-        if (err != CL_SUCCESS || !d_out_lens) {
-            verify_ok = 0;
-            goto iter_cleanup;
+        if (nblk * sizeof(cl_uint) > bench_d_out_lens_cap) {
+            if (bench_d_out_lens) clReleaseMemObject(bench_d_out_lens);
+            bench_d_out_lens = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, nblk * sizeof(cl_uint), NULL, &err);
+            if (err != CL_SUCCESS || !bench_d_out_lens) { bench_d_out_lens = NULL; bench_d_out_lens_cap = 0; verify_ok = 0; goto iter_cleanup; }
+            bench_d_out_lens_cap = nblk * sizeof(cl_uint);
+            bench_dec_kernel_set = 0;
         }
 
-        err  = clEnqueueWriteBuffer(q, d_comp, CL_TRUE, 0, comp_total, packed, 0, NULL, NULL);
-        err |= clEnqueueWriteBuffer(q, d_off, CL_TRUE, 0, (nblk + 1) * sizeof(cl_uint), h_off, 0, NULL, NULL);
+        /* Non-blocking uploads: enqueue both, then flush */
+        err  = clEnqueueWriteBuffer(q, bench_d_comp, CL_FALSE, 0, comp_total, bench_packed, 0, NULL, NULL);
+        err |= clEnqueueWriteBuffer(q, bench_d_off, CL_FALSE, 0, (nblk + 1) * sizeof(cl_uint), bench_h_off, 0, NULL, NULL);
         if (err != CL_SUCCESS) {
             verify_ok = 0;
             goto iter_cleanup;
         }
 
-        cl_uint blk_sz = (cl_uint)blk;
-        cl_uint orig_sz = (cl_uint)in_size;
-        cl_uint nblk_cl = (cl_uint)nblk;
-        int dbg_dec_enabled = 0;
-        CHECK(clSetKernelArg(krn_d, 0, sizeof(cl_mem), &d_comp));
-        CHECK(clSetKernelArg(krn_d, 1, sizeof(cl_mem), &d_off));
-        CHECK(clSetKernelArg(krn_d, 2, sizeof(cl_mem), &d_out));
-        CHECK(clSetKernelArg(krn_d, 3, sizeof(cl_mem), &d_out_lens));
-        CHECK(clSetKernelArg(krn_d, 4, sizeof(cl_uint), &blk_sz));
-        CHECK(clSetKernelArg(krn_d, 5, sizeof(cl_uint), &orig_sz));
-        CHECK(clSetKernelArg(krn_d, 6, sizeof(cl_uint), &nblk_cl));
+        /* Set kernel args only when buffers changed (first iter or resize) */
+        if (!bench_dec_kernel_set) {
+            cl_uint blk_sz = (cl_uint)blk;
+            cl_uint orig_sz = (cl_uint)in_size;
+            cl_uint nblk_cl = (cl_uint)nblk;
+            CHECK(clSetKernelArg(krn_d, 0, sizeof(cl_mem), &bench_d_comp));
+            CHECK(clSetKernelArg(krn_d, 1, sizeof(cl_mem), &bench_d_off));
+            CHECK(clSetKernelArg(krn_d, 2, sizeof(cl_mem), &bench_d_out));
+            CHECK(clSetKernelArg(krn_d, 3, sizeof(cl_mem), &bench_d_out_lens));
+            CHECK(clSetKernelArg(krn_d, 4, sizeof(cl_uint), &blk_sz));
+            CHECK(clSetKernelArg(krn_d, 5, sizeof(cl_uint), &orig_sz));
+            CHECK(clSetKernelArg(krn_d, 6, sizeof(cl_uint), &nblk_cl));
 
-        dbg_dec_enabled = (debug_counters && kernel_has_dbg_dec);
-        if (dbg_dec_enabled) {
-            size_t dbg_bytes = nblk * 5 * sizeof(cl_uint);
-            d_dbg_dec = clCreateBuffer(ctx, CL_MEM_READ_WRITE, dbg_bytes, NULL, &err);
-            if (err != CL_SUCCESS || !d_dbg_dec) {
-                dbg_dec_enabled = 0;
-            } else {
-                h_dbg_dec = (cl_uint*)calloc(nblk * 5, sizeof(cl_uint));
-                if (!h_dbg_dec) {
+            int dbg_dec_enabled = (debug_counters && kernel_has_dbg_dec);
+            if (dbg_dec_enabled) {
+                size_t dbg_bytes = nblk * 5 * sizeof(cl_uint);
+                d_dbg_dec = clCreateBuffer(ctx, CL_MEM_READ_WRITE, dbg_bytes, NULL, &err);
+                if (err != CL_SUCCESS || !d_dbg_dec) {
                     dbg_dec_enabled = 0;
                 } else {
-                    err = clEnqueueWriteBuffer(q, d_dbg_dec, CL_TRUE, 0, dbg_bytes, h_dbg_dec, 0, NULL, NULL);
-                    if (err != CL_SUCCESS) dbg_dec_enabled = 0;
+                    h_dbg_dec = (cl_uint*)calloc(nblk * 5, sizeof(cl_uint));
+                    if (!h_dbg_dec) {
+                        dbg_dec_enabled = 0;
+                    } else {
+                        err = clEnqueueWriteBuffer(q, d_dbg_dec, CL_TRUE, 0, dbg_bytes, h_dbg_dec, 0, NULL, NULL);
+                        if (err != CL_SUCCESS) dbg_dec_enabled = 0;
+                    }
+                }
+                if (!dbg_dec_enabled) {
+                    if (d_dbg_dec) { clReleaseMemObject(d_dbg_dec); d_dbg_dec = NULL; }
+                    free(h_dbg_dec); h_dbg_dec = NULL;
                 }
             }
-            if (!dbg_dec_enabled) {
-                if (d_dbg_dec) { clReleaseMemObject(d_dbg_dec); d_dbg_dec = NULL; }
-                free(h_dbg_dec); h_dbg_dec = NULL;
+            if (kernel_has_dbg_dec) {
+                cl_mem dbg_arg = dbg_dec_enabled ? d_dbg_dec : bench_d_out_lens;
+                cl_uint dbg_flag = dbg_dec_enabled ? 1U : 0U;
+                CHECK(clSetKernelArg(krn_d, 7, sizeof(cl_mem), &dbg_arg));
+                CHECK(clSetKernelArg(krn_d, 8, sizeof(cl_uint), &dbg_flag));
             }
-        }
-        if (kernel_has_dbg_dec) {
-            cl_mem dbg_arg = dbg_dec_enabled ? d_dbg_dec : d_out_lens;
-            cl_uint dbg_flag = dbg_dec_enabled ? 1U : 0U;
-            CHECK(clSetKernelArg(krn_d, 7, sizeof(cl_mem), &dbg_arg));
-            CHECK(clSetKernelArg(krn_d, 8, sizeof(cl_uint), &dbg_flag));
+
+            /* Compute dispatch sizes once */
+            bench_dec_local = (g_cli_local_size > 0) ? g_cli_local_size : 1;
+            if (bench_dec_local > nblk) bench_dec_local = 1;
+            size_t target_items = (size_t)nblk;
+            if (target_items == 0) target_items = 1;
+            if (bench_dec_local > target_items) bench_dec_local = 1;
+            bench_dec_global = ((target_items + bench_dec_local - 1) / bench_dec_local) * bench_dec_local;
+            if (bench_dec_global == 0) bench_dec_global = 1;
+
+            bench_dec_kernel_set = 1;
         }
 
-        size_t local_size = (g_cli_local_size > 0) ? g_cli_local_size : 1;
-        if (local_size > nblk) local_size = 1;
-        size_t target_items = (size_t)nblk;
-        if (target_items == 0) target_items = 1;
-        if (local_size > target_items) local_size = 1;
-        size_t global_size = ((target_items + local_size - 1) / local_size) * local_size;
-        if (global_size == 0) global_size = 1;
+        /* Ensure uploads complete before kernel launch */
+        clFinish(q);
 
         uint64_t td0 = now_ns();
-        err = clEnqueueNDRangeKernel(q, krn_d, 1, NULL, &global_size, &local_size, 0, NULL, NULL);
+        err = clEnqueueNDRangeKernel(q, krn_d, 1, NULL, &bench_dec_global, &bench_dec_local, 0, NULL, NULL);
         if (err == CL_SUCCESS) clFinish(q);
         uint64_t td1 = now_ns();
         dec_kernel_us = (double)(td1 - td0) / 1000.0;
@@ -683,7 +732,7 @@ static int run_lzo_bench(const char *in_path,
             goto iter_cleanup;
         }
 
-        if (dbg_dec_enabled && d_dbg_dec && h_dbg_dec) {
+        if (d_dbg_dec && h_dbg_dec) {
             size_t dbg_bytes = nblk * 5 * sizeof(cl_uint);
             err = clEnqueueReadBuffer(q, d_dbg_dec, CL_TRUE, 0, dbg_bytes, h_dbg_dec, 0, NULL, NULL);
             if (err == CL_SUCCESS) {
@@ -698,25 +747,25 @@ static int run_lzo_bench(const char *in_path,
             }
         }
 
-        err = clEnqueueReadBuffer(q, d_out_lens, CL_TRUE, 0, nblk * sizeof(cl_uint), h_out_lens, 0, NULL, NULL);
+        err = clEnqueueReadBuffer(q, bench_d_out_lens, CL_TRUE, 0, nblk * sizeof(cl_uint), bench_h_out_lens, 0, NULL, NULL);
         if (err != CL_SUCCESS) {
             verify_ok = 0;
             goto iter_cleanup;
         }
         size_t out_total = 0;
         for (size_t i = 0; i < nblk; ++i) {
-            if (h_out_lens[i] == 0xFFFFFFFFu) {
+            if (bench_h_out_lens[i] == 0xFFFFFFFFu) {
                 verify_ok = 0;
                 break;
             }
-            out_total += (size_t)h_out_lens[i];
+            out_total += (size_t)bench_h_out_lens[i];
         }
         if (!verify_ok || out_total != in_size) {
             verify_ok = 0;
             goto iter_cleanup;
         }
 
-        void* map_dec = clEnqueueMapBuffer(q, d_out, CL_TRUE, CL_MAP_READ, 0, in_size, 0, NULL, NULL, &err);
+        void* map_dec = clEnqueueMapBuffer(q, bench_d_out, CL_TRUE, CL_MAP_READ, 0, in_size, 0, NULL, NULL, &err);
         if (err != CL_SUCCESS || !map_dec) {
             verify_ok = 0;
             goto iter_cleanup;
@@ -724,8 +773,10 @@ static int run_lzo_bench(const char *in_path,
         if (memcmp(map_dec, input_ref, in_size) != 0) {
             verify_ok = 0;
         }
-        clEnqueueUnmapMemObject(q, d_out, map_dec, 0, NULL, NULL);
+        clEnqueueUnmapMemObject(q, bench_d_out, map_dec, 0, NULL, NULL);
         clFinish(q);
+        uint64_t dec_total_end = now_ns();
+        double dec_total_us = (double)(dec_total_end - dec_total_start) / 1000.0;
         if (!verify_ok) {
             goto iter_cleanup;
         }
@@ -733,59 +784,62 @@ static int run_lzo_bench(const char *in_path,
         if (n == cap) {
             size_t new_cap = cap * 2;
             double *nc = (double *)realloc(comp_tp, new_cap * sizeof(double));
-            if (!nc) {
-                verify_ok = 0;
-                break;
-            }
+            if (!nc) { verify_ok = 0; break; }
             comp_tp = nc;
 
             double *nd = (double *)realloc(dec_tp, new_cap * sizeof(double));
-            if (!nd) {
-                verify_ok = 0;
-                break;
-            }
+            if (!nd) { verify_ok = 0; break; }
             dec_tp = nd;
 
+            double *nct = (double *)realloc(comp_total_tp, new_cap * sizeof(double));
+            if (!nct) { verify_ok = 0; break; }
+            comp_total_tp = nct;
+
+            double *ndt = (double *)realloc(dec_total_tp, new_cap * sizeof(double));
+            if (!ndt) { verify_ok = 0; break; }
+            dec_total_tp = ndt;
+
             double *nr = (double *)realloc(ratio_pct, new_cap * sizeof(double));
-            if (!nr) {
-                verify_ok = 0;
-                break;
-            }
+            if (!nr) { verify_ok = 0; break; }
             ratio_pct = nr;
             cap = new_cap;
         }
 
         double in_mb = (double)tc.in_size / (1024.0 * 1024.0);
         comp_tp[n] = (tc.kernel_exec_us > 0) ? (in_mb * 1000000.0 / (double)tc.kernel_exec_us) : 0.0;
-            dec_tp[n] = (dec_kernel_us > 0.0) ? (in_mb * 1000000.0 / dec_kernel_us) : 0.0;
+        dec_tp[n] = (dec_kernel_us > 0.0) ? (in_mb * 1000000.0 / dec_kernel_us) : 0.0;
+        comp_total_tp[n] = (time_us > 0) ? (in_mb * 1000000.0 / (double)time_us) : 0.0;
+        dec_total_tp[n] = (dec_total_us > 0.0) ? (in_mb * 1000000.0 / dec_total_us) : 0.0;
         ratio_pct[n] = (tc.in_size > 0) ? (100.0 * (double)tc.out_size / (double)tc.in_size) : 0.0;
         n++;
 
         iter_cleanup:
-            if (d_comp) clReleaseMemObject(d_comp);
-            if (d_off) clReleaseMemObject(d_off);
-            if (d_out) clReleaseMemObject(d_out);
-            if (d_out_lens) clReleaseMemObject(d_out_lens);
             if (d_dbg_dec) clReleaseMemObject(d_dbg_dec);
-            free(h_lens);
-            free(h_off);
-            free(h_out_lens);
             free(h_dbg_dec);
-            free(packed);
             if (!verify_ok) break;
 
         clock_gettime(CLOCK_MONOTONIC, &ts1);
         if (elapsed_sec(&ts0, &ts1) >= bench_seconds && n > 0) break;
     }
 
+    /* Free bench-loop persistent resources */
+    if (bench_d_comp) clReleaseMemObject(bench_d_comp);
+    if (bench_d_off) clReleaseMemObject(bench_d_off);
+    if (bench_d_out) clReleaseMemObject(bench_d_out);
+    if (bench_d_out_lens) clReleaseMemObject(bench_d_out_lens);
+    free(bench_h_lens);
+    free(bench_h_off);
+    free(bench_h_out_lens);
+    free(bench_packed);
+
     clock_gettime(CLOCK_MONOTONIC, &ts1);
     double sec = elapsed_sec(&ts0, &ts1);
 
     if (n > 0) {
-        printf("Bench Compress : kernel_tp=%.2f MB/s ratio=%.2f%%\n",
-               median_double(comp_tp, n), median_double(ratio_pct, n));
-        printf("Bench Decompress : kernel_tp=%.2f MB/s verify=%s\n",
-               median_double(dec_tp, n), verify_ok ? "OK" : "FAIL");
+        printf("Bench Compress : kernel_tp=%.2f MB/s total_tp=%.2f MB/s ratio=%.2f%%\n",
+               median_double(comp_tp, n), median_double(comp_total_tp, n), median_double(ratio_pct, n));
+        printf("Bench Decompress : kernel_tp=%.2f MB/s total_tp=%.2f MB/s verify=%s\n",
+               median_double(dec_tp, n), median_double(dec_total_tp, n), verify_ok ? "OK" : "FAIL");
         printf("Bench Summary : iterations=%zu seconds=%.2f\n", n, sec);
          if (debug_counters) {
              printf("[LZO-DBG][DECOMP] tokens=%llu literal_bytes=%llu match_bytes=%llu small_offsets=%llu output_errors=%llu\n",
@@ -802,6 +856,8 @@ static int run_lzo_bench(const char *in_path,
 
     free(comp_tp);
     free(dec_tp);
+    free(comp_total_tp);
+    free(dec_total_tp);
     free(ratio_pct);
     free(input_ref);
     lzo_gpu_workspace_free(&ws);

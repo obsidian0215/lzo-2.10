@@ -261,6 +261,16 @@ def kernel_dec(stats, engine):
     return v if v > 0 else None
 
 
+def total_comp(stats, engine):
+    v = float(stats.get("comp_total_mbs", 0.0) or 0.0)
+    return v if v > 0 else None
+
+
+def total_dec(stats, engine):
+    v = float(stats.get("dec_total_mbs", 0.0) or 0.0)
+    return v if v > 0 else None
+
+
 def fmt_metric(v, digits):
     if v is None:
         return "N/A"
@@ -282,13 +292,19 @@ def fmt_mbs_or_na(v, digits):
 def emit_case_average(file_name, engine, config_label, avg_stats):
     comp_kernel = kernel_comp(avg_stats, engine)
     dec_kernel = kernel_dec(avg_stats, engine)
-    print(
-        "[CaseAvg] "
-        f"file={file_name} engine={engine} cfg={config_label} "
-        f"ratio_avg={fmtf(avg_stats.get('ratio', 0.0), 2)}% "
-        f"comp_mbs_avg={fmt_mbs_or_na(comp_kernel, 2)} "
-        f"dec_mbs_avg={fmt_mbs_or_na(dec_kernel, 2)}"
-    )
+    comp_total = total_comp(avg_stats, engine)
+    dec_total = total_dec(avg_stats, engine)
+    parts = [
+        "[CaseAvg] ",
+        f"file={file_name} engine={engine} cfg={config_label} ",
+        f"ratio_avg={fmtf(avg_stats.get('ratio', 0.0), 2)}% ",
+        f"comp_kernel={fmt_mbs_or_na(comp_kernel, 2)} ",
+        f"dec_kernel={fmt_mbs_or_na(dec_kernel, 2)}",
+    ]
+    if comp_total is not None or dec_total is not None:
+        parts.append(f" comp_total={fmt_mbs_or_na(comp_total, 2)}")
+        parts.append(f" dec_total={fmt_mbs_or_na(dec_total, 2)}")
+    print("".join(parts))
 
 
 def build_summary_record(engine, config_label, avg_stats):
@@ -298,6 +314,8 @@ def build_summary_record(engine, config_label, avg_stats):
         "ratio": float(avg_stats.get("ratio", 0.0) or 0.0),
         "comp_kernel": kernel_comp(avg_stats, engine),
         "dec_kernel": kernel_dec(avg_stats, engine),
+        "comp_total": total_comp(avg_stats, engine),
+        "dec_total": total_dec(avg_stats, engine),
     }
 
 
@@ -311,34 +329,57 @@ def print_and_save_config_summary(summary_records, out_csv):
         key = (rec["engine"], rec["config"])
         grouped.setdefault(key, []).append(rec)
 
+    has_total = any(r.get("comp_total") is not None or r.get("dec_total") is not None for r in summary_records)
+
     print("\n===== Per-Config Summary Stats (mean/median/p10/p90) =====")
     with open(out_csv, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
+        header = [
             "Engine", "Config", "Samples",
             "Ratio_mean", "Ratio_median", "Ratio_p10", "Ratio_p90", "Ratio_min", "Ratio_max",
-            "CompMBs_mean", "CompMBs_median", "CompMBs_p10", "CompMBs_p90", "CompMBs_min", "CompMBs_max",
-            "DecMBs_mean", "DecMBs_median", "DecMBs_p10", "DecMBs_p90", "DecMBs_min", "DecMBs_max",
-        ])
+            "CompKernelMBs_mean", "CompKernelMBs_median", "CompKernelMBs_p10", "CompKernelMBs_p90", "CompKernelMBs_min", "CompKernelMBs_max",
+            "DecKernelMBs_mean", "DecKernelMBs_median", "DecKernelMBs_p10", "DecKernelMBs_p90", "DecKernelMBs_min", "DecKernelMBs_max",
+        ]
+        if has_total:
+            header.extend([
+                "CompTotalMBs_mean", "CompTotalMBs_median", "CompTotalMBs_p10", "CompTotalMBs_p90", "CompTotalMBs_min", "CompTotalMBs_max",
+                "DecTotalMBs_mean", "DecTotalMBs_median", "DecTotalMBs_p10", "DecTotalMBs_p90", "DecTotalMBs_min", "DecTotalMBs_max",
+            ])
+        writer.writerow(header)
 
         for (engine, config), rows in sorted(grouped.items(), key=lambda x: (x[0][0], x[0][1])):
             ratio_s = summarize_dist([r["ratio"] for r in rows])
             comp_kernel_s = summarize_dist([r["comp_kernel"] for r in rows])
             dec_kernel_s = summarize_dist([r["dec_kernel"] for r in rows])
 
-            print(
+            line = (
                 f"[ConfigSummary] {engine} {config} n={ratio_s['count']} | "
                 f"ratio(mean/med/p10)={fmt_metric(ratio_s['mean'],2)}/{fmt_metric(ratio_s['median'],2)}/{fmt_metric(ratio_s['p10'],2)}% | "
-                f"Cmbs={fmt_metric(comp_kernel_s['mean'],2)}/{fmt_metric(comp_kernel_s['median'],2)}/{fmt_metric(comp_kernel_s['p10'],2)} | "
-                f"Dmbs={fmt_metric(dec_kernel_s['mean'],2)}/{fmt_metric(dec_kernel_s['median'],2)}/{fmt_metric(dec_kernel_s['p10'],2)}"
+                f"CKmbs={fmt_metric(comp_kernel_s['mean'],2)}/{fmt_metric(comp_kernel_s['median'],2)}/{fmt_metric(comp_kernel_s['p10'],2)} | "
+                f"DKmbs={fmt_metric(dec_kernel_s['mean'],2)}/{fmt_metric(dec_kernel_s['median'],2)}/{fmt_metric(dec_kernel_s['p10'],2)}"
             )
 
-            writer.writerow([
+            csv_row = [
                 engine, config, ratio_s["count"],
                 fmt_csv_metric(ratio_s["mean"], 4), fmt_csv_metric(ratio_s["median"], 4), fmt_csv_metric(ratio_s["p10"], 4), fmt_csv_metric(ratio_s["p90"], 4), fmt_csv_metric(ratio_s["min"], 4), fmt_csv_metric(ratio_s["max"], 4),
                 fmt_csv_metric(comp_kernel_s["mean"], 4), fmt_csv_metric(comp_kernel_s["median"], 4), fmt_csv_metric(comp_kernel_s["p10"], 4), fmt_csv_metric(comp_kernel_s["p90"], 4), fmt_csv_metric(comp_kernel_s["min"], 4), fmt_csv_metric(comp_kernel_s["max"], 4),
                 fmt_csv_metric(dec_kernel_s["mean"], 4), fmt_csv_metric(dec_kernel_s["median"], 4), fmt_csv_metric(dec_kernel_s["p10"], 4), fmt_csv_metric(dec_kernel_s["p90"], 4), fmt_csv_metric(dec_kernel_s["min"], 4), fmt_csv_metric(dec_kernel_s["max"], 4),
-            ])
+            ]
+
+            if has_total:
+                comp_total_s = summarize_dist([r["comp_total"] for r in rows])
+                dec_total_s = summarize_dist([r["dec_total"] for r in rows])
+                line += (
+                    f" | CTmbs={fmt_metric(comp_total_s['mean'],2)}/{fmt_metric(comp_total_s['median'],2)}/{fmt_metric(comp_total_s['p10'],2)}"
+                    f" | DTmbs={fmt_metric(dec_total_s['mean'],2)}/{fmt_metric(dec_total_s['median'],2)}/{fmt_metric(dec_total_s['p10'],2)}"
+                )
+                csv_row.extend([
+                    fmt_csv_metric(comp_total_s["mean"], 4), fmt_csv_metric(comp_total_s["median"], 4), fmt_csv_metric(comp_total_s["p10"], 4), fmt_csv_metric(comp_total_s["p90"], 4), fmt_csv_metric(comp_total_s["min"], 4), fmt_csv_metric(comp_total_s["max"], 4),
+                    fmt_csv_metric(dec_total_s["mean"], 4), fmt_csv_metric(dec_total_s["median"], 4), fmt_csv_metric(dec_total_s["p10"], 4), fmt_csv_metric(dec_total_s["p90"], 4), fmt_csv_metric(dec_total_s["min"], 4), fmt_csv_metric(dec_total_s["max"], 4),
+                ])
+
+            print(line)
+            writer.writerow(csv_row)
 
     print(f"[ConfigSummary] saved: {out_csv}")
 
@@ -581,23 +622,28 @@ def parse_gpu_output(output):
 
 def parse_stable_bench_output(output):
     comp = re.search(
-        r"Bench\s+Compress\s*:\s*kernel_tp=([0-9]+\.?[0-9]*)\s*MB/s\s*ratio=([0-9]+\.?[0-9]*)%",
+        r"Bench\s+Compress\s*:\s*kernel_tp=([0-9]+\.?[0-9]*)\s*MB/s\s*(?:total_tp=([0-9]+\.?[0-9]*)\s*MB/s\s*)?ratio=([0-9]+\.?[0-9]*)%",
         output or "",
         re.IGNORECASE,
     )
     dec = re.search(
-        r"Bench\s+Decompress\s*:\s*kernel_tp=([0-9]+\.?[0-9]*)\s*MB/s\s*verify=(OK|FAIL)",
+        r"Bench\s+Decompress\s*:\s*kernel_tp=([0-9]+\.?[0-9]*)\s*MB/s\s*(?:total_tp=([0-9]+\.?[0-9]*)\s*MB/s\s*)?verify=(OK|FAIL)",
         output or "",
         re.IGNORECASE,
     )
     if not comp or not dec:
         return None
-    return {
-        "ratio": float(comp.group(2)),
+    result = {
+        "ratio": float(comp.group(3)),
         "comp_kernel_tp": float(comp.group(1)),
         "dec_kernel_tp": float(dec.group(1)),
-        "verify_ok": dec.group(2).upper() == "OK",
+        "verify_ok": dec.group(3).upper() == "OK",
     }
+    if comp.group(2):
+        result["comp_total_tp"] = float(comp.group(2))
+    if dec.group(2):
+        result["dec_total_tp"] = float(dec.group(2))
+    return result
 
 
 def run_lzo_cpu(file_path, alg, bs, threads, telemetry=None, bench_seconds=3.0):
@@ -617,6 +663,8 @@ def run_lzo_cpu(file_path, alg, bs, threads, telemetry=None, bench_seconds=3.0):
         'ratio': 0,
         'comp_mbs': 0,
         'dec_mbs': 0,
+        'comp_total_mbs': 0,
+        'dec_total_mbs': 0,
         'comp_time_s': 0,
         'dec_time_s': 0,
         'throughput_semantics': 'op_time_bench',
@@ -640,6 +688,10 @@ def run_lzo_cpu(file_path, alg, bs, threads, telemetry=None, bench_seconds=3.0):
             stats['ratio'] = stable['ratio']
             stats['comp_mbs'] = stable['comp_kernel_tp']
             stats['dec_mbs'] = stable['dec_kernel_tp']
+            if 'comp_total_tp' in stable:
+                stats['comp_total_mbs'] = stable['comp_total_tp']
+            if 'dec_total_tp' in stable:
+                stats['dec_total_mbs'] = stable['dec_total_tp']
             stats['comp_time_s'] = (in_sz / (stats['comp_mbs'] * 1024.0 * 1024.0)) if in_sz > 0 and stats['comp_mbs'] > 0 else 0.0
             stats['dec_time_s'] = (in_sz / (stats['dec_mbs'] * 1024.0 * 1024.0)) if in_sz > 0 and stats['dec_mbs'] > 0 else 0.0
             stats['throughput_semantics'] = 'stable_kernel_bench'
@@ -681,6 +733,8 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
         'ratio': 0,
         'comp_mbs': 0,
         'dec_mbs': 0,
+        'comp_total_mbs': 0,
+        'dec_total_mbs': 0,
         'comp_time_s': 0,
         'dec_time_s': 0,
         'throughput_semantics': 'op_time_bench',
@@ -713,6 +767,10 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
             stats['ratio'] = stable['ratio']
             stats['comp_mbs'] = stable['comp_kernel_tp']
             stats['dec_mbs'] = stable['dec_kernel_tp']
+            if 'comp_total_tp' in stable:
+                stats['comp_total_mbs'] = stable['comp_total_tp']
+            if 'dec_total_tp' in stable:
+                stats['dec_total_mbs'] = stable['dec_total_tp']
             if in_sz > 0 and stats['comp_mbs'] > 0:
                 stats['comp_time_s'] = in_sz / (stats['comp_mbs'] * 1024.0 * 1024.0)
             if in_sz > 0 and stats['dec_mbs'] > 0:
@@ -830,7 +888,8 @@ def main():
                 "File", "FreqPoint", "CPUFreqTargetPct", "GPUFreqTargetPct",
                 "Engine", "Alg", "Level", "BlockSize", "Threads_LSZ",
                 "Ratio%",
-                "CompMBs", "DecMBs", "CompTime_s", "DecTime_s",
+                "CompKernelMBs", "DecKernelMBs", "CompTotalMBs", "DecTotalMBs",
+                "CompTime_s", "DecTime_s",
                 "CPUFreqAvgKernel_MHz", "GPUFreqAvgKernel_MHz",
                 "CompCPUEnergy_J", "CompGPUEnergy_J", "CompCPUPower_W", "CompGPUPower_W",
                 "Roundtrip_OK"
@@ -864,6 +923,8 @@ def main():
                                         fmtf(cpu_stats['ratio'], 2),
                                         fmtf(cpu_stats['comp_mbs'], 2),
                                         fmtf(cpu_stats['dec_mbs'], 2),
+                                        fmtf(cpu_stats.get('comp_total_mbs', 0), 2),
+                                        fmtf(cpu_stats.get('dec_total_mbs', 0), 2),
                                         fmtf(cpu_stats['comp_time_s'], 6),
                                         fmtf(cpu_stats['dec_time_s'], 6),
                                         fmtf(cpu_stats['cpu_freq_avg_mhz'], 2),
@@ -899,6 +960,8 @@ def main():
                                             fmtf(gpu_stats['ratio'], 2),
                                             fmtf(gpu_stats['comp_mbs'], 2),
                                             fmtf(gpu_stats['dec_mbs'], 2),
+                                            fmtf(gpu_stats.get('comp_total_mbs', 0), 2),
+                                            fmtf(gpu_stats.get('dec_total_mbs', 0), 2),
                                             fmtf(gpu_stats['comp_time_s'], 6),
                                             fmtf(gpu_stats['dec_time_s'], 6),
                                             fmtf(gpu_stats['cpu_freq_avg_mhz'], 2),

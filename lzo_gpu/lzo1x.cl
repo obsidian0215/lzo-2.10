@@ -186,28 +186,28 @@ static inline uint lzo1x_hash32(uint dv)
 
 #define DINDEX(dv,p)        ((lzo1x_hash32(dv)) >> (32 - D_BITS))
 
-/* Fingerprinting: 12 bits high for data, 20 bits low for offset (up to 1MB) */
-#define DENTRY(p,in,dv)                       ((lzo_dict_t)(((lzo_uint)pd(p, in) & 0xFFFFF) | ((dv) & 0xFFF00000)))
-#define DENTRY_OFF(off,dv)                    ((lzo_dict_t)(((lzo_uint)(off) & 0xFFFFF) | ((dv) & 0xFFF00000)))
-#define UPDATE_I(dict,index,p,in,dv)          dict[index] = DENTRY(p,in,dv)
+/* 32-bit packed dictionary: epoch_12 (bits 31:20) | offset_20 (bits 19:0) */
+#define DICT_EPOCH_SHIFT 20
+#define DICT_OFF_MASK    0x000FFFFFu
+#define DICT_EPOCH_MASK  0xFFF00000u
 
-static inline void dict_store_packed(__global ulong* dict, uint idx, lzo_dict_t entry, uint epoch)
+static inline void dict_store32(__global uint* dict, uint idx, uint offset, uint epoch)
 {
-    dict[idx] = (((ulong)epoch) << 32) | (ulong)entry;
+    dict[idx] = ((epoch & 0xFFFu) << DICT_EPOCH_SHIFT) | (offset & DICT_OFF_MASK);
 }
 
-static inline lzo_dict_t dict_load_packed(__global const ulong* dict, uint idx, uint epoch, uint* valid)
+static inline uint dict_load32(__global const uint* dict, uint idx, uint epoch, uint* valid)
 {
-    ulong packed = dict[idx];
-    *valid = ((uint)(packed >> 32) == epoch);
-    return (lzo_dict_t)packed;
+    uint entry = dict[idx];
+    *valid = (((entry >> DICT_EPOCH_SHIFT) & 0xFFFu) == (epoch & 0xFFFu));
+    return entry & DICT_OFF_MASK;
 }
 
 
 static lzo_uint
 lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
                    LZO_ADDR_GLOBAL lzo_bytep out, lzo_uintp out_len,
-                    lzo_uint ti, __global ulong *dict, uint epoch)
+                    lzo_uint ti, __global uint *dict, uint epoch)
 {
     LZO_ADDR_GLOBAL const lzo_bytep ip;
     LZO_ADDR_GLOBAL lzo_bytep op;
@@ -241,40 +241,64 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
                 uint4 h_a = dvs_a ^ (dvs_a >> 7); h_a ^= (h_a >> 3); h_a *= 0x9e3779b1u; h_a ^= (h_a >> 16);
                 uint4 idx_a = (h_a >> (32 - D_BITS));
 
-                // Iter 1-8 with Fingerprinting
-                lzo_dict_t ent;
-                uint valid;
-#define CHECK_MATCH_STORE(idx, current_dv) \
-                ent = dict_load_packed(dict, idx, epoch, &valid); \
-                if (valid && ent != 0 && (ent & 0xFFF00000) == (current_dv & 0xFFF00000)) { \
-                    m_off = ent & 0xFFFFF; \
-                    if (ip_off > m_off && (ip_off - m_off) <= M4_MAX_OFFSET) { \
-                        m_pos = in + m_off; \
-                        if (current_dv == UA_GET_LE32(m_pos)) { \
-                            dv = current_dv; saved_dindex = idx; goto match_found; \
-                        } \
-                    } \
-                } \
-                dict_store_packed(dict, idx, DENTRY_OFF(ip_off, current_dv), epoch);
+                // Batch load all 4 dict entries (reads), then check, then batch store (writes)
+                // Separating reads from writes improves memory controller scheduling
+                uint valid0, valid1, valid2, valid3;
+                uint off0 = dict_load32(dict, idx_a.s0, epoch, &valid0);
+                uint off1 = dict_load32(dict, idx_a.s1, epoch, &valid1);
+                uint off2 = dict_load32(dict, idx_a.s2, epoch, &valid2);
+                uint off3 = dict_load32(dict, idx_a.s3, epoch, &valid3);
 
-#define CHECK_MATCH_ONLY(idx, current_dv) \
-                ent = dict_load_packed(dict, idx, epoch, &valid); \
-                if (valid && ent != 0 && (ent & 0xFFF00000) == (current_dv & 0xFFF00000)) { \
-                    m_off = ent & 0xFFFFF; \
-                    if (ip_off > m_off && (ip_off - m_off) <= M4_MAX_OFFSET) { \
-                        m_pos = in + m_off; \
-                        if (current_dv == UA_GET_LE32(m_pos)) { \
-                            dv = current_dv; saved_dindex = idx; goto match_found; \
-                        } \
-                    } \
+                // Check position 0
+                if (valid0 && off0 != 0 && ip_off > off0 && (ip_off - off0) <= M4_MAX_OFFSET) {
+                    m_pos = in + off0;
+                    if (dvs_a.s0 == UA_GET_LE32(m_pos)) {
+                        dv = dvs_a.s0; saved_dindex = idx_a.s0;
+                        dict_store32(dict, idx_a.s0, (uint)ip_off, epoch);
+                        goto match_found;
+                    }
                 }
-
-                CHECK_MATCH_STORE(idx_a.s0, dvs_a.s0);
-                ip++; ip_off++; CHECK_MATCH_STORE(idx_a.s1, dvs_a.s1);
-                ip++; ip_off++; CHECK_MATCH_STORE(idx_a.s2, dvs_a.s2);
-                ip++; ip_off++; CHECK_MATCH_STORE(idx_a.s3, dvs_a.s3);
-#undef CHECK_MATCH_STORE
-#undef CHECK_MATCH_ONLY
+                // Check position 1
+                ip++; ip_off++;
+                if (valid1 && off1 != 0 && ip_off > off1 && (ip_off - off1) <= M4_MAX_OFFSET) {
+                    m_pos = in + off1;
+                    if (dvs_a.s1 == UA_GET_LE32(m_pos)) {
+                        dv = dvs_a.s1; saved_dindex = idx_a.s1;
+                        dict_store32(dict, idx_a.s0, (uint)(ip_off - 1), epoch);
+                        dict_store32(dict, idx_a.s1, (uint)ip_off, epoch);
+                        goto match_found;
+                    }
+                }
+                // Check position 2
+                ip++; ip_off++;
+                if (valid2 && off2 != 0 && ip_off > off2 && (ip_off - off2) <= M4_MAX_OFFSET) {
+                    m_pos = in + off2;
+                    if (dvs_a.s2 == UA_GET_LE32(m_pos)) {
+                        dv = dvs_a.s2; saved_dindex = idx_a.s2;
+                        dict_store32(dict, idx_a.s0, (uint)(ip_off - 2), epoch);
+                        dict_store32(dict, idx_a.s1, (uint)(ip_off - 1), epoch);
+                        dict_store32(dict, idx_a.s2, (uint)ip_off, epoch);
+                        goto match_found;
+                    }
+                }
+                // Check position 3
+                ip++; ip_off++;
+                if (valid3 && off3 != 0 && ip_off > off3 && (ip_off - off3) <= M4_MAX_OFFSET) {
+                    m_pos = in + off3;
+                    if (dvs_a.s3 == UA_GET_LE32(m_pos)) {
+                        dv = dvs_a.s3; saved_dindex = idx_a.s3;
+                        dict_store32(dict, idx_a.s0, (uint)(ip_off - 3), epoch);
+                        dict_store32(dict, idx_a.s1, (uint)(ip_off - 2), epoch);
+                        dict_store32(dict, idx_a.s2, (uint)(ip_off - 1), epoch);
+                        dict_store32(dict, idx_a.s3, (uint)ip_off, epoch);
+                        goto match_found;
+                    }
+                }
+                // No match found: batch store all 4 positions
+                dict_store32(dict, idx_a.s0, (uint)(ip_off - 3), epoch);
+                dict_store32(dict, idx_a.s1, (uint)(ip_off - 2), epoch);
+                dict_store32(dict, idx_a.s2, (uint)(ip_off - 1), epoch);
+                dict_store32(dict, idx_a.s3, (uint)ip_off, epoch);
 
                 ip++;
                 goto literal;
@@ -288,9 +312,8 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
             dindex = DINDEX(dv,ip);
 
             uint valid = 0;
-            lzo_dict_t ent = dict_load_packed(dict, dindex, epoch, &valid);
-            if (valid && ent != 0 && (ent & 0xFFF00000) == (dv & 0xFFF00000)) {
-                m_off = ent & 0xFFFFF;
+            m_off = dict_load32(dict, dindex, epoch, &valid);
+            if (valid && m_off != 0) {
                 if (ip_off > m_off && (ip_off - m_off) <= M4_MAX_OFFSET) {
                     m_pos = in + m_off;
                     if (dv == UA_GET_LE32(m_pos)) {
@@ -300,7 +323,7 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
                 }
             }
 
-            dict_store_packed(dict, dindex, DENTRY_OFF(ip_off,dv), epoch);
+            dict_store32(dict, dindex, (uint)ip_off, epoch);
 
             goto literal;
         }
@@ -399,7 +422,7 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
         }
 m_len_done:
         /* Update dictionary entry with current position */
-        dict_store_packed(dict, saved_dindex, DENTRY(ip,in,dv), epoch);
+        dict_store32(dict, saved_dindex, (uint)pd(ip, in), epoch);
 
         m_off = pd(ip,m_pos);
         ip += m_len;
@@ -479,7 +502,7 @@ static __global uchar* lzo1x_compress_terminate(__global const uchar* ip, uint i
     return op;
 }
 
-static void do_compress(__global const uchar* in, uint in_len, __global uchar* out, lzo_uintp out_len, lzo_uint ti, __global ulong *dict, uint epoch)
+static void do_compress(__global const uchar* in, uint in_len, __global uchar* out, lzo_uintp out_len, lzo_uint ti, __global uint *dict, uint epoch)
 {
     lzo_uint t = ti;
     __global uchar* op = out;
@@ -500,7 +523,7 @@ __kernel void lzo1x_block_compress(__global const uchar *in ,
                                    const uint  in_sz,
                                    const uint  blk_size,
                                    const uint  worst_blk,
-                                   __global ulong *dict_pool,
+                                   __global uint *dict_pool,
                                    const uint  dict_pool_size,
                                    const uint  epoch_base)
 {
@@ -511,7 +534,7 @@ __kernel void lzo1x_block_compress(__global const uchar *in ,
 
     if (wi >= dict_pool_size) return;
 
-    __global ulong *dict = dict_pool + ((size_t)wi * dict_elems);
+    __global uint *dict = dict_pool + ((size_t)wi * dict_elems);
 
     for (uint b = wi; b < total_blocks; b += total_wi) {
         uint epoch = epoch_base + b + 1u;

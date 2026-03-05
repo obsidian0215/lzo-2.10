@@ -671,7 +671,7 @@ static int lzo_compress_core_pipeline(
         cl_uint cus = 0;
         cl_ulong global_mem = 0;
         cl_ulong max_alloc = 0;
-        size_t dict_per_block = (1ULL << params->level) * sizeof(uint64_t);
+        size_t dict_per_block = (1ULL << params->level) * sizeof(uint32_t);
         size_t occ_cap = 0;
         size_t mem_cap = 0;
         size_t safe_mem = 0;
@@ -740,7 +740,7 @@ static int lzo_compress_core_pipeline(
     }
 
     if (ws->comp_epoch_base == 0) ws->comp_epoch_base = 1;
-    if (ws->comp_epoch_base > (uint32_t)(UINT32_MAX - (uint32_t)nblk - 2U)) {
+    if ((uint32_t)nblk + 2U >= 4095U || ws->comp_epoch_base + (uint32_t)nblk + 1U > 4095U) {
         if (d_dict && d_dict_cap > 0) {
             (void)lzo_zero_buffer(queue, d_dict, d_dict_cap);
         }
@@ -1204,7 +1204,7 @@ int lzo_compress_core(
         cl_uint cus = 0;
         cl_ulong global_mem = 0;
         cl_ulong max_alloc = 0;
-        size_t dict_per_block = (1ULL << params->level) * sizeof(uint64_t);
+        size_t dict_per_block = (1ULL << params->level) * sizeof(uint32_t);
         size_t occ_cap = 0;
         size_t mem_cap = 0;
         size_t safe_mem = 0;
@@ -1263,7 +1263,7 @@ int lzo_compress_core(
     }
 
     if (ws->comp_epoch_base == 0) ws->comp_epoch_base = 1;
-    if (ws->comp_epoch_base > (uint32_t)(UINT32_MAX - (uint32_t)nblk - 2U)) {
+    if ((uint32_t)nblk + 2U >= 4095U || ws->comp_epoch_base + (uint32_t)nblk + 1U > 4095U) {
         if (ws->d_dict && ws->dict_size > 0) {
             (void)lzo_zero_buffer(queue, ws->d_dict, ws->dict_size);
         }
@@ -1273,8 +1273,8 @@ int lzo_compress_core(
     ws->comp_epoch_base += (uint32_t)nblk + 1U;
 
     {
-        /* Packed dictionary stores {epoch, entry} in one 64-bit slot per hash entry. */
-        size_t dict_per_block = (1ULL << params->level) * sizeof(uint64_t);
+        /* 32-bit packed dictionary: epoch_12|offset_20 in one uint32 per hash entry. */
+        size_t dict_per_block = (1ULL << params->level) * sizeof(uint32_t);
         size_t total_dict_size = (size_t)pool_size * dict_per_block;
         size_t prev_dict_size = ws->dict_size;
 
