@@ -822,10 +822,14 @@ static int run_stable_kernel_bench(const unsigned char *data, size_t size,
     size_t n = 0;
     double *comp_tp = (double *)malloc(cap * sizeof(double));
     double *dec_tp = (double *)malloc(cap * sizeof(double));
+    double *comp_total_tp = (double *)malloc(cap * sizeof(double));
+    double *dec_total_tp = (double *)malloc(cap * sizeof(double));
     double *ratio_pct = (double *)malloc(cap * sizeof(double));
-    if (!comp_tp || !dec_tp || !ratio_pct) {
+    if (!comp_tp || !dec_tp || !comp_total_tp || !dec_total_tp || !ratio_pct) {
         free(comp_tp);
         free(dec_tp);
+        free(comp_total_tp);
+        free(dec_total_tp);
         free(ratio_pct);
         fprintf(stderr, "Bench error: malloc failed\n");
         return 1;
@@ -842,14 +846,18 @@ static int run_stable_kernel_bench(const unsigned char *data, size_t size,
         double comp_ms = 0.0;
         size_t total_comp = 0;
 
+        struct timespec ts_iter_comp_start, ts_iter_comp_end;
+        clock_gettime(clk, &ts_iter_comp_start);
         int rc = compress_multi(data, size, block_size, threads, level,
                                 &chunks, &chunk_count, &comp_ms, &total_comp);
+        clock_gettime(clk, &ts_iter_comp_end);
         if (rc != LZO_E_OK) {
             fprintf(stderr, "Bench error: compress failed (%d)\n", rc);
             free_compression_chunks(chunks, chunk_count);
             verify_ok = 0;
             break;
         }
+        double comp_wall_ms = diff_ms_ts(&ts_iter_comp_start, &ts_iter_comp_end);
 
         unsigned char *out = (unsigned char *)malloc(size ? size : 1u);
         if (!out) {
@@ -864,10 +872,14 @@ static int run_stable_kernel_bench(const unsigned char *data, size_t size,
         }
 
         double decomp_ms = 0.0;
+        struct timespec ts_iter_dec_start, ts_iter_dec_end;
+        clock_gettime(clk, &ts_iter_dec_start);
         rc = decompress_multi(chunks, chunk_count, threads, g_alg, &decomp_ms);
+        clock_gettime(clk, &ts_iter_dec_end);
         if (rc != LZO_E_OK || memcmp(out, data, size) != 0) {
             verify_ok = 0;
         }
+        double dec_wall_ms = diff_ms_ts(&ts_iter_dec_start, &ts_iter_dec_end);
 
         if (n == cap) {
             size_t new_cap = cap * 2;
@@ -889,6 +901,24 @@ static int run_stable_kernel_bench(const unsigned char *data, size_t size,
             }
             dec_tp = new_dec;
 
+            double *new_comp_total = (double *)realloc(comp_total_tp, new_cap * sizeof(double));
+            if (!new_comp_total) {
+                free(out);
+                free_compression_chunks(chunks, chunk_count);
+                verify_ok = 0;
+                break;
+            }
+            comp_total_tp = new_comp_total;
+
+            double *new_dec_total = (double *)realloc(dec_total_tp, new_cap * sizeof(double));
+            if (!new_dec_total) {
+                free(out);
+                free_compression_chunks(chunks, chunk_count);
+                verify_ok = 0;
+                break;
+            }
+            dec_total_tp = new_dec_total;
+
             double *new_ratio = (double *)realloc(ratio_pct, new_cap * sizeof(double));
             if (!new_ratio) {
                 free(out);
@@ -902,6 +932,8 @@ static int run_stable_kernel_bench(const unsigned char *data, size_t size,
 
         comp_tp[n] = (comp_ms > 0.0) ? (size / 1048576.0) / (comp_ms / 1000.0) : 0.0;
         dec_tp[n] = (decomp_ms > 0.0) ? (size / 1048576.0) / (decomp_ms / 1000.0) : 0.0;
+        comp_total_tp[n] = (comp_wall_ms > 0.0) ? (size / 1048576.0) / (comp_wall_ms / 1000.0) : 0.0;
+        dec_total_tp[n] = (dec_wall_ms > 0.0) ? (size / 1048576.0) / (dec_wall_ms / 1000.0) : 0.0;
         ratio_pct[n] = size ? (100.0 * (double)total_comp / (double)size) : 0.0;
         n++;
 
@@ -921,6 +953,8 @@ static int run_stable_kernel_bench(const unsigned char *data, size_t size,
     if (n == 0) {
         free(comp_tp);
         free(dec_tp);
+        free(comp_total_tp);
+        free(dec_total_tp);
         free(ratio_pct);
         fprintf(stderr, "Bench error: no valid iterations\n");
         return 1;
@@ -928,14 +962,18 @@ static int run_stable_kernel_bench(const unsigned char *data, size_t size,
 
     double comp_med = median_double(comp_tp, n);
     double dec_med = median_double(dec_tp, n);
+    double comp_total_med = median_double(comp_total_tp, n);
+    double dec_total_med = median_double(dec_total_tp, n);
     double ratio_med = median_double(ratio_pct, n);
 
-    fprintf(stderr, "Bench Compress : kernel_tp=%.2f MB/s ratio=%.2f%%\n", comp_med, ratio_med);
-    fprintf(stderr, "Bench Decompress : kernel_tp=%.2f MB/s verify=%s\n", dec_med, verify_ok ? "OK" : "FAIL");
+    fprintf(stderr, "Bench Compress : kernel_tp=%.2f MB/s total_tp=%.2f MB/s ratio=%.2f%%\n", comp_med, comp_total_med, ratio_med);
+    fprintf(stderr, "Bench Decompress : kernel_tp=%.2f MB/s total_tp=%.2f MB/s verify=%s\n", dec_med, dec_total_med, verify_ok ? "OK" : "FAIL");
     fprintf(stderr, "Bench Summary : iterations=%zu seconds=%.2f\n", n, elapsed);
 
     free(comp_tp);
     free(dec_tp);
+    free(comp_total_tp);
+    free(dec_total_tp);
     free(ratio_pct);
     return verify_ok ? 0 : 1;
 }

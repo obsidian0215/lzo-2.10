@@ -72,6 +72,6 @@ exp_results/
 build/
 param_scan_*/
 archived/
-lzo_hybrid/
-lzo_gpu/tools/benchmark_bandwidth
+lzo_hybrid/lzo_hybrid
+lzo_hybrid/*.cl
 # end

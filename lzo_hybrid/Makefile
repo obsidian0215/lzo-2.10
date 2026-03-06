@@ -1,0 +1,39 @@
+CC ?= gcc
+CFLAGS = -std=gnu11 -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 -DNDEBUG
+
+CPU_DIR = ../lzo_cpu
+GPU_DIR = ../lzo_gpu
+
+CPPFLAGS = -I$(CPU_DIR) -I$(CPU_DIR)/src -I$(CPU_DIR)/include -I$(CPU_DIR)/include/lzo \
+           -I$(GPU_DIR)
+
+LDFLAGS = -lOpenCL -lm -lpthread
+
+CPU_SRCS = $(CPU_DIR)/lzo1x_1.c $(CPU_DIR)/lzo1x_1k.c $(CPU_DIR)/lzo1x_1l.c \
+           $(CPU_DIR)/lzo1x_1o.c $(CPU_DIR)/lzo1x_d1.c $(CPU_DIR)/lzo1x_d2.c \
+           $(CPU_DIR)/lzo1y_1.c $(CPU_DIR)/lzo1y_d1.c $(CPU_DIR)/lzo1y_d2.c \
+           $(CPU_DIR)/src/lzo_init.c $(CPU_DIR)/src/lzo_ptr.c \
+           $(CPU_DIR)/src/lzo_str.c $(CPU_DIR)/src/lzo_util.c $(CPU_DIR)/src/lzo_crc.c
+
+GPU_UTILS_SRC = $(GPU_DIR)/lzo_gpu_utils.c
+
+HYBRID_SRCS = lzo_hybrid.c lzo_hybrid_core.c
+
+all: symlinks lzo_hybrid
+
+lzo_hybrid: $(HYBRID_SRCS) $(GPU_UTILS_SRC) $(CPU_SRCS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $(HYBRID_SRCS) $(GPU_UTILS_SRC) $(CPU_SRCS) $(LDFLAGS)
+
+symlinks:
+	@for f in $(GPU_DIR)/*.cl $(GPU_DIR)/*.clbin; do \
+		bn=$$(basename "$$f"); \
+		if [ ! -e "$$bn" ]; then ln -sf "$$f" "$$bn"; fi; \
+	done
+
+clean:
+	rm -f lzo_hybrid *.o
+
+distclean: clean
+	rm -f *.cl *.clbin
+
+.PHONY: all clean distclean symlinks
