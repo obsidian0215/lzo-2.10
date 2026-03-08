@@ -72,7 +72,7 @@ win32-lccwin32:
 	lc -A -unused -O $(CPPFLAGS) $(SOURCES)
 
 win32-mingw32 win32-mingw:
-	gcc $(CPPFLAGS) $(GCC_CFLAGS) -o $(PROGRAM).exe $(SOURCES)
+	$(CC) $(CPPFLAGS) $(GCC_CFLAGS) -o $(PROGRAM).exe $(SOURCES)
 
 win32-visualc win32-vc:
 	cl -nologo -MT -W3 -O2 -GF $(CPPFLAGS) $(SOURCES)

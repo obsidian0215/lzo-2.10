@@ -361,8 +361,15 @@ static void *compress_worker(void *opaque) {
     compress_job_t *job = (compress_job_t *)opaque;
     lzo_align_t *thread_wrkmem = NULL;
     int have_wrkmem = 0;
+#if defined(_WIN32) || defined(_WIN64)
+    #define LZO_CPU_ALIGNED_ALLOC(ptr, align, size) (((*(void**)(ptr) = _aligned_malloc((size), (align))) == NULL) ? -1 : 0)
+    #define LZO_CPU_ALIGNED_FREE(ptr) _aligned_free((ptr))
+#else
+    #define LZO_CPU_ALIGNED_ALLOC(ptr, align, size) posix_memalign((void **)(ptr), (align), (size))
+    #define LZO_CPU_ALIGNED_FREE(ptr) free((ptr))
+#endif
     /* try to allocate per-thread workspace to reuse across compress calls */
-    if (posix_memalign((void **)&thread_wrkmem, sizeof(lzo_align_t), LZO_WORK_MEM_SIZE) == 0) {
+    if (LZO_CPU_ALIGNED_ALLOC((void **)&thread_wrkmem, sizeof(lzo_align_t), LZO_WORK_MEM_SIZE) == 0) {
         have_wrkmem = 1;
     } else {
         thread_wrkmem = NULL;
@@ -429,7 +436,7 @@ static void *compress_worker(void *opaque) {
             ck->comp_size = out_len;
         }
     }
-    if (have_wrkmem && thread_wrkmem) free(thread_wrkmem);
+    if (have_wrkmem && thread_wrkmem) LZO_CPU_ALIGNED_FREE(thread_wrkmem);
     return NULL;
 }
 

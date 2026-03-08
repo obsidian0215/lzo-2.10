@@ -1,6 +1,6 @@
 # LZO Hybrid 实现：设计、优化与三引擎全量性能对比
 
-更新时间：2026-03-07
+更新时间：2026-03-09（测量语义二次修正后）
 
 ---
 
@@ -23,7 +23,7 @@
 
 1. **吞吐量最大化**：利用 CPU+GPU 并行流水线超越纯 GPU 和纯 CPU 的端到端吞吐量
 2. **灵活配比**：`gpu_ratio` 参数控制 GPU/CPU 工作分配比例（0.0 = 纯 CPU, 1.0 = 纯 GPU）
-3. **压缩率不退化**：GPU 和 CPU 使用相同的 LZO 算法，产出互相兼容的块格式
+3. **算法兼容性优先**：GPU 和 CPU 使用相同的 LZO 算法，产出互相兼容的块格式；但系统级压缩率仍可能因 hybrid 容器和分路策略而劣于纯 CPU/GPU
 4. **能效对比**：在不同频率下评估三种引擎的能效特性
 
 ---
@@ -101,7 +101,7 @@ GPU 内核直接复用 `lzo_gpu` 的实现，包含以下核心组件：
 | **OpenCL 缓冲区管理** | grow-only 策略（只增不减），避免 CL buffer alloc/release 开销 |
 | **非阻塞传输** | `clEnqueueWriteBuffer(non_blocking)` + `clFinish()` |
 | **内核参数缓存** | 只在缓冲区增长时重设 kernel arg |
-| **内存基准模式** | `--bench` 模式使用内存循环替代文件 I/O，total_tp 与 kernel_tp 误差 < 1 MB/s |
+| **双基准模式** | `--bench` 保留历史内存循环语义；当前新增 `--bench-io` 作为正式 total-throughput 口径，在 warmed process 内执行真实 file-backed compress→write / read→decompress→write 循环 |
 
 ---
 
@@ -123,7 +123,9 @@ GPU 内核直接复用 `lzo_gpu` 的实现，包含以下核心组件：
 
 初始实现中 total_tp 远低于 kernel_tp（差距可达 50%），原因是 bench 循环包含文件 I/O 开销。
 
-**解决方案**：重写 bench 循环为纯内存操作——首次从文件读入缓冲区后，后续迭代直接操作内存中的数据。优化后 total_tp 与 kernel_tp 差距 < 1 MB/s。
+**第一阶段解决方案**：重写 bench 循环为纯内存操作——首次从文件读入缓冲区后，后续迭代直接操作内存中的数据。这个阶段性优化对剥离内核与主机端差异很有价值。
+
+**当前最终口径补充**：在本轮 methodology correction 中，又新增了真正的 `--bench-io`，因为纯内存循环虽然适合做历史性能剖析，但不足以作为最终 system-level total throughput 的 ground truth。当前文档里的正式 total-throughput 结论一律以 warmed in-binary `--bench-io` 为准。
 
 ### 3.3 解压分发修复
 
@@ -148,7 +150,7 @@ GPU 内核直接复用 `lzo_gpu` 的实现，包含以下核心组件：
 
 ---
 
-## 4. 全量实验设计
+## 4. 全量实验设计（历史矩阵存档 + 当前 corrected run 入口）
 
 ### 4.1 测试矩阵
 
@@ -158,7 +160,14 @@ GPU 内核直接复用 `lzo_gpu` 的实现，包含以下核心组件：
 | GPU | 2 算法 × 6 (BS×LSZ) 组合 × 1 Level | 12 |
 | HYBRID | 2 算法 × 3 BS × 7 gpu_ratio × 3 cpu_threads | 126 |
 
-每个配置在 3 个频率点（40%, 70%, 100%）测试，共 84 个测试文件（~7.3GB 总大小）。
+下表保留的是 **第一轮全量 sweep 的历史矩阵**，用于说明 hybrid 参数空间是如何逐步铺开的；它对理解实现演进仍有价值，但**不再作为当前对外结论的证据来源**。
+
+当前有效结论只引用：
+
+- CPU/GPU baseline：`/root/lzo-2.10/exp_results/runs/20260307_221942/lzo_param_sweep.csv`
+- hybrid corrected rerun：`/root/lzo-2.10/exp_results/runs/20260308_171419/lzo_param_sweep.csv`
+
+历史 sweep 中每个配置曾在 3 个频率点（40%, 70%, 100%）测试，共 84 个测试文件（~7.3GB 总大小）。
 
 | 数据集 | 行数 | 运行目录 |
 |--------|------|---------|
@@ -171,211 +180,185 @@ GPU 内核直接复用 `lzo_gpu` 的实现，包含以下核心组件：
 
 | 指标 | 单位 | 说明 |
 |------|------|------|
-| CompKernelMBs | MB/s | 压缩内核吞吐量（不含主机端开销） |
-| DecKernelMBs | MB/s | 解压内核吞吐量 |
-| CompTotalMBs | MB/s | 压缩端到端总吞吐量（含 OCL 初始化、缓冲区管理） |
-| DecTotalMBs | MB/s | 解压端到端总吞吐量 |
+| CompKernelMBs | MB/s | 压缩编解码吞吐量（由 `max(cpu_kernel_us, gpu_kernel_us)` 计算，表示 hybrid 下真实 codec 执行跨度，不含 file I/O 与纯 host coordination） |
+| DecKernelMBs | MB/s | 解压编解码吞吐量（语义同上） |
+| CompTotalMBs | MB/s | 压缩端到端总吞吐量（当前正式结论以 warmed in-binary `--bench-io` 的真实 file-backed wall-time 为准，包含运行时与文件路径开销，但不重复计入一次性冷启动） |
+| DecTotalMBs | MB/s | 解压端到端总吞吐量（语义同上） |
 | Ratio% | % | 压缩后大小/原始大小 × 100 |
 | CompCPUEnergy_J | J | 压缩期间 CPU RAPL 能耗 |
 | CompGPUEnergy_J | J | 压缩期间 GPU RAPL (uncore) 能耗 |
 
 ---
 
-## 5. 全量实验结果
+## 5. 修正后的全量实验结果（当前有效结论）
 
-### 5.1 聚合对比：中位数指标（最佳配置/文件）
+### 5.1 为什么必须重写这一节
 
-频率 100% 下，每个引擎对每个文件取最佳 CompTotalMBs 配置，然后对 84 个文件取中位数：
+旧版本第 5 节的主结论是：
 
-| 引擎 | 算法 | CompKern (MB/s) | DecKern (MB/s) | CompTotal (MB/s) | DecTotal (MB/s) | Ratio% |
-|------|------|----------------|----------------|-------------------|-------------------|--------|
-| CPU | lzo1x | 2,040 | 1,786 | 2,035 | 1,786 | 21.66% |
-| CPU | lzo1y | 1,987 | 1,766 | 1,981 | 1,766 | 21.87% |
-| GPU | lzo1x | 5,774 | 12,093 | 2,589 | 4,553 | 21.23% |
-| GPU | lzo1y | 5,760 | 11,684 | 2,554 | 4,553 | 21.42% |
-| **HYBRID** | **lzo1x** | **4,615** | **5,200** | **3,892** | **5,109** | **21.22%** |
-| **HYBRID** | **lzo1y** | **4,811** | **5,100** | **3,879** | **4,940** | **21.42%** |
+- Hybrid 压缩 total throughput 100% 胜出；
+- Hybrid 是三引擎综合最优。
 
-**关键发现：**
-- Hybrid 压缩总吞吐量 3,892 MB/s 相比 GPU 的 2,589 MB/s 提升 **50.3%**，相比 CPU 的 2,035 MB/s 提升 **91.2%**
-- Hybrid 解压总吞吐量 5,109 MB/s 相比 GPU 的 4,553 MB/s 提升 **12.2%**，相比 CPU 的 1,786 MB/s 提升 **186%**
-- 压缩率三者基本一致（~21%），GPU 和 Hybrid 的 16K/32K 块大小略高（0.4pp），可忽略
+这些结论已经与当前 corrected methodology 和当前 live 结果冲突，因此必须整体替换。
 
-### 5.2 胜率统计（freq=100%, 84 文件 × 2 算法 = 168 对比）
+### 5.2 当前结果文件
 
-| 指标 | HYBRID 胜 | GPU 胜 | CPU 胜 |
-|------|-----------|--------|--------|
-| 压缩总吞吐量 | **168 (100%)** | 0 | 0 |
-| 解压总吞吐量 | **145 (86.3%)** | 23 (13.7%) | 0 |
+- CPU/GPU baseline：`/root/lzo-2.10/exp_results/runs/20260307_221942/lzo_param_sweep.csv`
+- Hybrid corrected run：`/root/lzo-2.10/exp_results/runs/20260308_171419/lzo_param_sweep.csv`
 
-**Hybrid 在压缩总吞吐量上 100% 胜出。** 解压中 GPU 在部分高压缩率小文件上胜出（见 5.6 节分析）。
+### 5.3 当前 best-per-engine medians
 
-### 5.3 加速比：各引擎 vs CPU（freq=100%）
+| Engine | Comp total MB/s | Dec total MB/s | Comp kernel MB/s | Dec kernel MB/s | Ratio % | Comp power W |
+|---|---:|---:|---:|---:|---:|---:|
+| CPU | 824.76 | 690.77 | 3149.84 | 1667.99 | 13.93 | 14.12 |
+| **GPU** | **1501.12** | **811.37** | **9242.84** | **16692.40** | 13.95 | **13.67** |
+| Hybrid fixed | 883.18 | 680.84 | 2205.38 | 1790.59 | 22.79 | 15.74 |
+| Hybrid adaptive | 824.87 | 716.77 | 1745.84 | 1673.55 | 22.74 | 15.04 |
 
-#### 5.3.1 vs CPU 最佳（T=3）
+### 5.4 Winner counts
 
-| 对比 | lzo1x 中位数 | lzo1y 中位数 |
-|------|-------------|-------------|
-| GPU/CPU Compress | 1.31x | 1.34x |
-| GPU/CPU Decomp | 2.96x | 2.93x |
-| **HYB/CPU Compress** | **1.88x** | **1.91x** |
-| **HYB/CPU Decomp** | **3.29x** | **3.25x** |
-| HYB/GPU Compress | 1.45x | 1.44x |
-| HYB/GPU Decomp | 1.12x | 1.12x |
+**Compression total throughput**：
 
-#### 5.3.2 vs CPU 单线程（T=1）和双线程（T=2）
+- GPU：**32**
+- CPU：**3**
+- Hybrid fixed：**1**
+- Hybrid adaptive：**0**
 
-| 对比 | lzo1x Compress | lzo1x Decomp |
-|------|---------------|--------------|
-| GPU vs CPU@T=1 | med=3.79x, max=7.69x | med=8.63x, max=11.34x |
-| GPU vs CPU@T=2 | med=1.92x, max=3.86x | med=4.39x, max=5.77x |
-| **HYB vs CPU@T=1** | **med=5.55x, max=8.44x** | **med=9.53x, max=16.10x** |
-| **HYB vs CPU@T=2** | **med=2.80x, max=4.23x** | **med=4.91x, max=8.20x** |
+**Decompression total throughput**：
 
-**Hybrid vs CPU@T=1 压缩达到 5.55x、解压达到 9.53x 加速比。即使 vs CPU@T=2 仍有 2.80x 压缩、4.91x 解压优势。**
+- GPU：**29**
+- CPU：**1**
+- Hybrid fixed：**2**
+- Hybrid adaptive：**4**
 
-### 5.4 最优 gpu_ratio 分布
+### 5.5 Fixed vs adaptive
 
-对 84 个文件 × 2 算法 = 168 个对比点（freq=100%，以 CompTotalMBs 选最优配置）：
+**Raw median across all hybrid rows**：
 
-| gpu_ratio | 出现次数 (lzo1x) | 出现次数 (lzo1y) | 合计 | 占比 |
-|-----------|-----------------|-----------------|------|------|
-| 0.0 (纯CPU) | 25 | 25 | 50 | 29.8% |
-| 0.5 | 6 | 5 | 11 | 6.5% |
-| 0.7 | 6 | 5 | 11 | 6.5% |
-| 0.8 | 12 | 13 | 25 | 14.9% |
-| 0.9 | 14 | 13 | 27 | 16.1% |
-| 0.95 | 7 | 10 | 17 | 10.1% |
-| 1.0 (纯GPU) | 14 | 13 | 27 | 16.1% |
+| Mode | Comp total MB/s | Dec total MB/s |
+|---|---:|---:|
+| Fixed | **495.81** | **516.75** |
+| Adaptive | 460.57 | 428.35 |
 
-**最优线程数分布：** T=4 占 85.7%（72/84），T=2 占 9.5%，T=1 占 4.8%
+**Best-per-file median**：
 
-**关键规律：**
-- **高压缩率文件**（ratio < 5%, 如 influxdb-bench, sample_zero, sample_repeat）：最优 ratio = **0.0**（纯 CPU with T=4）。原因：这些文件 CPU 压缩速度极快（>15,000 MB/s），GPU 的 OCL 开销反而成为瓶颈
-- **中等压缩率文件**（ratio 15-35%, 如 elasticsearch, redis-video）：最优 ratio = **0.7-0.9**。CPU+GPU 真正并行发挥作用
-- **低压缩率文件**（ratio > 50%, 如 dickens, sao, webster）：最优 ratio = **0.9-0.95**。GPU 主导，CPU 处理少量块补充
-- **小文件且高度可压缩**（如 sample_6.80mb_zero）：最优 ratio = **0.0**（OCL 启动开销 > GPU 并行收益）
+| Mode | Comp total MB/s | Dec total MB/s |
+|---|---:|---:|
+| Fixed | **883.18** | 680.84 |
+| Adaptive | 824.87 | **716.77** |
 
-### 5.5 能效对比
+### 5.6 当前正确解读
 
-#### 5.5.1 每 MB 能耗（J/MB, 压缩, 中位数）
+当前 corrected 结果的结论需要分两层理解：
 
-| 引擎 | freq=40% | freq=70% | freq=100% |
-|------|---------|---------|----------|
-| CPU | 0.00706 | 0.00708 | 0.00707 |
-| GPU | 0.00316 | 0.00304 | 0.00301 |
-| HYBRID | 0.00418 | 0.00443 | 0.00413 |
+1. **GPU 仍是 LZO family 的总吞吐冠军**；
+2. **此前 hybrid 被严重低估，原因是旧 Python harness 用额外 outer-process file-backed runs 覆盖了 binary 自己的 repeated-loop totals**；
+3. **在新的 warmed in-binary `--bench-io` 语义下，Hybrid 已不再“异常差”，但仍不足以推翻 GPU 的默认最佳引擎地位**；
+4. **Adaptive 当前更准确地表现为：解压优于 fixed，压缩不如 fixed。**
 
-**GPU 能效最优**（0.00301 J/MB），是 CPU 的 2.35x。Hybrid 介于两者之间（0.00413 J/MB），比 CPU 节能 42%。
+因此旧文档中的 “Hybrid 在压缩 total 上 100% 胜出” 必须废弃；上一版把 hybrid 写得过度悲观的结论也必须废弃。
 
-注意：GPU 能耗通过 RAPL uncore 测量，读数极低（~0.001-0.003W），实际 GPU 功耗可能更高。CPU 能耗（RAPL package-0）包含所有 CPU 核心的功耗。
+## 6. 最优配置推荐（按当前 corrected 结果重写）
 
-#### 5.5.2 总功率（W, 压缩期间）
+### 6.1 当前默认推荐
 
-| 引擎 | CPU Power (W) | GPU Power (W) |
-|------|--------------|---------------|
-| CPU | 14.3 | ~0 |
-| GPU | 18.3 | ~0.003 |
-| HYBRID | 19.3 | ~0.003 |
+如果目标是当前平台上的实际部署默认值，则推荐：
 
-GPU 和 Hybrid 的 CPU 功率高于纯 CPU 的原因：iGPU 共享内存带宽，OpenCL 运行时本身也消耗 CPU 资源。
+- **默认引擎**：GPU-only
+- **理由**：当前 corrected total throughput、ratio、power 三项综合最优
 
-### 5.6 频率敏感度
+### 6.2 Hybrid 的当前合理定位
 
-freq=40% 到 freq=100% 的吞吐量变化（中位数）：
+Hybrid 不再适合作为默认推荐路径，但仍适合作为：
 
-| 引擎 | CompTotal 变化 | DecTotal 变化 |
-|------|---------------|--------------|
-| CPU | 1.00x（无变化） | 1.00x |
-| GPU | 1.02x（微增） | 1.01x |
-| HYBRID | 1.00x | 1.00x |
+- CPU/GPU 协同研究路径
+- adaptive split 研究平台
+- 某些未来更低开销调度器的基础实现
 
-**所有三个引擎对频率变化不敏感。** 这证实 LZO 压缩/解压是内存带宽受限（memory-bound）而非计算受限。即使 GPU 频率从 40% 提升到 100%，吞吐量几乎不变。
+### 6.3 Adaptive 的推荐理解方式
 
-### 5.7 典型现象分析
+当前 adaptive 的作用不是“让 hybrid 逆袭 GPU”，而是：
 
-#### 现象 1：纯 CPU 在高压缩率文件上胜出
+- 在 hybrid 自身内部提供另一种 split 选择；
+- 在当前结果中，**decompression best-per-file 优于 fixed**，但 **compression 仍落后 fixed**；
+- 为后续更强调度策略保留真实实现入口。
 
-influxdb-bench 和 sample_zero/repeat 文件的最优配置为 R=0.0（纯 CPU T=4），压缩吞吐量达 15,000-27,000 MB/s。
+## 7. 压缩率对比（按 corrected 结果更新）
 
-**原因：** 这些文件数据高度规律（零、重复模式），CPU 的 LZO 压缩器可以用极少的哈希表查找和极长的匹配拷贝完成压缩。CPU 分支预测器和 L1/L2 缓存在此类数据上效率极高。相比之下，GPU 的 OpenCL 启动开销（缓冲区分配、数据传输、内核启动）在总时间中占比过大。
+当前 corrected best-per-engine medians：
 
-#### 现象 2：GPU 解压在部分文件上胜出 Hybrid
+| 引擎 | Ratio% |
+|------|-------:|
+| CPU | 13.93 |
+| GPU | 13.95 |
+| Hybrid fixed | 22.79 |
+| Hybrid adaptive | 22.74 |
 
-23 个解压对比点中 GPU 胜出。这些多为小文件（< 10MB）且中高压缩率。
+这与旧文档“压缩率三者基本一致”的结论已经不同。
 
-**原因：** 小文件块数少，CPU 路径的线程创建和同步开销占比大。当文件只有几十个块时，CPU 分得的块很少，线程启动成本无法被摊平。纯 GPU 路径没有 pthreads 开销，反而更高效。
+当前正确解释为：
 
-#### 现象 3：Hybrid 总吞吐量 >> Hybrid 内核吞吐量（在 R=1.0 时）
+- CPU 与 GPU 压缩率几乎等价；
+- Hybrid 两种模式的 ratio 明显更差；
+- 这说明当前 hybrid 容器与分路策略会带来实际 ratio 成本，而不能再被视作“几乎免费”的协同方式。
 
-当 R=1.0（纯 GPU via hybrid 路径）时，kernel_tp 远高于 total_tp（如 compress: kernel=9,400 MB/s, total=5,800 MB/s）。
+## 7.1 CPU OpenCL 路径的当前定位
 
-**原因：** kernel_tp 只计内核执行时间，total_tp 包含 OpenCL 缓冲区操作和数据传输。这个差距正是 `lzo_gpu` 主机端优化（grow-only buffer、非阻塞传输、kernel arg 缓存）努力缩小但仍然存在的 OCL 运行时开销。
+本轮还专门验证了“CPU 是否也应复用 OpenCL backend”的问题。当前代码通过 `FORCE_OPENCL_DEVICE=CPU` 已支持在 Intel CPU OpenCL 设备上运行同一套 OpenCL 路径，结果表明：
 
-#### 现象 4：最优块大小几乎都是 64K
+- **可运行且正确**；
+- 在 `dickens`、`industrial_parent_0_pages_img.tar` 等代表性 case 上，CPU OpenCL 可以接近甚至短暂超过 GPU OpenCL；
+- 但它没有稳定优于当前 native CPU path，也没有证明能把 hybrid 拉升到超过 GPU-only 的排序。
 
-84 个文件中约 70% 的最优配置使用 64K 块大小。
+因此当前文档应把 CPU OpenCL 写成 **已验证的可行性/移植性结果**，而不是默认保留的主设计。
 
-**原因：** 64K 块提供最佳压缩率（长匹配窗口），且块数减少意味着更少的 OpenCL 内核调度和块头开销。虽然 16K 块提供更多并行度（更多 work-items），但块间调度开销抵消了并行收益。只有在极小文件上 16K/32K 才偶尔胜出。
+## 8. 当前结论
 
----
+1. **LZO hybrid 的系统结构和实现细节仍然重要**：CPU/GPU 分路、atomic 工作窃取、OpenCL workspace、adaptive split 等都是真实存在且可复现的实现资产。  
+2. **但当前 corrected 结果已经推翻旧结论**：Hybrid 不再是三引擎最优，更没有“100% 胜出”。同时，也不能再把 hybrid 描述成“几乎完全没有价值”的异常差路径。  
+3. **GPU 是当前 LZO family 的主导引擎**：吞吐最高、压缩率与 CPU 接近、active compression power 也更优。  
+4. **Adaptive 只在 hybrid 内部提供部分改善**：当前它提升了解压侧表现，但 compression 仍落后 fixed。  
+5. **CPU OpenCL 虽然已确认可运行，但当前只适合作为 portability / research path**，不构成替代 native CPU path 或当前 hybrid 设计的依据。  
+6. **LZO hybrid 当前最合理的定位是研究型协同后端，而不是默认部署路径。**
 
-## 6. 最优配置推荐
+简言之：
 
-### 6.1 按文件特征的推荐配置
+> `lzo_hybrid` 现在应被写成一个“结构完整、实现真实、调度仍待继续优化、且二次修正测量语义后获得更合理 total-throughput 数据”的 CPU--GPU 协同系统，而不应再写成已经全面超越 CPU/GPU 的最终答案。
 
-| 文件特征 | 最优引擎 | gpu_ratio | BS | Threads | 预期 CompTotal |
-|---------|---------|-----------|-----|---------|---------------|
-| 高压缩率 (ratio < 5%) | HYBRID R=0.0 | 0.0 | 64K | 4 | 10,000-27,000 MB/s |
-| 中等压缩率 (15-35%) | HYBRID | 0.7-0.9 | 64K | 4 | 2,500-5,000 MB/s |
-| 低压缩率 (> 50%) | HYBRID | 0.9-0.95 | 64K | 4 | 1,200-2,500 MB/s |
-| 不可压缩 (~100%) | HYBRID R=0.0 | 0.0 | 64K/32K | 4 | 12,000-16,000 MB/s |
-| 小文件 (< 10MB) | GPU 或 HYBRID | 0.95-1.0 | 64K | 2-4 | 取决于压缩率 |
+## 9. 2026-03-09 调度优化快照
 
-### 6.2 通用默认配置
+本轮对 `lzo_hybrid` 做的关键实现更新包括：
 
-对于不了解文件特征的通用场景：
+- GPU/CPU block partition 从“GPU 前缀 + CPU 后缀”改为**跨文件分布式 block assignment**；
+- 为分布式 GPU block assignment 增加了完整的 gather/scatter path：
+  - GPU 压缩前先把 GPU-assigned blocks gather 成连续输入；
+  - GPU 解压前先把 GPU-assigned compressed blocks gather 成连续压缩流；
+  - 结果再 scatter 回全局 block 槽位；
+- 修复了 gather staging buffer 过早释放导致的 GPU crash；
+- 修复 `hybrid_bench()` 中 `--bench-io` 固定 `/tmp` 文件名问题。
 
-```
-gpu_ratio = 0.8
-block_size = 64K
-cpu_threads = 4
-```
+### 9.1 subset 结果（优化后）
 
-此配置在中位数文件上提供约 3,900 MB/s 压缩总吞吐量和约 5,100 MB/s 解压总吞吐量。
+#### `dickens`，64K
 
-### 6.3 自适应策略建议
+| Engine / Mode | Comp total MB/s | Dec total MB/s | Ratio % |
+|---|---:|---:|---:|
+| CPU-only | 171.80 | 214.27 | 61.91 |
+| GPU-only | **465.19** | **703.11** | 63.56 |
+| Hybrid fixed (0.7) | 374.56 | 336.27 | 63.06 |
+| Hybrid adaptive | 202.44 | 246.58 | **62.31** |
 
-最优 gpu_ratio 与文件压缩率高度相关。一个简单的自适应策略：
+#### `industrial_parent_0_pages_img.tar`，64K
 
-1. 对文件第一个块进行快速 CPU 压缩（< 1ms）
-2. 根据压缩率选择 gpu_ratio:
-   - ratio < 5% → R=0.0
-   - ratio 5-50% → R=0.8
-   - ratio > 50% → R=0.95
-   - ratio ~100% → R=0.0
+| Mode | Comp total MB/s | Dec total MB/s | Ratio % |
+|---|---:|---:|---:|
+| Hybrid fixed (0.7) | **925.81** | **874.05** | **17.53** |
 
----
+### 9.2 当前结论
 
-## 7. 压缩率对比
+1. 分布式 GPU block assignment + gather/scatter 已在真实 roundtrip 和 warmed bench 中通过验证；
+2. `lzo_hybrid` 当前已经不再被旧的前缀切分限制死在文件头局部模式上；
+3. 但从当前 subset 结果看，**LZO GPU-only 仍然是默认最强引擎**，hybrid fixed 更像特定 workload 上的次优协同方案；
+4. 因此本轮优化更准确的价值是：
 
-freq=100%，取最佳吞吐量配置的压缩率：
-
-| 引擎 | lzo1x 中位数 | lzo1y 中位数 |
-|------|-------------|-------------|
-| CPU | 21.66% | 21.87% |
-| GPU | 21.23% | 21.42% |
-| HYBRID | 21.22% | 21.42% |
-
-三个引擎的压缩率差异 < 0.5pp，可以认为等价。GPU/Hybrid 略低是因为 16K/32K 块大小在部分配置中被选为最优吞吐量配置，而更大的块大小通常能获得更好的压缩率。当使用相同块大小（64K）时，三者压缩率完全一致。
-
----
-
-## 8. 结论
-
-1. **Hybrid 实现是三引擎中综合最优**：在压缩总吞吐量上 100% 胜出（168/168），在解压总吞吐量上 86.3% 胜出
-2. **vs CPU@T=1 加速比：压缩 5.55x，解压 9.53x**；vs CPU@T=2: 压缩 2.80x，解压 4.91x
-3. **最优 gpu_ratio 取决于文件特征**：高压缩率文件宜纯 CPU（R=0.0），中等文件宜 R=0.7-0.9，低压缩率文件宜 R=0.9-0.95
-4. **能效：GPU 最优**（0.003 J/MB），Hybrid 次之（0.004 J/MB），CPU 最差（0.007 J/MB）
-5. **频率不敏感**：三引擎均为内存带宽受限，提高频率不显著提升吞吐量
-6. **压缩率一致**：三引擎在相同块大小下产出完全相同的压缩率，互换兼容
+> `lzo_hybrid` 的调度与 bench 路径已经被修正到可继续扩展的状态，但在当前 verified subset 上，它仍未形成对 `lzo_gpu` 的系统级反超。

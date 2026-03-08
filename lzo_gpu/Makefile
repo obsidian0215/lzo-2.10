@@ -1,6 +1,31 @@
 CC ?= gcc
-CFLAGS ?= -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200
-LDFLAGS ?= -lOpenCL -lm
+HOSTCC ?= gcc
+
+ifeq ($(OS),Windows_NT)
+EXEEXT ?=.exe
+HOSTEXEEXT ?=
+PTHREAD_LIB ?= -lpthread
+OPENCL_INCLUDE_DIR ?=
+OPENCL_LIB_DIR ?=
+OPENCL_LIB_NAME ?= OpenCL
+OPENCL_CFLAGS := $(if $(OPENCL_INCLUDE_DIR),-I$(OPENCL_INCLUDE_DIR),)
+OPENCL_LDFLAGS := $(if $(OPENCL_LIB_DIR),-L$(OPENCL_LIB_DIR),) -l$(OPENCL_LIB_NAME)
+CFLAGS ?= -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 -DWIN32_LEAN_AND_MEAN $(OPENCL_CFLAGS)
+LDFLAGS ?= $(OPENCL_LDFLAGS) -lm $(PTHREAD_LIB)
+HOST_OPENCL_CFLAGS ?=
+HOST_OPENCL_LDFLAGS ?=-lOpenCL -lm
+PRECOMPILE_HELPER := build_kernel_host$(HOSTEXEEXT)
+else
+EXEEXT ?=
+HOSTEXEEXT ?=$(EXEEXT)
+OPENCL_CFLAGS ?=
+OPENCL_LDFLAGS ?=-lOpenCL
+CFLAGS ?= -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 $(OPENCL_CFLAGS)
+LDFLAGS ?= $(OPENCL_LDFLAGS) -lm
+HOST_OPENCL_CFLAGS ?=$(OPENCL_CFLAGS)
+HOST_OPENCL_LDFLAGS ?=$(LDFLAGS)
+PRECOMPILE_HELPER := build_kernel$(EXEEXT)
+endif
 
 ## Automatically discover .cl sources present in this directory so we don't
 ## attempt to precompile kernels that aren't actually in the tree.
@@ -9,30 +34,39 @@ CL_SOURCES := $(wildcard *.cl)
 all: build_kernel lzo_gpu precompile-combos
 
 build_kernel: build_kernel.c lzo_gpu_utils.c
-	$(CC) $(CFLAGS) -o build_kernel build_kernel.c lzo_gpu_utils.c $(LDFLAGS) -lpthread
+	$(CC) $(CFLAGS) -o build_kernel$(EXEEXT) build_kernel.c lzo_gpu_utils.c $(LDFLAGS)
+
+build_kernel_host: build_kernel.c lzo_gpu_utils.c
+	$(HOSTCC) -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 $(HOST_OPENCL_CFLAGS) -o build_kernel_host$(HOSTEXEEXT) build_kernel.c lzo_gpu_utils.c $(HOST_OPENCL_LDFLAGS)
 
 
 # build the unified GPU host CLI
-lzo_gpu: lzo_gpu.c lzo_gpu_daemon.c lzo_gpu_client.c lzo_gpu_utils.c lzo_gpu_core.c
-	$(CC) $(CFLAGS) -o lzo_gpu lzo_gpu.c lzo_gpu_daemon.c lzo_gpu_client.c lzo_gpu_utils.c lzo_gpu_core.c $(LDFLAGS) -lpthread
+ifeq ($(OS),Windows_NT)
+LZO_GPU_SRCS = lzo_gpu.c lzo_gpu_utils.c lzo_gpu_core.c
+else
+LZO_GPU_SRCS = lzo_gpu.c lzo_gpu_daemon.c lzo_gpu_client.c lzo_gpu_utils.c lzo_gpu_core.c
+endif
 
-precompile: build_kernel
+lzo_gpu: $(LZO_GPU_SRCS)
+	$(CC) $(CFLAGS) -o lzo_gpu$(EXEEXT) $(LZO_GPU_SRCS) $(LDFLAGS)
+
+precompile: $(PRECOMPILE_HELPER)
 # If KERNEL is specified, build only that kernel (basename without .cl)
 	# Usage: make precompile KERNEL=lzo1x_12
 	if [ -n "$(KERNEL)" ]; then \
 		src="$(KERNEL).cl"; \
 		if [ ! -f "$$src" ]; then echo "Kernel source $$src not found"; exit 1; fi; \
-		./build_kernel $$src $${src%%.cl}.bin; \
+		./$(PRECOMPILE_HELPER) $$src $${src%%.cl}.bin; \
 	else \
 		$(MAKE) precompile-combos; \
 	fi
 
-precompile-combos: build_kernel
+precompile-combos: $(PRECOMPILE_HELPER)
 	@echo "Generate binaries for all algorithms and dictionary sizes"
 	@for alg in lzo1x lzo1y; do \
 		for bits in 11 12 13 14 15; do \
 			echo "Building $${alg}_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits})..."; \
-			./build_kernel $${alg}.cl $${alg}_$${bits}.clbin "-I. -D D_BITS=$${bits}" || exit 1; \
+			./$(PRECOMPILE_HELPER) $${alg}.cl $${alg}_$${bits}.clbin "-I. -D D_BITS=$${bits}" || exit 1; \
 		done; \
 	done
 
@@ -86,7 +120,7 @@ testdata:
 	python3 ../tools/generate-test-data.py --suite --out-dir "$$OUTDIR" || (echo "failed to generate test data"; exit 1)
 
 clean:
-	rm -f build_kernel lzo_gpu *.bin
+	rm -f build_kernel build_kernel.exe build_kernel_host lzo_gpu lzo_gpu.exe *.bin
 	@echo "Note: precompiled .clbin kernel binaries are preserved by default. Run 'make clean-clbin' to remove them."
 
 clean-clbin:

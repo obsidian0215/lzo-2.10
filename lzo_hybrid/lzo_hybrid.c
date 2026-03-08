@@ -18,6 +18,16 @@ static cl_context g_ctx;
 static cl_command_queue g_queue;
 static cl_device_id g_dev;
 
+static cl_device_type preferred_opencl_device_type(void) {
+    const char* pref = getenv("FORCE_OPENCL_DEVICE");
+    if (!pref || !*pref) return CL_DEVICE_TYPE_GPU;
+    if (strcasecmp(pref, "CPU") == 0) return CL_DEVICE_TYPE_CPU;
+    if (strcasecmp(pref, "GPU") == 0) return CL_DEVICE_TYPE_GPU;
+    if (strcasecmp(pref, "DEFAULT") == 0) return CL_DEVICE_TYPE_DEFAULT;
+    if (strcasecmp(pref, "ALL") == 0) return CL_DEVICE_TYPE_ALL;
+    return CL_DEVICE_TYPE_GPU;
+}
+
 static inline uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -27,15 +37,18 @@ static inline uint64_t now_ns(void) {
 static int ocl_init(void) {
     cl_int err;
     cl_platform_id pf = NULL;
+    cl_device_type pref_type = preferred_opencl_device_type();
     err = clGetPlatformIDs(1, &pf, NULL);
     if (err != CL_SUCCESS || !pf) {
         fprintf(stderr, "OpenCL: clGetPlatformIDs failed (err=%d)\n", err);
         return -1;
     }
-    err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_GPU, 1, &g_dev, NULL);
-    if (err != CL_SUCCESS)
+    err = clGetDeviceIDs(pf, pref_type, 1, &g_dev, NULL);
+    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_GPU)
+        err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_GPU, 1, &g_dev, NULL);
+    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_DEFAULT)
         err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_DEFAULT, 1, &g_dev, NULL);
-    if (err != CL_SUCCESS)
+    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_ALL)
         err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_ALL, 1, &g_dev, NULL);
     if (err != CL_SUCCESS) {
         fprintf(stderr, "OpenCL: clGetDeviceIDs failed (err=%d)\n", err);
@@ -76,7 +89,10 @@ static void show_help(const char* prog) {
     fprintf(stderr, "  --local N            OpenCL work-group size (default: 1)\n");
     fprintf(stderr, "  --cpu-threads N      CPU worker threads (default: 2)\n");
     fprintf(stderr, "  --gpu-ratio F        GPU block fraction 0.0-1.0 (default: 0.8)\n");
+    fprintf(stderr, "  --adaptive           Enable adaptive per-file CPU/GPU split\n");
+    fprintf(stderr, "  --sample-blocks N    Adaptive sample block count (default: 8)\n");
     fprintf(stderr, "  --bench [SECONDS]    Benchmark mode (compress+decompress+verify)\n");
+    fprintf(stderr, "  --bench-io           Include file write/read in bench total throughput\n");
     fprintf(stderr, "  -v, --verbose        Verbose output\n");
     fprintf(stderr, "  -h, --help           Show this help\n");
 }
@@ -84,6 +100,7 @@ static void show_help(const char* prog) {
 int main(int argc, char** argv) {
     int decompress_mode = 0;
     int bench_mode = 0;
+    int bench_include_io = 0;
     int verbose = 0;
     double bench_seconds = 3.0;
     const char* in_path = NULL;
@@ -94,6 +111,8 @@ int main(int argc, char** argv) {
     int local_size = 0;
     int cpu_threads = 2;
     double gpu_ratio = 0.8;
+    int adaptive_mode = 0;
+    size_t adaptive_sample_blocks = 8;
     int debug = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -111,6 +130,10 @@ int main(int argc, char** argv) {
         if (strcmp(arg, "--bench") == 0) {
             bench_mode = 1;
             if (i + 1 < argc && argv[i+1][0] != '-') bench_seconds = atof(argv[++i]);
+            continue;
+        }
+        if (strcmp(arg, "--bench-io") == 0) {
+            bench_include_io = 1;
             continue;
         }
         if (strcmp(arg, "-o") == 0 || strcmp(arg, "--output") == 0) {
@@ -152,6 +175,19 @@ int main(int argc, char** argv) {
             gpu_ratio = atof(argv[i]); continue;
         }
         if (strncmp(arg, "--gpu-ratio=", 12) == 0) { gpu_ratio = atof(arg + 12); continue; }
+        if (strcmp(arg, "--adaptive") == 0) {
+            adaptive_mode = 1;
+            continue;
+        }
+        if (strcmp(arg, "--sample-blocks") == 0) {
+            if (++i >= argc) { fprintf(stderr, "Error: --sample-blocks requires argument\n"); return 1; }
+            adaptive_sample_blocks = (size_t)strtoull(argv[i], NULL, 10);
+            continue;
+        }
+        if (strncmp(arg, "--sample-blocks=", 16) == 0) {
+            adaptive_sample_blocks = (size_t)strtoull(arg + 16, NULL, 10);
+            continue;
+        }
         if (arg[0] == '-') {
             fprintf(stderr, "Error: unknown option '%s'\n", arg); return 1;
         }
@@ -175,8 +211,9 @@ int main(int argc, char** argv) {
         .alg_id = alg_id,
         .comp_level = comp_level,
         .block_size = block_size,
-        .split_mode = HYBRID_SPLIT_FIXED,
+        .split_mode = adaptive_mode ? HYBRID_SPLIT_ADAPTIVE : HYBRID_SPLIT_FIXED,
         .gpu_ratio = gpu_ratio,
+        .adaptive_sample_blocks = adaptive_sample_blocks,
         .cpu_threads = cpu_threads,
         .local_size = local_size,
         .standard_copy = 0,
@@ -229,7 +266,7 @@ int main(int argc, char** argv) {
 
     if (bench_mode) {
         rc = hybrid_bench(g_ctx, g_queue, g_dev, comp_krn, dec_krn,
-                          in_path, &params, &ws, bench_seconds);
+                          in_path, &params, &ws, bench_seconds, bench_include_io);
     } else if (decompress_mode) {
         char default_out[512];
         if (!output_path) {

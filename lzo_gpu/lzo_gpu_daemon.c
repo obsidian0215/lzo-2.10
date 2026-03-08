@@ -323,61 +323,27 @@ static cl_program get_decompress_program(int alg)
     }
 
     const char* alg_names[] = {"lzo1x", "lzo1y"};
-    cl_int err;
-
-    /* 1. Try to load precompiled binary */
-    char bin_name[64];
-    snprintf(bin_name, sizeof(bin_name), "%s_decomp.clbin", alg_names[alg]);
-    size_t bin_sz;
+    char build_log[8192] = {0};
     uint64_t tk1 = core_now_ns();
-    unsigned char* bin = (unsigned char*)lzo_read_file(bin_name, &bin_sz);
 
-    if (bin) {
-        printf("[DAEMON] 加载预编译解压Program: %s\n", bin_name);
-        cl_int binary_status;
-        g_state.prog_decomp[alg] = clCreateProgramWithBinary(g_state.context, 1, &g_state.device,
-                                                        &bin_sz, (const unsigned char**)&bin, &binary_status, &err);
-        free(bin);
-        if (err == CL_SUCCESS && binary_status == CL_SUCCESS) {
-             err = clBuildProgram(g_state.prog_decomp[alg], 1, &g_state.device, "-cl-std=CL2.0", NULL, NULL);
-             uint64_t tk2 = core_now_ns();
-             g_kernel_load_us += (unsigned long)((tk2 - tk1) / 1000);
-             if (err == CL_SUCCESS) {
-                 pthread_mutex_unlock(&g_state.compile_lock);
-                 return g_state.prog_decomp[alg];
-             }
-        }
-        if (g_state.prog_decomp[alg]) {
-            clReleaseProgram(g_state.prog_decomp[alg]);
-            g_state.prog_decomp[alg] = NULL;
-        }
-    }
-
-    /* 2. Fallback to source compilation */
-    char src_file[64];
-    snprintf(src_file, sizeof(src_file), "%s_decomp.cl", alg_names[alg]);
-    printf("[DAEMON] 编译解压缩Program: %s...\n", src_file);
-
-    size_t src_len;
-    char* src = lzo_read_file(src_file, &src_len);
-    if (!src) {
-        pthread_mutex_unlock(&g_state.compile_lock);
-        return NULL;
-    }
-
-    g_state.prog_decomp[alg] = clCreateProgramWithSource(g_state.context, 1, (const char**)&src, &src_len, &err);
-    free(src);
-
-    if (err == CL_SUCCESS) {
-        err = clBuildProgram(g_state.prog_decomp[alg], 1, &g_state.device, "-cl-std=CL2.0 -I.", NULL, NULL);
+    printf("[DAEMON] 加载解压缩Program: %s\n", alg_names[alg]);
+    g_state.prog_decomp[alg] = lzo_load_program_with_dbits(
+        g_state.context,
+        g_state.device,
+        alg_names[alg],
+        LZO_DEFAULT_COMP_LEVEL,
+        build_log,
+        sizeof(build_log)
+    );
+    if (g_state.prog_decomp[alg]) {
         uint64_t tk2 = core_now_ns();
         g_kernel_load_us += (unsigned long)((tk2 - tk1) / 1000);
-        if (err == CL_SUCCESS) {
-            pthread_mutex_unlock(&g_state.compile_lock);
-            return g_state.prog_decomp[alg];
-        }
-        clReleaseProgram(g_state.prog_decomp[alg]);
-        g_state.prog_decomp[alg] = NULL;
+        pthread_mutex_unlock(&g_state.compile_lock);
+        return g_state.prog_decomp[alg];
+    }
+
+    if (build_log[0]) {
+        fprintf(stderr, "[DAEMON] 解压缩Program加载失败: %s\n", build_log);
     }
     pthread_mutex_unlock(&g_state.compile_lock);
     return NULL;
@@ -987,8 +953,8 @@ void print_stats(void)
  */
 int run_lzo_daemon(int argc, char** argv)
 {
-    setlinebuf(stdout);
-    setlinebuf(stderr);
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
     /* simple command-line parsing: support -h/--help and -s/--socket */
     for (int i = 0; i < argc; ++i) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {

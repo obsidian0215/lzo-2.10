@@ -74,4 +74,7 @@ param_scan_*/
 archived/
 lzo_hybrid/lzo_hybrid
 lzo_hybrid/*.cl
+.cache
+benchmark_bandwidth
+*_debug.cl
 # end

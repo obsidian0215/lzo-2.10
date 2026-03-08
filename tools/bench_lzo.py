@@ -8,6 +8,7 @@ import statistics
 import socket
 import sys
 import time
+import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -34,6 +35,7 @@ GPU_LOCAL_SIZES = [1]
 HYBRID_BLOCK_SIZES = ["16K", "32K", "64K"]
 HYBRID_GPU_RATIOS = [0.0, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0]
 HYBRID_CPU_THREADS = [1, 2, 4]
+HYBRID_SPLIT_MODES = ["fixed", "adaptive"]
 
 
 
@@ -502,6 +504,66 @@ def run_command_with_telemetry(cmd, telemetry=None, env=None, sample_interval_s=
     return completed, tel
 
 
+def run_command_with_telemetry_cwd(cmd, cwd=None, telemetry=None, env=None, sample_interval_s=0.05):
+    if telemetry is None:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env, cwd=cwd)
+        return res, {}
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=cwd)
+    samples = []
+    start_snap = telemetry.snapshot()
+    samples.append(start_snap)
+
+    while True:
+        try:
+            out, err = proc.communicate(timeout=sample_interval_s)
+            break
+        except subprocess.TimeoutExpired:
+            samples.append(telemetry.snapshot())
+
+    end_snap = telemetry.snapshot()
+    samples.append(end_snap)
+    delta = telemetry.diff(start_snap, end_snap)
+
+    cpu_avg = safe_mean([s.get("cpu_freq_mhz") for s in samples])
+    gpu_avg = safe_mean([s.get("gpu_freq_mhz") for s in samples])
+
+    tel = {
+        "elapsed_s": float(delta.get("elapsed_s", 0.0) or 0.0),
+        "cpu_freq_avg_mhz": float(cpu_avg),
+        "gpu_freq_avg_mhz": float(gpu_avg),
+        "cpu_energy_j": float(delta.get("cpu_energy_j", 0.0) or 0.0),
+        "gpu_energy_j": float(delta.get("gpu_energy_j", 0.0) or 0.0),
+    }
+    completed = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    return completed, tel
+
+
+def apply_wall_energy(stats, tel_window, comp_elapsed_s, dec_elapsed_s, energy_source):
+    stats['cpu_freq_avg_mhz'] = float(tel_window.get('cpu_freq_avg_mhz', 0.0) or 0.0)
+    stats['gpu_freq_avg_mhz'] = float(tel_window.get('gpu_freq_avg_mhz', 0.0) or 0.0)
+    elapsed_s = float(tel_window.get('elapsed_s', 0.0) or 0.0)
+    if elapsed_s <= 0.0:
+        stats['cpu_energy_j'] = 0.0
+        stats['gpu_energy_j'] = 0.0
+        stats['comp_cpu_power_w'] = 0.0
+        stats['comp_gpu_power_w'] = 0.0
+        stats['energy_source'] = energy_source
+        return
+
+    total_phase_s = max(0.0, float(comp_elapsed_s or 0.0)) + max(0.0, float(dec_elapsed_s or 0.0))
+    phase_scale = min(1.0, total_phase_s / elapsed_s) if total_phase_s > 0.0 else 0.0
+    comp_share = (float(comp_elapsed_s or 0.0) / total_phase_s) if total_phase_s > 0.0 else 0.0
+    cpu_total_energy = float(tel_window.get('cpu_energy_j', 0.0) or 0.0)
+    gpu_total_energy = float(tel_window.get('gpu_energy_j', 0.0) or 0.0)
+
+    stats['cpu_energy_j'] = cpu_total_energy * phase_scale * comp_share
+    stats['gpu_energy_j'] = gpu_total_energy * phase_scale * comp_share
+    stats['comp_cpu_power_w'] = (stats['cpu_energy_j'] / comp_elapsed_s) if comp_elapsed_s and comp_elapsed_s > 0.0 else 0.0
+    stats['comp_gpu_power_w'] = (stats['gpu_energy_j'] / comp_elapsed_s) if comp_elapsed_s and comp_elapsed_s > 0.0 else 0.0
+    stats['energy_source'] = energy_source
+
+
 def run_control_action(control_script_path, action):
     if not os.path.exists(control_script_path):
         return "missing_script"
@@ -664,7 +726,38 @@ def parse_stable_bench_output(output):
     return result
 
 
-def run_lzo_cpu(file_path, alg, bs, threads, telemetry=None, bench_seconds=3.0):
+def warm_lzo_gpu_daemon(file_path, alg, level, bs_arg, lsz):
+    gpu_dir = str(Path(LZO_GPU_BIN).resolve().parent)
+    warm_out = f"/tmp/lzo_gpu_warm_{os.getpid()}_{int(time.time() * 1000)}.lzo"
+    warm_dec = f"{warm_out}.dec"
+    try:
+        warm_comp_cmd = [
+            LZO_GPU_BIN,
+            "--use-daemon",
+            "-a", alg,
+            "-L", str(level),
+            "-B", bs_arg,
+            "--local", str(lsz),
+            "-o", warm_out,
+            str(file_path),
+        ]
+        subprocess.run(warm_comp_cmd, capture_output=True, text=True, check=False, env=build_gpu_subprocess_env(), cwd=gpu_dir)
+
+        if os.path.exists(warm_out):
+            warm_dec_cmd = [
+                LZO_GPU_BIN,
+                "--use-daemon",
+                "-d",
+                "-o", warm_dec,
+                warm_out,
+            ]
+            subprocess.run(warm_dec_cmd, capture_output=True, text=True, check=False, env=build_gpu_subprocess_env(), cwd=gpu_dir)
+    finally:
+        safe_remove(warm_out)
+        safe_remove(warm_dec)
+
+
+def run_lzo_cpu(file_path, alg, bs, threads, orig_hash=None, telemetry=None, bench_seconds=3.0):
     # Mapping "lzo1x" to "1x" for CPU tool
     alg_short = alg.replace("lzo", "")
     print(f"Bench_CPU: {file_path.name} A={alg_short} BS={bs} T={threads}")
@@ -706,14 +799,57 @@ def run_lzo_cpu(file_path, alg, bs, threads, telemetry=None, bench_seconds=3.0):
             stats['ratio'] = stable['ratio']
             stats['comp_mbs'] = stable['comp_kernel_tp']
             stats['dec_mbs'] = stable['dec_kernel_tp']
-            if 'comp_total_tp' in stable:
-                stats['comp_total_mbs'] = stable['comp_total_tp']
-            if 'dec_total_tp' in stable:
-                stats['dec_total_mbs'] = stable['dec_total_tp']
+
+            tmp_comp = f"/tmp/lzo_cpu_total_{os.getpid()}_{int(time.time() * 1000)}.lzo"
+            tmp_dec = f"{tmp_comp}.dec"
+            comp_elapsed_s = 0.0
+            dec_elapsed_s = 0.0
+            total_ok = False
+
+            try:
+                cmd_comp_total = [
+                    LZO_CPU_BIN,
+                    "-a", alg_short,
+                    "-B", str(bs),
+                    "-t", str(threads),
+                    "-o", tmp_comp,
+                    str(file_path),
+                ]
+                t0 = time.perf_counter()
+                comp_total_res, _ = run_command_with_telemetry(cmd_comp_total, telemetry=None)
+                comp_elapsed_s = max(0.0, time.perf_counter() - t0)
+
+                cmd_dec_total = [
+                    LZO_CPU_BIN,
+                    "-d",
+                    "-a", alg_short,
+                    "-t", str(threads),
+                    "-o", tmp_dec,
+                    tmp_comp,
+                ]
+                t1 = time.perf_counter()
+                dec_total_res, _ = run_command_with_telemetry(cmd_dec_total, telemetry=None)
+                dec_elapsed_s = max(0.0, time.perf_counter() - t1)
+
+                expected_hash = orig_hash if orig_hash else compute_sha256(str(file_path))
+                total_ok = (
+                    comp_total_res.returncode == 0
+                    and dec_total_res.returncode == 0
+                    and file_matches_hash(tmp_dec, expected_hash)
+                )
+
+                if in_sz > 0 and comp_elapsed_s > 0.0:
+                    stats['comp_total_mbs'] = in_sz / (comp_elapsed_s * 1024.0 * 1024.0)
+                if in_sz > 0 and dec_elapsed_s > 0.0:
+                    stats['dec_total_mbs'] = in_sz / (dec_elapsed_s * 1024.0 * 1024.0)
+            finally:
+                safe_remove(tmp_comp)
+                safe_remove(tmp_dec)
+
             stats['comp_time_s'] = (in_sz / (stats['comp_mbs'] * 1024.0 * 1024.0)) if in_sz > 0 and stats['comp_mbs'] > 0 else 0.0
             stats['dec_time_s'] = (in_sz / (stats['dec_mbs'] * 1024.0 * 1024.0)) if in_sz > 0 and stats['dec_mbs'] > 0 else 0.0
-            stats['throughput_semantics'] = 'stable_kernel_bench'
-            stats['roundtrip_verified'] = bool(stable['verify_ok']) and (res.returncode == 0)
+            stats['throughput_semantics'] = 'stable_kernel_bench_with_file_io_total'
+            stats['roundtrip_verified'] = bool(stable['verify_ok']) and (res.returncode == 0) and total_ok
         else:
             stats['throughput_semantics'] = 'stable_kernel_bench_parse_failed'
             stats['roundtrip_verified'] = False
@@ -722,24 +858,13 @@ def run_lzo_cpu(file_path, alg, bs, threads, telemetry=None, bench_seconds=3.0):
         print(f"CPU error: {e}")
 
     if telemetry and tel_window:
-        stats['cpu_freq_avg_mhz'] = float(tel_window.get('cpu_freq_avg_mhz', 0.0) or 0.0)
-        stats['gpu_freq_avg_mhz'] = float(tel_window.get('gpu_freq_avg_mhz', 0.0) or 0.0)
-
-        comp_s = float(stats.get('comp_time_s', 0.0) or 0.0)
-        dec_s = float(stats.get('dec_time_s', 0.0) or 0.0)
-        kernel_total_s = comp_s + dec_s
-        elapsed_s = float(tel_window.get('elapsed_s', 0.0) or 0.0)
-        kernel_scale = min(1.0, (kernel_total_s / elapsed_s)) if (elapsed_s > 0 and kernel_total_s > 0) else 0.0
-
-        cpu_kernel_energy = float(tel_window.get('cpu_energy_j', 0.0) or 0.0) * kernel_scale
-        gpu_kernel_energy = float(tel_window.get('gpu_energy_j', 0.0) or 0.0) * kernel_scale
-        comp_share = (comp_s / kernel_total_s) if kernel_total_s > 0 else 0.0
-
-        stats['cpu_energy_j'] = cpu_kernel_energy * comp_share
-        stats['gpu_energy_j'] = gpu_kernel_energy * comp_share
-        stats['comp_cpu_power_w'] = (cpu_kernel_energy / kernel_total_s) if kernel_total_s > 0 else 0.0
-        stats['comp_gpu_power_w'] = (gpu_kernel_energy / kernel_total_s) if kernel_total_s > 0 else 0.0
-        stats['energy_source'] = telemetry.describe_sources()
+        apply_wall_energy(
+            stats,
+            tel_window,
+            float(stats.get('comp_time_s', 0.0) or 0.0),
+            float(stats.get('dec_time_s', 0.0) or 0.0),
+            telemetry.describe_sources(),
+        )
 
     return stats
 
@@ -768,6 +893,7 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
     tel_window = {}
     try:
         in_sz = file_path.stat().st_size
+        gpu_dir = str(Path(LZO_GPU_BIN).resolve().parent)
 
         bench_cmd = [
             LZO_GPU_BIN,
@@ -778,23 +904,104 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
             "--local", str(lsz),
             str(file_path),
         ]
-        bench_res, tel_window = run_command_with_telemetry(bench_cmd, telemetry=telemetry, env=build_gpu_subprocess_env())
+        bench_res, tel_window = run_command_with_telemetry_cwd(bench_cmd, cwd=gpu_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
         bench_output = (bench_res.stdout or "") + (bench_res.stderr or "")
         stable = parse_stable_bench_output(bench_output)
         if stable:
+            warm_lzo_gpu_daemon(file_path, alg, level, bs_arg, lsz)
             stats['ratio'] = stable['ratio']
             stats['comp_mbs'] = stable['comp_kernel_tp']
             stats['dec_mbs'] = stable['dec_kernel_tp']
-            if 'comp_total_tp' in stable:
-                stats['comp_total_mbs'] = stable['comp_total_tp']
-            if 'dec_total_tp' in stable:
-                stats['dec_total_mbs'] = stable['dec_total_tp']
-            if in_sz > 0 and stats['comp_mbs'] > 0:
-                stats['comp_time_s'] = in_sz / (stats['comp_mbs'] * 1024.0 * 1024.0)
-            if in_sz > 0 and stats['dec_mbs'] > 0:
-                stats['dec_time_s'] = in_sz / (stats['dec_mbs'] * 1024.0 * 1024.0)
-            stats['throughput_semantics'] = 'stable_kernel_bench'
-            stats['roundtrip_verified'] = bool(stable['verify_ok']) and (bench_res.returncode == 0)
+
+            tmp_comp = f"/tmp/lzo_gpu_total_{os.getpid()}_{int(time.time() * 1000)}.lzo"
+            tmp_dec = f"{tmp_comp}.dec"
+            total_tel = {}
+            total_ok = False
+            local_tmp_comp = None
+            local_tmp_dec = None
+
+            try:
+                with tempfile.NamedTemporaryFile(prefix="lzo_gpu_comp_", suffix=".lzo", dir=gpu_dir, delete=False) as tfc:
+                    local_tmp_comp = tfc.name
+                with tempfile.NamedTemporaryFile(prefix="lzo_gpu_dec_", suffix=".bin", dir=gpu_dir, delete=False) as tfd:
+                    local_tmp_dec = tfd.name
+
+                cmd_comp_total = [
+                    LZO_GPU_BIN,
+                    "--use-daemon",
+                    "-v",
+                    "-a", alg,
+                    "-L", str(level),
+                    "-B", bs_arg,
+                    "--local", str(lsz),
+                    "-o", local_tmp_comp,
+                    str(file_path),
+                ]
+                comp_total_res, comp_total_tel = run_command_with_telemetry_cwd(cmd_comp_total, cwd=gpu_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
+                comp_total_output = (comp_total_res.stdout or "") + (comp_total_res.stderr or "")
+                comp_total_parsed = parse_gpu_output(comp_total_output)
+
+                cmd_dec_total = [
+                    LZO_GPU_BIN,
+                    "--use-daemon",
+                    "-v",
+                    "-d",
+                    "-o", local_tmp_dec,
+                    local_tmp_comp,
+                ]
+                dec_total_res, dec_total_tel = run_command_with_telemetry_cwd(cmd_dec_total, cwd=gpu_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
+                dec_total_output = (dec_total_res.stdout or "") + (dec_total_res.stderr or "")
+                dec_total_parsed = parse_gpu_output(dec_total_output)
+
+                comp_elapsed_s = float(comp_total_tel.get('elapsed_s', 0.0) or 0.0)
+                dec_elapsed_s = float(dec_total_tel.get('elapsed_s', 0.0) or 0.0)
+                total_tel = {
+                    'elapsed_s': comp_elapsed_s + dec_elapsed_s,
+                    'cpu_freq_avg_mhz': float(comp_total_tel.get('cpu_freq_avg_mhz', 0.0) or 0.0),
+                    'gpu_freq_avg_mhz': float(comp_total_tel.get('gpu_freq_avg_mhz', 0.0) or 0.0),
+                    'cpu_energy_j': float(comp_total_tel.get('cpu_energy_j', 0.0) or 0.0) + float(dec_total_tel.get('cpu_energy_j', 0.0) or 0.0),
+                    'gpu_energy_j': float(comp_total_tel.get('gpu_energy_j', 0.0) or 0.0) + float(dec_total_tel.get('gpu_energy_j', 0.0) or 0.0),
+                }
+
+                if local_tmp_comp and os.path.exists(local_tmp_comp):
+                    os.replace(local_tmp_comp, tmp_comp)
+                    local_tmp_comp = None
+                if local_tmp_dec and os.path.exists(local_tmp_dec):
+                    os.replace(local_tmp_dec, tmp_dec)
+                    local_tmp_dec = None
+
+                total_ok = (
+                    comp_total_res.returncode == 0
+                    and dec_total_res.returncode == 0
+                    and file_matches_hash(tmp_dec, orig_hash)
+                )
+
+                if comp_total_parsed.get('inclusive_tp'):
+                    stats['comp_total_mbs'] = comp_total_parsed['inclusive_tp']
+                if dec_total_parsed.get('inclusive_tp'):
+                    stats['dec_total_mbs'] = dec_total_parsed['inclusive_tp']
+                if comp_elapsed_s > 0.0:
+                    stats['comp_time_s'] = comp_elapsed_s
+                if dec_elapsed_s > 0.0:
+                    stats['dec_time_s'] = dec_elapsed_s
+            finally:
+                if local_tmp_comp:
+                    safe_remove(local_tmp_comp)
+                if local_tmp_dec:
+                    safe_remove(local_tmp_dec)
+                safe_remove(tmp_comp)
+                safe_remove(tmp_dec)
+
+            stats['throughput_semantics'] = 'stable_kernel_bench_with_daemon_inclusive_total'
+            stats['roundtrip_verified'] = bool(stable['verify_ok']) and (bench_res.returncode == 0) and total_ok
+            if telemetry and total_tel:
+                apply_wall_energy(
+                    stats,
+                    total_tel,
+                    float(stats.get('comp_time_s', 0.0) or 0.0),
+                    float(stats.get('dec_time_s', 0.0) or 0.0),
+                    telemetry.describe_sources(),
+                )
         else:
             stats['throughput_semantics'] = 'stable_kernel_bench_parse_failed'
             stats['roundtrip_verified'] = False
@@ -802,31 +1009,11 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
     except Exception as e:
         print(f"GPU Error: {e}")
 
-    if telemetry and tel_window:
-        stats['cpu_freq_avg_mhz'] = float(tel_window.get('cpu_freq_avg_mhz', 0.0) or 0.0)
-        stats['gpu_freq_avg_mhz'] = float(tel_window.get('gpu_freq_avg_mhz', 0.0) or 0.0)
-
-        comp_s = float(stats.get('comp_time_s', 0.0) or 0.0)
-        dec_s = float(stats.get('dec_time_s', 0.0) or 0.0)
-        kernel_total_s = comp_s + dec_s
-        elapsed_s = float(tel_window.get('elapsed_s', 0.0) or 0.0)
-        kernel_scale = min(1.0, (kernel_total_s / elapsed_s)) if (elapsed_s > 0 and kernel_total_s > 0) else 0.0
-
-        cpu_kernel_energy = float(tel_window.get('cpu_energy_j', 0.0) or 0.0) * kernel_scale
-        gpu_kernel_energy = float(tel_window.get('gpu_energy_j', 0.0) or 0.0) * kernel_scale
-        comp_share = (comp_s / kernel_total_s) if kernel_total_s > 0 else 0.0
-
-        stats['cpu_energy_j'] = cpu_kernel_energy * comp_share
-        stats['gpu_energy_j'] = gpu_kernel_energy * comp_share
-        stats['comp_cpu_power_w'] = (cpu_kernel_energy / kernel_total_s) if kernel_total_s > 0 else 0.0
-        stats['comp_gpu_power_w'] = (gpu_kernel_energy / kernel_total_s) if kernel_total_s > 0 else 0.0
-        stats['energy_source'] = telemetry.describe_sources()
-
     return stats
 
 
-def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, telemetry=None, bench_seconds=3.0):
-    print(f"Bench_HYBRID: {file_path.name} A={alg} BS={bs} R={gpu_ratio} T={cpu_threads}")
+def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, orig_hash=None, telemetry=None, bench_seconds=3.0, split_mode="fixed", sample_blocks=8):
+    print(f"Bench_HYBRID: {file_path.name} A={alg} BS={bs} mode={split_mode} R={gpu_ratio} T={cpu_threads}")
     bs_arg = str(bs).lower()
     stats = {
         'ratio': 0,
@@ -853,12 +1040,16 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, telemetry=None, b
         bench_cmd = [
             LZO_HYBRID_BIN,
             "--bench", str(bench_seconds),
+            "--bench-io",
             "-a", alg,
             "-B", bs_arg,
-            "--gpu-ratio", str(gpu_ratio),
             "--cpu-threads", str(cpu_threads),
             str(file_path),
         ]
+        if split_mode == "adaptive":
+            bench_cmd[1:1] = ["--adaptive", "--sample-blocks", str(sample_blocks), "--gpu-ratio", str(gpu_ratio)]
+        else:
+            bench_cmd[1:1] = ["--gpu-ratio", str(gpu_ratio)]
         bench_res, tel_window = run_command_with_telemetry(bench_cmd, telemetry=telemetry, env=build_gpu_subprocess_env())
         bench_output = (bench_res.stdout or "") + (bench_res.stderr or "")
         stable = parse_stable_bench_output(bench_output)
@@ -870,38 +1061,76 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, telemetry=None, b
                 stats['comp_total_mbs'] = stable['comp_total_tp']
             if 'dec_total_tp' in stable:
                 stats['dec_total_mbs'] = stable['dec_total_tp']
-            if in_sz > 0 and stats['comp_mbs'] > 0:
-                stats['comp_time_s'] = in_sz / (stats['comp_mbs'] * 1024.0 * 1024.0)
-            if in_sz > 0 and stats['dec_mbs'] > 0:
-                stats['dec_time_s'] = in_sz / (stats['dec_mbs'] * 1024.0 * 1024.0)
-            stats['throughput_semantics'] = 'stable_kernel_bench'
+            total_ok = False
+            total_tel = {}
+            try:
+                cmd_comp_total = [
+                    LZO_HYBRID_BIN,
+                    "-a", alg,
+                    "-B", bs_arg,
+                    "--cpu-threads", str(cpu_threads),
+                    "-o", "/tmp/lzo_hybrid_verify_tmp.lzo",
+                    str(file_path),
+                ]
+                if split_mode == "adaptive":
+                    cmd_comp_total[1:1] = ["--adaptive", "--sample-blocks", str(sample_blocks), "--gpu-ratio", str(gpu_ratio)]
+                else:
+                    cmd_comp_total[1:1] = ["--gpu-ratio", str(gpu_ratio)]
+                comp_total_res, comp_total_tel = run_command_with_telemetry(cmd_comp_total, telemetry=telemetry, env=build_gpu_subprocess_env())
+
+                cmd_dec_total = [
+                    LZO_HYBRID_BIN,
+                    "-d",
+                    "-o", "/tmp/lzo_hybrid_verify_tmp.lzo.dec",
+                    "/tmp/lzo_hybrid_verify_tmp.lzo",
+                ]
+                if split_mode == "adaptive":
+                    cmd_dec_total[1:1] = ["--adaptive", "--sample-blocks", str(sample_blocks), "--gpu-ratio", str(gpu_ratio), "--cpu-threads", str(cpu_threads)]
+                else:
+                    cmd_dec_total[1:1] = ["--gpu-ratio", str(gpu_ratio), "--cpu-threads", str(cpu_threads)]
+                dec_total_res, dec_total_tel = run_command_with_telemetry(cmd_dec_total, telemetry=telemetry, env=build_gpu_subprocess_env())
+
+                if stats['comp_total_mbs'] > 0.0:
+                    stats['comp_time_s'] = in_sz / (stats['comp_total_mbs'] * 1024.0 * 1024.0)
+                else:
+                    stats['comp_time_s'] = float(comp_total_tel.get('elapsed_s', 0.0) or 0.0)
+                if stats['dec_total_mbs'] > 0.0:
+                    stats['dec_time_s'] = in_sz / (stats['dec_total_mbs'] * 1024.0 * 1024.0)
+                else:
+                    stats['dec_time_s'] = float(dec_total_tel.get('elapsed_s', 0.0) or 0.0)
+                total_ok = (
+                    comp_total_res.returncode == 0
+                    and dec_total_res.returncode == 0
+                    and file_matches_hash("/tmp/lzo_hybrid_verify_tmp.lzo.dec", orig_hash)
+                ) if orig_hash else (comp_total_res.returncode == 0 and dec_total_res.returncode == 0)
+                total_tel = {
+                    'elapsed_s': float(comp_total_tel.get('elapsed_s', 0.0) or 0.0) + float(dec_total_tel.get('elapsed_s', 0.0) or 0.0),
+                    'cpu_freq_avg_mhz': float(comp_total_tel.get('cpu_freq_avg_mhz', 0.0) or 0.0),
+                    'gpu_freq_avg_mhz': float(comp_total_tel.get('gpu_freq_avg_mhz', 0.0) or 0.0),
+                    'cpu_energy_j': float(comp_total_tel.get('cpu_energy_j', 0.0) or 0.0) + float(dec_total_tel.get('cpu_energy_j', 0.0) or 0.0),
+                    'gpu_energy_j': float(comp_total_tel.get('gpu_energy_j', 0.0) or 0.0) + float(dec_total_tel.get('gpu_energy_j', 0.0) or 0.0),
+                }
+            finally:
+                safe_remove('/tmp/lzo_hybrid_verify_tmp.lzo')
+                safe_remove('/tmp/lzo_hybrid_verify_tmp.lzo.dec')
+            stats['throughput_semantics'] = 'stable_kernel_bench_inprocess_total_with_filebacked_verify'
             stats['roundtrip_verified'] = bool(stable['verify_ok']) and (bench_res.returncode == 0)
+            if total_ok:
+                stats['roundtrip_verified'] = True
+            if telemetry and total_tel:
+                apply_wall_energy(
+                    stats,
+                    total_tel,
+                    float(stats.get('comp_time_s', 0.0) or 0.0),
+                    float(stats.get('dec_time_s', 0.0) or 0.0),
+                    telemetry.describe_sources(),
+                )
         else:
             stats['throughput_semantics'] = 'stable_kernel_bench_parse_failed'
             stats['roundtrip_verified'] = False
-            print(f"  [HYBRID] stable bench parse failed for {file_path} (A={alg} BS={bs} R={gpu_ratio} T={cpu_threads})", flush=True)
+            print(f"  [HYBRID] stable bench parse failed for {file_path} (A={alg} BS={bs} mode={split_mode} R={gpu_ratio} T={cpu_threads})", flush=True)
     except Exception as e:
         print(f"HYBRID Error: {e}")
-
-    if telemetry and tel_window:
-        stats['cpu_freq_avg_mhz'] = float(tel_window.get('cpu_freq_avg_mhz', 0.0) or 0.0)
-        stats['gpu_freq_avg_mhz'] = float(tel_window.get('gpu_freq_avg_mhz', 0.0) or 0.0)
-
-        comp_s = float(stats.get('comp_time_s', 0.0) or 0.0)
-        dec_s = float(stats.get('dec_time_s', 0.0) or 0.0)
-        kernel_total_s = comp_s + dec_s
-        elapsed_s = float(tel_window.get('elapsed_s', 0.0) or 0.0)
-        kernel_scale = min(1.0, (kernel_total_s / elapsed_s)) if (elapsed_s > 0 and kernel_total_s > 0) else 0.0
-
-        cpu_kernel_energy = float(tel_window.get('cpu_energy_j', 0.0) or 0.0) * kernel_scale
-        gpu_kernel_energy = float(tel_window.get('gpu_energy_j', 0.0) or 0.0) * kernel_scale
-        comp_share = (comp_s / kernel_total_s) if kernel_total_s > 0 else 0.0
-
-        stats['cpu_energy_j'] = cpu_kernel_energy * comp_share
-        stats['gpu_energy_j'] = gpu_kernel_energy * comp_share
-        stats['comp_cpu_power_w'] = (cpu_kernel_energy / kernel_total_s) if kernel_total_s > 0 else 0.0
-        stats['comp_gpu_power_w'] = (gpu_kernel_energy / kernel_total_s) if kernel_total_s > 0 else 0.0
-        stats['energy_source'] = telemetry.describe_sources()
 
     return stats
 
@@ -923,6 +1152,7 @@ def main():
     parser.add_argument('--hybrid-block-sizes', default=','.join(HYBRID_BLOCK_SIZES), help='Hybrid block sizes, comma-separated')
     parser.add_argument('--hybrid-gpu-ratios', default=','.join(str(x) for x in HYBRID_GPU_RATIOS), help='Hybrid GPU ratios, comma-separated')
     parser.add_argument('--hybrid-cpu-threads', default=','.join(str(x) for x in HYBRID_CPU_THREADS), help='Hybrid CPU threads, comma-separated')
+    parser.add_argument('--hybrid-split-modes', default=','.join(HYBRID_SPLIT_MODES), help='Hybrid split modes, comma-separated (fixed,adaptive)')
     parser.add_argument('--freq-percent', type=int, default=None, help='Set both CPU and GPU to one shared frequency percent (0-100)')
     parser.add_argument('--freq-points', default='', help='Shared CPU/GPU frequency points, comma-separated (e.g. 40,70,100)')
     parser.add_argument('--single-file', default='', help='Only benchmark one file (path or basename under samples dir)')
@@ -954,6 +1184,7 @@ def main():
     hybrid_block_sizes = parse_str_list(args.hybrid_block_sizes, HYBRID_BLOCK_SIZES)
     hybrid_gpu_ratios = parse_float_list(args.hybrid_gpu_ratios, HYBRID_GPU_RATIOS)
     hybrid_cpu_threads = parse_int_list(args.hybrid_cpu_threads, HYBRID_CPU_THREADS)
+    hybrid_split_modes = parse_str_list(args.hybrid_split_modes, HYBRID_SPLIT_MODES)
     use_gpu_daemon = run_gpu
     freq_points = build_freq_points(parse_optional_int_list(args.freq_points), args.freq_percent)
 
@@ -1028,7 +1259,7 @@ def main():
                         for alg in algs:
                             for bs in cpu_block_sizes:
                                 for t in cpu_threads:
-                                    cpu_stats = run_lzo_cpu(sample, alg, bs, t, telemetry=telemetry, bench_seconds=args.bench_seconds)
+                                    cpu_stats = run_lzo_cpu(sample, alg, bs, t, orig_hash=orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds)
                                     writer.writerow([
                                         sample.name,
                                         point_idx,
@@ -1100,43 +1331,45 @@ def main():
                     if run_hybrid:
                         for alg in algs:
                             for bs in hybrid_block_sizes:
-                                for ratio in hybrid_gpu_ratios:
-                                    for ht in hybrid_cpu_threads:
-                                        hybrid_stats = run_lzo_hybrid(
-                                            sample, alg, bs, ratio, ht,
-                                            telemetry=telemetry,
-                                            bench_seconds=args.bench_seconds,
-                                        )
-                                        writer.writerow([
-                                            sample.name,
-                                            point_idx,
-                                            "" if cpu_freq_target is None else cpu_freq_target,
-                                            "" if gpu_freq_target is None else gpu_freq_target,
-                                            "HYBRID", alg, "N/A", bs,
-                                            f"R{ratio}_T{ht}",
-                                            fmtf(hybrid_stats['ratio'], 2),
-                                            fmtf(hybrid_stats['comp_mbs'], 2),
-                                            fmtf(hybrid_stats['dec_mbs'], 2),
-                                            fmtf(hybrid_stats.get('comp_total_mbs', 0), 2),
-                                            fmtf(hybrid_stats.get('dec_total_mbs', 0), 2),
-                                            fmtf(hybrid_stats['comp_time_s'], 6),
-                                            fmtf(hybrid_stats['dec_time_s'], 6),
-                                            fmtf(hybrid_stats['cpu_freq_avg_mhz'], 2),
-                                            fmtf(hybrid_stats['gpu_freq_avg_mhz'], 2),
-                                            fmtf(hybrid_stats['cpu_energy_j'], 6),
-                                            fmtf(hybrid_stats['gpu_energy_j'], 6),
-                                            fmtf(hybrid_stats['comp_cpu_power_w'], 6),
-                                            fmtf(hybrid_stats['comp_gpu_power_w'], 6),
-                                            "yes" if hybrid_stats.get('roundtrip_verified') else "no",
-                                        ])
-                                        f.flush()
+                                for split_mode in hybrid_split_modes:
+                                    for ratio in hybrid_gpu_ratios:
+                                        for ht in hybrid_cpu_threads:
+                                            hybrid_stats = run_lzo_hybrid(
+                                                sample, alg, bs, ratio, ht, orig_hash=orig_hash,
+                                                telemetry=telemetry,
+                                                bench_seconds=args.bench_seconds,
+                                                split_mode=split_mode,
+                                            )
+                                            writer.writerow([
+                                                sample.name,
+                                                point_idx,
+                                                "" if cpu_freq_target is None else cpu_freq_target,
+                                                "" if gpu_freq_target is None else gpu_freq_target,
+                                                "HYBRID", alg, "N/A", bs,
+                                                f"{split_mode}:R{ratio}_T{ht}",
+                                                fmtf(hybrid_stats['ratio'], 2),
+                                                fmtf(hybrid_stats['comp_mbs'], 2),
+                                                fmtf(hybrid_stats['dec_mbs'], 2),
+                                                fmtf(hybrid_stats.get('comp_total_mbs', 0), 2),
+                                                fmtf(hybrid_stats.get('dec_total_mbs', 0), 2),
+                                                fmtf(hybrid_stats['comp_time_s'], 6),
+                                                fmtf(hybrid_stats['dec_time_s'], 6),
+                                                fmtf(hybrid_stats['cpu_freq_avg_mhz'], 2),
+                                                fmtf(hybrid_stats['gpu_freq_avg_mhz'], 2),
+                                                fmtf(hybrid_stats['cpu_energy_j'], 6),
+                                                fmtf(hybrid_stats['gpu_energy_j'], 6),
+                                                fmtf(hybrid_stats['comp_cpu_power_w'], 6),
+                                                fmtf(hybrid_stats['comp_gpu_power_w'], 6),
+                                                "yes" if hybrid_stats.get('roundtrip_verified') else "no",
+                                            ])
+                                            f.flush()
 
-                                        hybrid_cfg_label = (
-                                            f"FP={point_idx};A={alg};BS={bs};R={ratio};T={ht}"
-                                        )
-                                        emit_case_average(sample.name, "HYBRID", hybrid_cfg_label, hybrid_stats)
-                                        if hybrid_stats.get("roundtrip_verified", False):
-                                            summary_records.append(build_summary_record("HYBRID", hybrid_cfg_label, hybrid_stats))
+                                            hybrid_cfg_label = (
+                                                f"FP={point_idx};A={alg};BS={bs};M={split_mode};R={ratio};T={ht}"
+                                            )
+                                            emit_case_average(sample.name, "HYBRID", hybrid_cfg_label, hybrid_stats)
+                                            if hybrid_stats.get("roundtrip_verified", False):
+                                                summary_records.append(build_summary_record("HYBRID", hybrid_cfg_label, hybrid_stats))
 
         print_and_save_config_summary(summary_records, results_summary_csv)
     finally:

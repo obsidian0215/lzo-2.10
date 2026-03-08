@@ -1,32 +1,101 @@
 ============================================================================
-LZO -- a real-time data compression library
+LZO repository with CPU, GPU, and hybrid execution paths
 ============================================================================
 
-Please read the file doc/LZO.TXT for an introduction to LZO.
-See the file doc/LZO.FAQ for various tidbits of information.
+This tree contains the classic LZO source plus local heterogeneous execution
+extensions used for CPU/GPU compression experiments.
 
-See the file NEWS for a list of major changes in the current release.
+Main subprojects:
 
-See the file INSTALL for compilation and installation instructions.
-
-For a quick start how to use LZO look at examples/lzopack.c.
-
-
-Directory overview:
--------------------
-  autoconf      Autoconf configuration files (UNIX specific)
-  B             various support files for DOS, Windows, OS/2, ...
-  doc           documentation
-  examples      example programs
-  include       public header files
-  minilzo       a lightweight subset for easy inclusion in your project
-  src           library source
-  tests         more or less exotic test programs
-  util          some utility scripts
+  lzo_cpu      Native CPU baseline and CLI
+  lzo_gpu      OpenCL GPU execution path
+  lzo_hybrid   CPU+GPU collaborative path
+  tools        benchmark runners and analysis helpers
 
 
-Have fun,
-Markus
+Build
+-----
 
-http://www.oberhumer.com/opensource/lzo/
+Linux
+~~~~~
 
+CPU baseline:
+
+    cd lzo_cpu
+    make gcc
+
+GPU path:
+
+    cd lzo_gpu
+    make
+
+Hybrid path:
+
+    cd lzo_hybrid
+    make
+
+Typical Linux packages:
+
+  Debian/Ubuntu:
+    build-essential opencl-headers ocl-icd-opencl-dev
+
+  Fedora:
+    gcc make opencl-headers ocl-icd-devel
+
+
+Windows
+~~~~~~~
+
+Supported Windows build target is MSYS2 / MinGW-w64.
+
+This is the supported path because the current codebase uses Makefiles and
+pthread-based CPU/hybrid paths. MSYS2 gives a practical Windows environment
+without requiring a full MSVC-native port.
+
+Install MSYS2 packages first:
+
+    pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-make mingw-w64-ucrt-x86_64-winpthreads
+
+You can then build against CUDA-installed OpenCL headers/import libraries:
+
+    cd lzo_gpu
+    make OS=Windows_NT CC=gcc \
+      OPENCL_INCLUDE_DIR="/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/include" \
+      OPENCL_LIB_DIR="/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/lib/x64"
+
+    cd ../lzo_hybrid
+    make OS=Windows_NT CC=gcc \
+      OPENCL_INCLUDE_DIR="/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/include" \
+      OPENCL_LIB_DIR="/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/lib/x64"
+
+    cd ../lzo_cpu
+    make win32-mingw
+
+Notes:
+
+  - NVIDIA CUDA on Windows includes OpenCL headers and import libraries.
+  - The OpenCL runtime DLL is provided by the installed GPU driver.
+  - If your OpenCL import library name differs, override OPENCL_LIB_NAME.
+  - Current Windows support focuses on standalone and benchmark modes.
+  - Daemon/client mode in lzo_gpu remains Linux-only today.
+
+
+Benchmarking
+------------
+
+Important runners:
+
+  tools/bench_lzo.py      CPU / GPU / hybrid benchmark driver
+  tools/README.md         tooling overview
+
+Example:
+
+    python3 tools/bench_lzo.py --samples-dir /root/samples_subset --hybrid-only --bench-seconds 1
+
+
+Current status
+--------------
+
+  - lzo_gpu is currently the default strongest verified engine in the LZO family.
+  - lzo_hybrid has received recent scheduler, gather/scatter, and bench-path fixes.
+  - lzo_cpu remains the preferred CPU baseline on the current Intel platform.

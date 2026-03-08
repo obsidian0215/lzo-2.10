@@ -19,11 +19,45 @@ extern "C" {
 #include <time.h>
 #include <stdint.h>
 
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#include <malloc.h>
+static inline uint64_t lzo_now_ns(void) {
+    LARGE_INTEGER freq;
+    LARGE_INTEGER counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (uint64_t)counter.QuadPart * 1000000000ULL / (uint64_t)freq.QuadPart;
+}
+
+static inline int lzo_aligned_alloc_portable(void** ptr, size_t alignment, size_t size) {
+    void* p = _aligned_malloc(size, alignment);
+    if (!p) {
+        *ptr = NULL;
+        return -1;
+    }
+    *ptr = p;
+    return 0;
+}
+
+static inline void lzo_aligned_free_portable(void* ptr) {
+    _aligned_free(ptr);
+}
+#else
 static inline uint64_t lzo_now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
+
+static inline int lzo_aligned_alloc_portable(void** ptr, size_t alignment, size_t size) {
+    return posix_memalign(ptr, alignment, size);
+}
+
+static inline void lzo_aligned_free_portable(void* ptr) {
+    free(ptr);
+}
+#endif
 
 /* Locate a file by name with priority: exe_dir, exe_dir/../lzo_gpu, LZO_GPU_DIR, OUT_DIR, cwd, raw
  * Returns 0 on success and writes resolved path to out. Returns -1 on failure.

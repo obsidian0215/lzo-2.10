@@ -5,10 +5,36 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#if !defined(_WIN32) && !defined(_WIN64)
 #include <unistd.h>
+#else
+#include <windows.h>
+#endif
 #include <limits.h>
-#include <linux/limits.h>
 #include <sys/stat.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+static int lzo_get_executable_path(char* out, size_t outlen) {
+    if (!out || outlen == 0) return -1;
+#if defined(_WIN32) || defined(_WIN64)
+    {
+        DWORD n = GetModuleFileNameA(NULL, out, (DWORD)outlen);
+        if (n == 0 || n >= outlen) return -1;
+        out[n] = '\0';
+        return 0;
+    }
+#else
+    {
+        ssize_t n = readlink("/proc/self/exe", out, outlen - 1);
+        if (n <= 0) return -1;
+        out[n] = '\0';
+        return 0;
+    }
+#endif
+}
 
 unsigned long g_ocl_init_us = 0;
 unsigned long g_kernel_load_us = 0;
@@ -42,10 +68,15 @@ int lzo_find_file_path(const char *name, char *out, size_t outlen)
     }
     /* 2: exe dir and exe_dir/../lzo_gpu */
     char exe_path[PATH_MAX] = {0};
-    ssize_t r = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-    if (r > 0) {
-        exe_path[r] = '\0';
-        char *slash = strrchr(exe_path, '/');
+    if (lzo_get_executable_path(exe_path, sizeof(exe_path)) == 0) {
+        char *slash = strrchr(exe_path,
+#if defined(_WIN32) || defined(_WIN64)
+                              '\\'
+#else
+                              '/'
+#endif
+        );
+        if (!slash) slash = strrchr(exe_path, '/');
         if (slash) {
             *slash = '\0';
             snprintf(path, sizeof(path), "%s/%s", exe_path, name);
@@ -163,10 +194,15 @@ int lzo_apply_autotune_config(request_t* req)
     /* 2) exe-directory default: lzo_gpu.autotune.conf, .lzo_gpu.autotune.conf, or ../lzo_gpu/... */
     if (!f) {
         char exe_path[PATH_MAX] = {0};
-        ssize_t r = readlink("/proc/self/exe", exe_path, sizeof(exe_path)-1);
-        if (r > 0) {
-            exe_path[r] = '\0';
-            char* slash = strrchr(exe_path, '/');
+        if (lzo_get_executable_path(exe_path, sizeof(exe_path)) == 0) {
+            char* slash = strrchr(exe_path,
+#if defined(_WIN32) || defined(_WIN64)
+                                  '\\'
+#else
+                                  '/'
+#endif
+            );
+            if (!slash) slash = strrchr(exe_path, '/');
             if (slash) {
                 *slash = '\0';
                 snprintf(conf_path, sizeof(conf_path), "%s/lzo_gpu.autotune.conf", exe_path);

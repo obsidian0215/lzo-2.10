@@ -43,6 +43,7 @@ typedef struct {
     /* Hybrid split */
     hybrid_split_mode_t split_mode;
     double gpu_ratio;        /* GPU fraction [0.0, 1.0], default 0.8 */
+    size_t adaptive_sample_blocks;
 
     /* CPU worker */
     int cpu_threads;         /* number of CPU worker threads */
@@ -130,7 +131,8 @@ int hybrid_bench(
     const char* input_path,
     const hybrid_params_t* params,
     hybrid_workspace_t* ws,
-    double bench_seconds
+    double bench_seconds,
+    int include_file_io
 );
 
 #ifdef __cplusplus

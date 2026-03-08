@@ -650,7 +650,7 @@ static int lzo_compress_core_pipeline(
     {
         int i;
         for (i = 0; i < 2; i++) {
-            int rc = posix_memalign((void**)&host_stage[i], ALIGN_BYTES, chunk_bytes_max);
+            int rc = lzo_aligned_alloc_portable((void**)&host_stage[i], ALIGN_BYTES, chunk_bytes_max);
             if (rc != 0 || host_stage[i] == NULL) {
                 host_stage[i] = (unsigned char*)malloc(chunk_bytes_max);
             }
@@ -1095,7 +1095,7 @@ int lzo_compress_core(
         }
         /* upload_us will be measured after unmap */
     } else {
-        int rc_mem = posix_memalign(&host_in, ALIGN_BYTES, in_sz);
+        int rc_mem = lzo_aligned_alloc_portable(&host_in, ALIGN_BYTES, in_sz);
         if (rc_mem != 0 || host_in == NULL) {
             host_in = malloc(in_sz);
             if (!host_in) {
@@ -1107,7 +1107,7 @@ int lzo_compress_core(
         /* Use unified IO module */
         if (lzo_read_file_to_buf(input_path, host_in, in_sz, &read_us) != 0) {
             perror("lzo_read_file_to_buf");
-            free(host_in);
+            lzo_aligned_free_portable(host_in);
             return -1;
         }
         /* upload after blocking calc */
@@ -1139,10 +1139,10 @@ int lzo_compress_core(
         err = clEnqueueWriteBuffer(queue, d_in, CL_TRUE, 0, in_sz, host_in, 0, NULL, NULL);
         if (err != CL_SUCCESS) {
             fprintf(stderr, "[CORE] clEnqueueWriteBuffer failed: %d\n", err);
-            free(host_in);
+            lzo_aligned_free_portable(host_in);
             return -1;
         }
-        free(host_in);
+        lzo_aligned_free_portable(host_in);
         host_in = NULL;
         uint64_t t_upload_end2 = core_now_ns();
         upload_us = (t_upload_end2 - t_upload_start2) / 1000;

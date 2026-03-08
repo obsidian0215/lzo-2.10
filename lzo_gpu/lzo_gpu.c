@@ -1,22 +1,32 @@
+#if !defined(_WIN32)
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
+#endif
 #include <CL/cl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <stdint.h>
 #include <math.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
+#include <errno.h>
+#include <time.h>
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#include <io.h>
+#define access _access
+#define F_OK 0
+#define strcasecmp _stricmp
+#else
+#include <strings.h>
+#include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <errno.h>
 #include <libgen.h>
 #include <linux/limits.h>
 #include <signal.h>
-#include <time.h>
+#endif
 #include "lzo_defaults.h"
 #include "timing.h"
 #include "lzo_gpu_utils.h"
@@ -27,8 +37,21 @@
 
 #define now_ns lzo_now_ns
 
+#if defined(_WIN32) || defined(_WIN64)
+static int run_lzo_daemon(int argc, char** argv) {
+    (void)argc; (void)argv;
+    fprintf(stderr, "Daemon mode is not supported in Windows builds. Use standalone or bench mode.\n");
+    return 1;
+}
+static int run_lzo_client(int argc, char** argv) {
+    (void)argc; (void)argv;
+    fprintf(stderr, "--use-daemon is not supported in Windows builds. Use standalone mode.\n");
+    return 1;
+}
+#else
 int run_lzo_daemon(int argc, char** argv);
 int run_lzo_client(int argc, char** argv);
+#endif
 
 /* Helper for multi-threaded pread into a destination buffer.
 * 压缩文件格式：
@@ -44,15 +67,6 @@ uint32  len[nblk]               // 每块压缩长度
 //#define BLK_SIZE        (32 * 1024)
 /* Compression ratio tracking */
 #define ENABLE_COMPRESSION_RATIO_TRACKING 1
-
-#if defined(_WIN32) || defined(_WIN64)
-     * → counter * 1e9 / freq = 纳秒
-     */
-    return (uint64_t)counter.QuadPart * (uint64_t)1000000000ULL /
-        (uint64_t)freq.QuadPart;
-}
-
-#endif
 
 static inline void print_ns(const char* tag, uint64_t ns) {
     unsigned long us = (unsigned long)(ns / 1000ULL);
@@ -78,11 +92,23 @@ static cl_context  ctx;
 static cl_command_queue q;
 static cl_device_id dev;
 
+static cl_device_type preferred_opencl_device_type(void)
+{
+    const char* pref = getenv("FORCE_OPENCL_DEVICE");
+    if (!pref || !*pref) return CL_DEVICE_TYPE_GPU;
+    if (strcasecmp(pref, "CPU") == 0) return CL_DEVICE_TYPE_CPU;
+    if (strcasecmp(pref, "GPU") == 0) return CL_DEVICE_TYPE_GPU;
+    if (strcasecmp(pref, "DEFAULT") == 0) return CL_DEVICE_TYPE_DEFAULT;
+    if (strcasecmp(pref, "ALL") == 0) return CL_DEVICE_TYPE_ALL;
+    return CL_DEVICE_TYPE_GPU;
+}
+
 static void ocl_init(void)
 {
     uint64_t t1 = now_ns();
     cl_int err;
     cl_platform_id pf = NULL;
+    cl_device_type pref_type = preferred_opencl_device_type();
     err = clGetPlatformIDs(1, &pf, NULL);
     if (err != CL_SUCCESS || pf == NULL) {
         fprintf(stderr, "OpenCL init failed: clGetPlatformIDs err=%d\n", err);
@@ -91,11 +117,14 @@ static void ocl_init(void)
         return;
     }
 
-    err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_GPU, 1, &dev, NULL);
-    if (err != CL_SUCCESS) {
+    err = clGetDeviceIDs(pf, pref_type, 1, &dev, NULL);
+    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_GPU) {
+        err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_GPU, 1, &dev, NULL);
+    }
+    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_DEFAULT) {
         err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_DEFAULT, 1, &dev, NULL);
     }
-    if (err != CL_SUCCESS) {
+    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_ALL) {
         err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_ALL, 1, &dev, NULL);
     }
     if (err != CL_SUCCESS) {
@@ -1096,6 +1125,10 @@ int run_lzo_standalone(int argc, char** argv)
 
 /* --- Unified Tool Main Entry --- */
 static int stop_daemon(void) {
+#if defined(_WIN32) || defined(_WIN64)
+    fprintf(stderr, "--stop-daemon is not supported in Windows builds.\n");
+    return 1;
+#else
     const char* pid_path = lzo_daemon_pidfile_path();
     const char* sock_path = lzo_daemon_socket_path();
     FILE* f = fopen(pid_path, "r");
@@ -1134,6 +1167,7 @@ static int stop_daemon(void) {
     unlink(sock_path);
     printf("守护进程清理完成\n");
     return 0;
+#endif
 }
 
 int main(int argc, char** argv) {
