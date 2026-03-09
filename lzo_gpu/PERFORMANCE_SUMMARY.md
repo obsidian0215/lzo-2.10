@@ -373,8 +373,8 @@ fresh subset 验证表明：CPU OpenCL **功能上可运行**，并且在部分 
 
 | 参数 | 当前有效设置 |
 |------|-------------|
-| 基线结果文件 | `/root/lzo-2.10/exp_results/runs/20260307_221942/lzo_param_sweep.csv` |
-| 文件集 | 36 个已验证文件（来自 `/root/samples` 的当前 corrected base run 覆盖集） |
+| 基线结果文件 | `/root/lzo-2.10/exp_results/runs/20260309_merged_full_83/lzo_param_sweep_merged.csv` |
+| 文件集 | 83 个已验证文件（`/root/samples`，通过 stitched artifact 全覆盖） |
 | 频率点 | 100% |
 | 指标 | `CompKernelMBs`, `DecKernelMBs`, `CompTotalMBs`, `DecTotalMBs`, `Ratio%`, `CompCPUPower_W`, `CompGPUPower_W` |
 | 正确性 | 仅统计 `Roundtrip_OK=yes` 结果 |
@@ -383,7 +383,7 @@ fresh subset 验证表明：CPU OpenCL **功能上可运行**，并且在部分 
 
 当前采用：
 
-1. 对每个文件、每个 engine（CPU/GPU）在自己的配置空间中选最佳 `CompTotalMBs`；
+1. 对每个文件、每个 engine（`CPU lzo1x` / `CPU lzo1y` / `GPU lzo1x` / `GPU lzo1y`）在自己的配置空间中选最佳 `CompTotalMBs`；
 2. 再对所有文件做 best-per-file median；
 3. kernel throughput 用来解释 headroom，**不作为最终比较结论的主指标**。
 
@@ -391,28 +391,30 @@ fresh subset 验证表明：CPU OpenCL **功能上可运行**，并且在部分 
 
 | Engine | Comp total MB/s | Dec total MB/s | Comp kernel MB/s | Dec kernel MB/s | Ratio % | Comp power W |
 |---|---:|---:|---:|---:|---:|---:|
-| CPU | 824.76 | 690.77 | 3149.84 | 1667.99 | 13.93 | 14.12 |
-| **GPU** | **1501.12** | **811.37** | **9242.84** | **16692.40** | 13.95 | **13.67** |
+| CPU lzo1x | 615.68 | 642.44 | 2074.46 | 1765.48 | 21.68 | 14.74 |
+| CPU lzo1y | 613.45 | 642.66 | 1994.41 | 1756.91 | 22.12 | 14.80 |
+| **GPU lzo1x** | **1334.63** | **808.86** | **5828.83** | **11600.56** | **23.38** | **13.85** |
+| GPU lzo1y | 1330.73 | 808.09 | 5643.52 | 11587.72 | 23.19 | 14.15 |
 
 ### 6.5 当前结果分析
 
 #### 6.5.1 total throughput
 
-- compression total: GPU / CPU = **1.82x**
-- decompression total: GPU / CPU = **1.17x**
+- compression total: `GPU lzo1x / CPU lzo1x = 2.17x`，`GPU lzo1y / CPU lzo1y = 2.17x`
+- decompression total: `GPU lzo1x / CPU lzo1x = 1.26x`，`GPU lzo1y / CPU lzo1y = 1.26x`
 
 这说明 corrected 之后，LZO GPU 仍然是 LZO family 中最强的默认引擎。
 
 #### 6.5.2 ratio
 
-当前 GPU ratio = 13.95%，CPU ratio = 13.93%，几乎等价。也就是说，GPU 的加速不是通过显著牺牲压缩率获得的。
+当前 best-per-file medians 下，`lzo1x` 的 GPU ratio 为 23.38%，CPU 为 21.68%；`lzo1y` 的 GPU ratio 为 23.19%，CPU 为 22.12%。也就是说，GPU 的加速不是通过灾难性牺牲压缩率获得的，但也不能再写成“完全零代价”。
 
 #### 6.5.3 power
 
 当前 active compression power：
 
-- CPU = 14.12W
-- GPU = 13.67W
+- CPU lzo1x = 14.74W，CPU lzo1y = 14.80W
+- GPU lzo1x = 13.85W，GPU lzo1y = 14.15W
 
 因此当前结果不应描述为“GPU 更快但更耗电”，而应描述为：
 
@@ -422,8 +424,8 @@ fresh subset 验证表明：CPU OpenCL **功能上可运行**，并且在部分 
 
 当前 GPU best-per-file medians：
 
-- compression: 9242.84 MB/s kernel vs 1501.12 MB/s total
-- decompression: 16692.40 MB/s kernel vs 811.37 MB/s total
+- `GPU lzo1x`：5828.83 MB/s kernel vs 1334.63 MB/s total，11600.56 MB/s kernel vs 808.86 MB/s total
+- `GPU lzo1y`：5643.52 MB/s kernel vs 1330.73 MB/s total，11587.72 MB/s kernel vs 808.09 MB/s total
 
 这说明 LZO GPU 当前仍然是典型的“kernel 很强，但系统交付仍受 runtime/file-backed path 约束”的后端。因此 total throughput 才是决定系统结论的主指标。
 
@@ -432,15 +434,15 @@ fresh subset 验证表明：CPU OpenCL **功能上可运行**，并且在部分 
 在 corrected steady-state total semantics 下：
 
 1. **GPU 仍然明确优于 CPU**；
-2. **压缩率几乎不变**；
-3. **active compression power 不升反降**；
+2. **`lzo1x` 与 `lzo1y` 两条 GPU 路径表现几乎并列**；
+3. **active compression power 仍不高于 CPU，部分情况下更低**；
 4. 因此 `lzo_gpu` 依然是当前项目中最强的 GPU 路径之一。
 
 ### 6.7 与 hybrid 和 CPU OpenCL 的关系
 
 当前 LZO family 的关系应表述为：
 
-- **GPU-only 仍是默认最佳引擎**；
+- **GPU-only 仍是默认最佳引擎**，但当前应按 `lzo1x` / `lzo1y` 分别分析；
 - **Hybrid 在 corrected methodology 下已被重新评估为“次优但非异常差”**，说明之前的极端悲观印象部分来自测量口径问题；
 - **CPU OpenCL 已验证可运行，但没有形成稳定优于 native CPU path 的证据**。
 
@@ -473,14 +475,14 @@ fresh subset 验证表明：CPU OpenCL **功能上可运行**，并且在部分 
 
 1. **LZO GPU 的架构与实现已经成熟**：包含 standalone / daemon / client、内核与主机端 runtime、workspace/buffer 复用、向量化解压路径等完整组件。
 2. **历史优化路径仍然重要**：32-bit 紧凑字典、延迟写入、主机端 buffer 复用等，是当前结果成立的关键前提。
-3. **当前 corrected baseline 证明 GPU 是 LZO family 的主导引擎**：在 steady-state total throughput 下压缩 1.82x 于 CPU、解压 1.17x 于 CPU。
-4. **ratio 与 power 都没有破坏这个结论**：GPU 几乎不牺牲压缩率，且 active compression power 略低于 CPU。
+3. **当前 corrected baseline 证明 GPU 是 LZO family 的主导引擎**：在 steady-state total throughput 下，`lzo1x` / `lzo1y` 压缩都约为 CPU 的 2.17x，解压约为 1.26x。
+4. **ratio 与 power 都没有破坏这个结论**：GPU 的 ratio 成本有限，且 active compression power 仍不高于 CPU。
 5. **CPU OpenCL 当前不应被写成默认推荐设计**：它验证了统一 OpenCL backend 的可行性，但在本轮结果里更适合作为 portability/fallback path。
-6. **跨家族比较需谨慎**：当前可以确认 `lzo_gpu` 是强结果，但若要严格断言优于 `lz4_gpu`，仍应使用 matched-corpus 对照。
+6. **跨家族比较需谨慎**：当前可以确认 `lzo_gpu` 是强结果，但若要严格断言与 `lz4_gpu` 的排序，必须使用 matched-corpus 对照；在 fresh 83-file matched view 中，`lz4_gpu` 仍快于 `lzo_gpu`。
 
 简言之：
 
-> 当前 `lzo_gpu` 是一条既有完整系统结构、又经过历史优化收敛、并且在 corrected steady-state total semantics 下仍然强势的正式主路径。
+> 当前 `lzo_gpu` 是一条既有完整系统结构、又经过历史优化收敛、并且在 fresh 83-file corrected stitched artifact 下仍然强势的正式主路径。
 
 ## 9. 2026-03-09 块大小敏感性快照
 

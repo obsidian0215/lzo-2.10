@@ -706,7 +706,7 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
         /* Build with appropriate macros based on variant flags. */
         char build_opts[320];
         snprintf(build_opts, sizeof(build_opts),
-             "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I. -I./lzo_gpu -I.. -D D_BITS=%d -D LZO_GPU_DEBUG_COUNTERS_RUNTIME=%d",
+             "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I. -I./lzo_gpu -I../lzo_gpu -I.. -D D_BITS=%d -D LZO_GPU_DEBUG_COUNTERS_RUNTIME=%d",
              bits, dbg_flag ? 1 : 0);
         err = clBuildProgram(prog, 1, &dev, build_opts, NULL, NULL);
         if (err != CL_SUCCESS) {

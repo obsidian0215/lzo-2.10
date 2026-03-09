@@ -164,8 +164,8 @@ GPU 内核直接复用 `lzo_gpu` 的实现，包含以下核心组件：
 
 当前有效结论只引用：
 
-- CPU/GPU baseline：`/root/lzo-2.10/exp_results/runs/20260307_221942/lzo_param_sweep.csv`
-- hybrid corrected rerun：`/root/lzo-2.10/exp_results/runs/20260308_171419/lzo_param_sweep.csv`
+- CPU/GPU/hybrid stitched artifact：`/root/lzo-2.10/exp_results/runs/20260309_merged_full_83/lzo_param_sweep_merged.csv`
+- full-corpus analysis bundle：`/root/analysis/20260309_full_refresh/lzo_best_per_file_medians.json`
 
 历史 sweep 中每个配置曾在 3 个频率点（40%, 70%, 100%）测试，共 84 个测试文件（~7.3GB 总大小）。
 
@@ -203,33 +203,33 @@ GPU 内核直接复用 `lzo_gpu` 的实现，包含以下核心组件：
 
 ### 5.2 当前结果文件
 
-- CPU/GPU baseline：`/root/lzo-2.10/exp_results/runs/20260307_221942/lzo_param_sweep.csv`
-- Hybrid corrected run：`/root/lzo-2.10/exp_results/runs/20260308_171419/lzo_param_sweep.csv`
+- stitched artifact：`/root/lzo-2.10/exp_results/runs/20260309_merged_full_83/lzo_param_sweep_merged.csv`
+- provenance manifest：`/root/lzo-2.10/exp_results/runs/20260309_merged_full_83/merge_manifest.json`
 
 ### 5.3 当前 best-per-engine medians
 
 | Engine | Comp total MB/s | Dec total MB/s | Comp kernel MB/s | Dec kernel MB/s | Ratio % | Comp power W |
 |---|---:|---:|---:|---:|---:|---:|
-| CPU | 824.76 | 690.77 | 3149.84 | 1667.99 | 13.93 | 14.12 |
-| **GPU** | **1501.12** | **811.37** | **9242.84** | **16692.40** | 13.95 | **13.67** |
-| Hybrid fixed | 883.18 | 680.84 | 2205.38 | 1790.59 | 22.79 | 15.74 |
-| Hybrid adaptive | 824.87 | 716.77 | 1745.84 | 1673.55 | 22.74 | 15.04 |
+| CPU lzo1x | 615.68 | 642.44 | 2074.46 | 1765.48 | 21.68 | 14.74 |
+| GPU lzo1x | **1334.63** | 808.86 | **5828.83** | **11600.56** | 23.38 | 13.85 |
+| Hybrid fixed lzo1x | 925.46 | 821.24 | 2477.15 | 2292.82 | 21.68 | 12.28 |
+| Hybrid adaptive lzo1x | 927.49 | **897.38** | 2580.50 | 2748.89 | 21.68 | 12.27 |
+| CPU lzo1y | 613.45 | 642.66 | 1994.41 | 1756.91 | 22.12 | 14.80 |
+| GPU lzo1y | 1330.73 | 808.09 | 5643.52 | 11587.72 | 23.19 | 14.15 |
+| Hybrid fixed lzo1y | 926.01 | 812.25 | 2477.46 | 2256.97 | 22.12 | 12.26 |
+| Hybrid adaptive lzo1y | **942.86** | **900.74** | **2643.72** | 2673.32 | 22.12 | 12.27 |
 
 ### 5.4 Winner counts
 
 **Compression total throughput**：
 
-- GPU：**32**
-- CPU：**3**
-- Hybrid fixed：**1**
-- Hybrid adaptive：**0**
+- `lzo1x`：GPU 62，Hybrid fixed 17，Hybrid adaptive 4
+- `lzo1y`：GPU 60，Hybrid fixed 18，Hybrid adaptive 5
 
 **Decompression total throughput**：
 
-- GPU：**29**
-- CPU：**1**
-- Hybrid fixed：**2**
-- Hybrid adaptive：**4**
+- `lzo1x`：Hybrid adaptive 48，GPU 23，Hybrid fixed 12
+- `lzo1y`：Hybrid adaptive 52，GPU 23，Hybrid fixed 8
 
 ### 5.5 Fixed vs adaptive
 
@@ -237,24 +237,28 @@ GPU 内核直接复用 `lzo_gpu` 的实现，包含以下核心组件：
 
 | Mode | Comp total MB/s | Dec total MB/s |
 |---|---:|---:|
-| Fixed | **495.81** | **516.75** |
-| Adaptive | 460.57 | 428.35 |
+| lzo1x fixed | 748.03 | 745.72 |
+| lzo1x adaptive | **906.62** | **833.92** |
+| lzo1y fixed | 748.44 | 742.69 |
+| lzo1y adaptive | **913.59** | **833.89** |
 
 **Best-per-file median**：
 
 | Mode | Comp total MB/s | Dec total MB/s |
 |---|---:|---:|
-| Fixed | **883.18** | 680.84 |
-| Adaptive | 824.87 | **716.77** |
+| lzo1x fixed | 925.46 | 821.24 |
+| lzo1x adaptive | **927.49** | **897.38** |
+| lzo1y fixed | 926.01 | 812.25 |
+| lzo1y adaptive | **942.86** | **900.74** |
 
 ### 5.6 当前正确解读
 
 当前 corrected 结果的结论需要分两层理解：
 
-1. **GPU 仍是 LZO family 的总吞吐冠军**；
+1. **GPU 仍是 LZO family 的 compression 主路径**；
 2. **此前 hybrid 被严重低估，原因是旧 Python harness 用额外 outer-process file-backed runs 覆盖了 binary 自己的 repeated-loop totals**；
-3. **在新的 warmed in-binary `--bench-io` 语义下，Hybrid 已不再“异常差”，但仍不足以推翻 GPU 的默认最佳引擎地位**；
-4. **Adaptive 当前更准确地表现为：解压优于 fixed，压缩不如 fixed。**
+3. **在 stitched 83-file full-corpus 结果中，adaptive 已不再弱于 fixed**；
+4. **Adaptive 当前更准确地表现为：解压明显优于 fixed，并在部分模式下压缩也更强。**
 
 因此旧文档中的 “Hybrid 在压缩 total 上 100% 胜出” 必须废弃；上一版把 hybrid 写得过度悲观的结论也必须废弃。
 
@@ -264,12 +268,13 @@ GPU 内核直接复用 `lzo_gpu` 的实现，包含以下核心组件：
 
 如果目标是当前平台上的实际部署默认值，则推荐：
 
-- **默认引擎**：GPU-only
-- **理由**：当前 corrected total throughput、ratio、power 三项综合最优
+- **默认压缩引擎**：GPU-only
+- **默认解压协同研究模式**：adaptive hybrid
+- **理由**：当前结果已经从“GPU 全面统治”演变为“GPU 负责 compression，adaptive hybrid 在 decompression 上更强”
 
 ### 6.2 Hybrid 的当前合理定位
 
-Hybrid 不再适合作为默认推荐路径，但仍适合作为：
+Hybrid 不再适合作为统一默认推荐路径，但仍适合作为：
 
 - CPU/GPU 协同研究路径
 - adaptive split 研究平台
@@ -277,10 +282,10 @@ Hybrid 不再适合作为默认推荐路径，但仍适合作为：
 
 ### 6.3 Adaptive 的推荐理解方式
 
-当前 adaptive 的作用不是“让 hybrid 逆袭 GPU”，而是：
+当前 adaptive 的作用不是“让 hybrid 全面逆袭 GPU”，而是：
 
 - 在 hybrid 自身内部提供另一种 split 选择；
-- 在当前结果中，**decompression best-per-file 优于 fixed**，但 **compression 仍落后 fixed**；
+- 在当前结果中，**decompression best-per-file 明显优于 fixed**，并且在 `lzo1x` / `lzo1y` 上的 compression 也不再弱于 fixed；
 - 为后续更强调度策略保留真实实现入口。
 
 ## 7. 压缩率对比（按 corrected 结果更新）
@@ -289,18 +294,22 @@ Hybrid 不再适合作为默认推荐路径，但仍适合作为：
 
 | 引擎 | Ratio% |
 |------|-------:|
-| CPU | 13.93 |
-| GPU | 13.95 |
-| Hybrid fixed | 22.79 |
-| Hybrid adaptive | 22.74 |
+| CPU lzo1x | 21.68 |
+| GPU lzo1x | 23.38 |
+| Hybrid fixed lzo1x | 21.68 |
+| Hybrid adaptive lzo1x | 21.68 |
+| CPU lzo1y | 22.12 |
+| GPU lzo1y | 23.19 |
+| Hybrid fixed lzo1y | 22.12 |
+| Hybrid adaptive lzo1y | 22.12 |
 
 这与旧文档“压缩率三者基本一致”的结论已经不同。
 
 当前正确解释为：
 
-- CPU 与 GPU 压缩率几乎等价；
-- Hybrid 两种模式的 ratio 明显更差；
-- 这说明当前 hybrid 容器与分路策略会带来实际 ratio 成本，而不能再被视作“几乎免费”的协同方式。
+- CPU 与 Hybrid 在同一算法线上的 ratio 已非常接近；
+- GPU ratio 略高，但不构成灾难性代价；
+- 这说明 LZO family 的 ratio trade-off 与 LZ4 family 不同，不能套用旧的统一描述。
 
 ## 7.1 CPU OpenCL 路径的当前定位
 
@@ -316,14 +325,14 @@ Hybrid 不再适合作为默认推荐路径，但仍适合作为：
 
 1. **LZO hybrid 的系统结构和实现细节仍然重要**：CPU/GPU 分路、atomic 工作窃取、OpenCL workspace、adaptive split 等都是真实存在且可复现的实现资产。  
 2. **但当前 corrected 结果已经推翻旧结论**：Hybrid 不再是三引擎最优，更没有“100% 胜出”。同时，也不能再把 hybrid 描述成“几乎完全没有价值”的异常差路径。  
-3. **GPU 是当前 LZO family 的主导引擎**：吞吐最高、压缩率与 CPU 接近、active compression power 也更优。  
-4. **Adaptive 只在 hybrid 内部提供部分改善**：当前它提升了解压侧表现，但 compression 仍落后 fixed。  
+3. **GPU 是当前 LZO family 的 compression 主导引擎**：吞吐最高、active compression power 也更优。  
+4. **Adaptive 已经不只是次要改善**：当前它在解压侧形成了明确优势，并在 fresh stitched artifact 上整体强于 fixed。  
 5. **CPU OpenCL 虽然已确认可运行，但当前只适合作为 portability / research path**，不构成替代 native CPU path 或当前 hybrid 设计的依据。  
-6. **LZO hybrid 当前最合理的定位是研究型协同后端，而不是默认部署路径。**
+6. **LZO hybrid 当前最合理的定位是解压侧更强的研究型协同后端，而不是统一默认部署路径。**
 
 简言之：
 
-> `lzo_hybrid` 现在应被写成一个“结构完整、实现真实、调度仍待继续优化、且二次修正测量语义后获得更合理 total-throughput 数据”的 CPU--GPU 协同系统，而不应再写成已经全面超越 CPU/GPU 的最终答案。
+> `lzo_hybrid` 现在应被写成一个“结构完整、实现真实、调度经过 full-corpus stitched 验证后已显示出解压优势”的 CPU--GPU 协同系统；它不是新的统一默认引擎，但 adaptive 已经成为当前最值得继续优化的协同模式。
 
 ## 9. 2026-03-09 调度优化快照
 
