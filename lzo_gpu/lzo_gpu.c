@@ -517,7 +517,7 @@ static int run_lzo_bench(const char *in_path,
     cl_uint krn_num_args = 0;
     int kernel_has_dbg_dec = 0;
     if (clGetKernelInfo(krn_d, CL_KERNEL_NUM_ARGS, sizeof(krn_num_args), &krn_num_args, NULL) == CL_SUCCESS) {
-        kernel_has_dbg_dec = (krn_num_args >= 9U);
+        kernel_has_dbg_dec = (krn_num_args >= 10U);
     }
 
     lzo_gpu_workspace_t ws;
@@ -554,12 +554,11 @@ static int run_lzo_bench(const char *in_path,
 
     /* --- Host-side optimization: pre-allocate reusable resources --- */
     /* Decompression CL buffers (reused across iterations, grown if needed) */
-    cl_mem bench_d_comp = NULL, bench_d_off = NULL, bench_d_out = NULL, bench_d_out_lens = NULL;
-    size_t bench_d_comp_cap = 0, bench_d_off_cap = 0, bench_d_out_cap = 0, bench_d_out_lens_cap = 0;
+    cl_mem bench_d_off = NULL, bench_d_comp_lens = NULL, bench_d_out = NULL, bench_d_out_lens = NULL;
+    size_t bench_d_off_cap = 0, bench_d_comp_lens_cap = 0, bench_d_out_cap = 0, bench_d_out_lens_cap = 0;
     /* Reusable host arrays (grown if needed) */
     cl_uint *bench_h_lens = NULL, *bench_h_off = NULL, *bench_h_out_lens = NULL;
-    unsigned char *bench_packed = NULL;
-    size_t bench_h_lens_cap = 0, bench_h_off_cap = 0, bench_h_out_lens_cap = 0, bench_packed_cap = 0;
+    size_t bench_h_lens_cap = 0, bench_h_off_cap = 0, bench_h_out_lens_cap = 0;
     /* Decompression kernel args that stay constant across iterations */
     int bench_dec_kernel_set = 0;
     /* Cached decompression dispatch sizes */
@@ -597,22 +596,17 @@ static int run_lzo_bench(const char *in_path,
             bench_h_lens = (cl_uint*)malloc(nblk * sizeof(cl_uint));
             bench_h_lens_cap = bench_h_lens ? nblk * sizeof(cl_uint) : 0;
         }
-        if ((nblk + 1) * sizeof(cl_uint) > bench_h_off_cap) {
+        if (nblk * sizeof(cl_uint) > bench_h_off_cap) {
             free(bench_h_off);
-            bench_h_off = (cl_uint*)malloc((nblk + 1) * sizeof(cl_uint));
-            bench_h_off_cap = bench_h_off ? (nblk + 1) * sizeof(cl_uint) : 0;
+            bench_h_off = (cl_uint*)malloc(nblk * sizeof(cl_uint));
+            bench_h_off_cap = bench_h_off ? nblk * sizeof(cl_uint) : 0;
         }
         if (nblk * sizeof(cl_uint) > bench_h_out_lens_cap) {
             free(bench_h_out_lens);
             bench_h_out_lens = (cl_uint*)malloc(nblk * sizeof(cl_uint));
             bench_h_out_lens_cap = bench_h_out_lens ? nblk * sizeof(cl_uint) : 0;
         }
-        if (comp_total > bench_packed_cap) {
-            free(bench_packed);
-            bench_packed = (unsigned char*)malloc(comp_total);
-            bench_packed_cap = bench_packed ? comp_total : 0;
-        }
-        if (!bench_h_lens || !bench_h_off || !bench_h_out_lens || !bench_packed) {
+        if (!bench_h_lens || !bench_h_off || !bench_h_out_lens) {
             verify_ok = 0;
             goto iter_cleanup;
         }
@@ -628,30 +622,14 @@ static int run_lzo_bench(const char *in_path,
         clEnqueueUnmapMemObject(q, ws.d_len, map_len, 0, NULL, NULL);
         clFinish(q);
 
-        void* map_out = clEnqueueMapBuffer(q, ws.d_out, CL_TRUE, CL_MAP_READ,
-                                           0, nblk * worst_blk,
-                                           0, NULL, NULL, &err);
-        if (err != CL_SUCCESS || !map_out) {
-            verify_ok = 0;
-            goto iter_cleanup;
-        }
-
-        size_t co = 0;
-        bench_h_off[0] = 0;
         for (size_t i = 0; i < nblk; ++i) {
-            size_t csz = (size_t)bench_h_lens[i];
-            if (co + csz > comp_total) {
+            if ((size_t)bench_h_lens[i] > worst_blk) {
                 verify_ok = 0;
                 break;
             }
-            memcpy(bench_packed + co, ((unsigned char*)map_out) + i * worst_blk, csz);
-            co += csz;
-            bench_h_off[i + 1] = (cl_uint)co;
+            bench_h_off[i] = (cl_uint)(i * worst_blk);
         }
-        clEnqueueUnmapMemObject(q, ws.d_out, map_out, 0, NULL, NULL);
-        clFinish(q);
-        if (!verify_ok || co != comp_total) {
-            verify_ok = 0;
+        if (!verify_ok) {
             goto iter_cleanup;
         }
 
@@ -659,18 +637,18 @@ static int run_lzo_bench(const char *in_path,
         uint64_t dec_total_start = now_ns();
 
         /* Grow decompression CL buffers only when capacity is insufficient */
-        if (comp_total > bench_d_comp_cap) {
-            if (bench_d_comp) clReleaseMemObject(bench_d_comp);
-            bench_d_comp = clCreateBuffer(ctx, CL_MEM_READ_ONLY, comp_total, NULL, &err);
-            if (err != CL_SUCCESS || !bench_d_comp) { bench_d_comp = NULL; bench_d_comp_cap = 0; verify_ok = 0; goto iter_cleanup; }
-            bench_d_comp_cap = comp_total;
-            bench_dec_kernel_set = 0; /* kernel args need re-binding */
-        }
-        if ((nblk + 1) * sizeof(cl_uint) > bench_d_off_cap) {
+        if (nblk * sizeof(cl_uint) > bench_d_off_cap) {
             if (bench_d_off) clReleaseMemObject(bench_d_off);
-            bench_d_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY, (nblk + 1) * sizeof(cl_uint), NULL, &err);
+            bench_d_off = clCreateBuffer(ctx, CL_MEM_READ_ONLY, nblk * sizeof(cl_uint), NULL, &err);
             if (err != CL_SUCCESS || !bench_d_off) { bench_d_off = NULL; bench_d_off_cap = 0; verify_ok = 0; goto iter_cleanup; }
-            bench_d_off_cap = (nblk + 1) * sizeof(cl_uint);
+            bench_d_off_cap = nblk * sizeof(cl_uint);
+            bench_dec_kernel_set = 0;
+        }
+        if (nblk * sizeof(cl_uint) > bench_d_comp_lens_cap) {
+            if (bench_d_comp_lens) clReleaseMemObject(bench_d_comp_lens);
+            bench_d_comp_lens = clCreateBuffer(ctx, CL_MEM_READ_ONLY, nblk * sizeof(cl_uint), NULL, &err);
+            if (err != CL_SUCCESS || !bench_d_comp_lens) { bench_d_comp_lens = NULL; bench_d_comp_lens_cap = 0; verify_ok = 0; goto iter_cleanup; }
+            bench_d_comp_lens_cap = nblk * sizeof(cl_uint);
             bench_dec_kernel_set = 0;
         }
         if (in_size > bench_d_out_cap) {
@@ -688,9 +666,8 @@ static int run_lzo_bench(const char *in_path,
             bench_dec_kernel_set = 0;
         }
 
-        /* Non-blocking uploads: enqueue both, then flush */
-        err  = clEnqueueWriteBuffer(q, bench_d_comp, CL_FALSE, 0, comp_total, bench_packed, 0, NULL, NULL);
-        err |= clEnqueueWriteBuffer(q, bench_d_off, CL_FALSE, 0, (nblk + 1) * sizeof(cl_uint), bench_h_off, 0, NULL, NULL);
+        err  = clEnqueueWriteBuffer(q, bench_d_off, CL_FALSE, 0, nblk * sizeof(cl_uint), bench_h_off, 0, NULL, NULL);
+        err |= clEnqueueWriteBuffer(q, bench_d_comp_lens, CL_FALSE, 0, nblk * sizeof(cl_uint), bench_h_lens, 0, NULL, NULL);
         if (err != CL_SUCCESS) {
             verify_ok = 0;
             goto iter_cleanup;
@@ -701,13 +678,14 @@ static int run_lzo_bench(const char *in_path,
             cl_uint blk_sz = (cl_uint)blk;
             cl_uint orig_sz = (cl_uint)in_size;
             cl_uint nblk_cl = (cl_uint)nblk;
-            CHECK(clSetKernelArg(krn_d, 0, sizeof(cl_mem), &bench_d_comp));
+            CHECK(clSetKernelArg(krn_d, 0, sizeof(cl_mem), &ws.d_out));
             CHECK(clSetKernelArg(krn_d, 1, sizeof(cl_mem), &bench_d_off));
-            CHECK(clSetKernelArg(krn_d, 2, sizeof(cl_mem), &bench_d_out));
-            CHECK(clSetKernelArg(krn_d, 3, sizeof(cl_mem), &bench_d_out_lens));
-            CHECK(clSetKernelArg(krn_d, 4, sizeof(cl_uint), &blk_sz));
-            CHECK(clSetKernelArg(krn_d, 5, sizeof(cl_uint), &orig_sz));
-            CHECK(clSetKernelArg(krn_d, 6, sizeof(cl_uint), &nblk_cl));
+            CHECK(clSetKernelArg(krn_d, 2, sizeof(cl_mem), &bench_d_comp_lens));
+            CHECK(clSetKernelArg(krn_d, 3, sizeof(cl_mem), &bench_d_out));
+            CHECK(clSetKernelArg(krn_d, 4, sizeof(cl_mem), &bench_d_out_lens));
+            CHECK(clSetKernelArg(krn_d, 5, sizeof(cl_uint), &blk_sz));
+            CHECK(clSetKernelArg(krn_d, 6, sizeof(cl_uint), &orig_sz));
+            CHECK(clSetKernelArg(krn_d, 7, sizeof(cl_uint), &nblk_cl));
 
             int dbg_dec_enabled = (debug_counters && kernel_has_dbg_dec);
             if (dbg_dec_enabled) {
@@ -732,8 +710,8 @@ static int run_lzo_bench(const char *in_path,
             if (kernel_has_dbg_dec) {
                 cl_mem dbg_arg = dbg_dec_enabled ? d_dbg_dec : bench_d_out_lens;
                 cl_uint dbg_flag = dbg_dec_enabled ? 1U : 0U;
-                CHECK(clSetKernelArg(krn_d, 7, sizeof(cl_mem), &dbg_arg));
-                CHECK(clSetKernelArg(krn_d, 8, sizeof(cl_uint), &dbg_flag));
+                CHECK(clSetKernelArg(krn_d, 8, sizeof(cl_mem), &dbg_arg));
+                CHECK(clSetKernelArg(krn_d, 9, sizeof(cl_uint), &dbg_flag));
             }
 
             /* Compute dispatch sizes once */
@@ -852,14 +830,13 @@ static int run_lzo_bench(const char *in_path,
     }
 
     /* Free bench-loop persistent resources */
-    if (bench_d_comp) clReleaseMemObject(bench_d_comp);
     if (bench_d_off) clReleaseMemObject(bench_d_off);
+    if (bench_d_comp_lens) clReleaseMemObject(bench_d_comp_lens);
     if (bench_d_out) clReleaseMemObject(bench_d_out);
     if (bench_d_out_lens) clReleaseMemObject(bench_d_out_lens);
     free(bench_h_lens);
     free(bench_h_off);
     free(bench_h_out_lens);
-    free(bench_packed);
 
     clock_gettime(CLOCK_MONOTONIC, &ts1);
     double sec = elapsed_sec(&ts0, &ts1);

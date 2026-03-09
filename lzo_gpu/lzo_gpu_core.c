@@ -234,6 +234,7 @@ void lzo_gpu_workspace_free(lzo_gpu_workspace_t* ws) {
     if (ws->d_dict) clReleaseMemObject(ws->d_dict);
     if (ws->d_comp) clReleaseMemObject(ws->d_comp);
     if (ws->d_off) clReleaseMemObject(ws->d_off);
+    if (ws->d_comp_lens) clReleaseMemObject(ws->d_comp_lens);
     if (ws->d_decomp_out) clReleaseMemObject(ws->d_decomp_out);
     if (ws->d_out_lens) clReleaseMemObject(ws->d_out_lens);
     memset(ws, 0, sizeof(lzo_gpu_workspace_t));
@@ -1504,26 +1505,44 @@ int lzo_decompress_core(
     unsigned long buf_comp_us = (t_buf_comp_end - t_buf_comp_start) / 1000;
 
     /* Buffer Alloc (off) timing removed per request; keep allocation but don't time it */
-    cl_mem d_off = core_get_or_create_buffer(ctx, &ws->d_off, &ws->off_size, (nblk + 1) * sizeof(cl_uint), CL_MEM_READ_ONLY, &err); CHECK(err);
+    cl_mem d_off = core_get_or_create_buffer(ctx, &ws->d_off, &ws->off_size, nblk * sizeof(cl_uint), CL_MEM_READ_ONLY, &err); CHECK(err);
+    cl_mem d_comp_lens = core_get_or_create_buffer(ctx, &ws->d_comp_lens, &ws->comp_lens_size, nblk * sizeof(cl_uint), CL_MEM_READ_ONLY, &err); CHECK(err);
 
     /* Build offsets directly into device-backed buffer to avoid host off_arr allocation/upload. */
     {
         void* mapped_off = clEnqueueMapBuffer(queue, d_off, CL_TRUE, CL_MAP_WRITE,
-                                              0, (nblk + 1) * sizeof(cl_uint),
+                                              0, nblk * sizeof(cl_uint),
                                               0, NULL, NULL, &err);
         if (err != CL_SUCCESS || !mapped_off) {
             fprintf(stderr, "[DECOMP] clEnqueueMapBuffer d_off failed: %d\n", err);
             goto cleanup;
         }
+        void* mapped_lens = clEnqueueMapBuffer(queue, d_comp_lens, CL_TRUE, CL_MAP_WRITE,
+                                               0, nblk * sizeof(cl_uint),
+                                               0, NULL, NULL, &err);
+        if (err != CL_SUCCESS || !mapped_lens) {
+            fprintf(stderr, "[DECOMP] clEnqueueMapBuffer d_comp_lens failed: %d\n", err);
+            clEnqueueUnmapMemObject(queue, d_off, mapped_off, 0, NULL, NULL);
+            goto cleanup;
+        }
         {
             cl_uint* off_dev = (cl_uint*)mapped_off;
-            off_dev[0] = 0;
-            for (uint32_t i = 0; i < nblk; ++i)
-                off_dev[i + 1] = off_dev[i] + len_arr[i];
+            cl_uint* lens_dev = (cl_uint*)mapped_lens;
+            cl_uint off = 0;
+            for (uint32_t i = 0; i < nblk; ++i) {
+                off_dev[i] = off;
+                lens_dev[i] = len_arr[i];
+                off += len_arr[i];
+            }
         }
         err = clEnqueueUnmapMemObject(queue, d_off, mapped_off, 0, NULL, NULL);
         if (err != CL_SUCCESS) {
             fprintf(stderr, "[DECOMP] clEnqueueUnmapMemObject d_off failed: %d\n", err);
+            goto cleanup;
+        }
+        err = clEnqueueUnmapMemObject(queue, d_comp_lens, mapped_lens, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "[DECOMP] clEnqueueUnmapMemObject d_comp_lens failed: %d\n", err);
             goto cleanup;
         }
     }
@@ -1600,18 +1619,19 @@ int lzo_decompress_core(
 
     CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_comp));
     CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_off));
-    CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &d_out));
-    CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &d_out_lens));
-    CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uint), &blk_sz));
-    CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uint), &orig_sz));
-    CHECK(clSetKernelArg(kernel, 6, sizeof(cl_uint), &nblk));
+    CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &d_comp_lens));
+    CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &d_out));
+    CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &d_out_lens));
+    CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uint), &blk_sz));
+    CHECK(clSetKernelArg(kernel, 6, sizeof(cl_uint), &orig_sz));
+    CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uint), &nblk));
 
     {
         cl_uint kernel_num_args = 0;
         int kernel_has_dbg = 0;
         int dbg_dec_enabled = lzo_debug_counters_enabled();
         if (clGetKernelInfo(kernel, CL_KERNEL_NUM_ARGS, sizeof(kernel_num_args), &kernel_num_args, NULL) == CL_SUCCESS) {
-            kernel_has_dbg = (kernel_num_args >= 9U);
+            kernel_has_dbg = (kernel_num_args >= 10U);
         }
         if (dbg_dec_enabled && !kernel_has_dbg) {
             fprintf(stderr, "[LZO-DBG][DECOMP] warning: kernel has no debug args, counters disabled\n");
@@ -1630,8 +1650,8 @@ int lzo_decompress_core(
         if (kernel_has_dbg) {
             cl_mem dbg_arg = dbg_dec_enabled ? dbg_dec_buf : d_out_lens;
             cl_uint dbg_flag = dbg_dec_enabled ? 1U : 0U;
-            CHECK(clSetKernelArg(kernel, 7, sizeof(cl_mem), &dbg_arg));
-            CHECK(clSetKernelArg(kernel, 8, sizeof(cl_uint), &dbg_flag));
+            CHECK(clSetKernelArg(kernel, 8, sizeof(cl_mem), &dbg_arg));
+            CHECK(clSetKernelArg(kernel, 9, sizeof(cl_uint), &dbg_flag));
         }
     }
 

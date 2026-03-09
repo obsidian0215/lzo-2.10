@@ -25,10 +25,12 @@ typedef struct {
     /* Decompression buffers */
     cl_mem d_comp;
     cl_mem d_off;
+    cl_mem d_comp_lens;
     cl_mem d_decomp_out;
     cl_mem d_out_lens;
     size_t comp_size;
     size_t off_size;
+    size_t comp_lens_size;
     size_t decomp_out_size;
     size_t lens_size;
 } lzo_gpu_workspace_t;
