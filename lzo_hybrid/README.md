@@ -73,3 +73,19 @@ Notes:
 - Recent scheduler work changed the hybrid split from a simple GPU-prefix policy to distributed block assignment with explicit gather/scatter around GPU kernels.
 - Bench path temp-file handling was updated to avoid fixed-path collisions.
 - The current verified subset results still rank `lzo_gpu` as the default fastest engine, while `lzo_hybrid` remains a workload-specific compromise.
+
+## 2026-03 stitched full-corpus results
+
+The current full-corpus hybrid analysis is derived from the stitched 83-file artifact:
+
+- `../exp_results/runs/20260309_merged_full_83/lzo_param_sweep_merged.csv`
+- analysis bundle: `/root/analysis/20260309_full_refresh/`
+
+Current matched-corpus best-per-file medians:
+
+- `lzo1x fixed`: `925.46 / 821.24 MB/s`
+- `lzo1x adaptive`: `927.49 / 897.38 MB/s`
+- `lzo1y fixed`: `926.01 / 812.25 MB/s`
+- `lzo1y adaptive`: `942.86 / 900.74 MB/s`
+
+Updated interpretation: on the refreshed 83-file corpus, adaptive hybrid is no longer weaker than fixed. GPU remains the default compression leader, while adaptive hybrid is currently the stronger decompression-oriented cooperative mode.
