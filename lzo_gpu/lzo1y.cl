@@ -707,13 +707,14 @@ eof_found:
 
 __kernel void lzo1y_block_decompress(
     __global const uchar* in_buf, __global const uint* off_arr,
+    __global const uint* comp_lens,
     __global       uchar* out_buf, __global uint* out_lens,
     uint blk_sz, uint orig_size, uint nblk)
 {
     uint gid = get_global_id(0);
     if (gid >= nblk) return;
     uint in_off = off_arr[gid];
-    uint in_len = off_arr[gid + 1] - in_off;
+    uint in_len = comp_lens[gid];
     uint out_off = gid * blk_sz;
     uint out_len = (out_off + blk_sz <= orig_size) ? blk_sz : (orig_size - out_off);
     lzo1y_decompress(in_buf + in_off, in_len, out_buf + out_off, &out_len, NULL);
