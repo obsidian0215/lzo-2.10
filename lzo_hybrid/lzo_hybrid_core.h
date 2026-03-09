@@ -70,10 +70,12 @@ typedef struct {
     /* GPU decompression buffers */
     cl_mem d_comp;
     cl_mem d_off;
+    cl_mem d_comp_lens;
     cl_mem d_decomp_out;
     cl_mem d_out_lens;
     size_t comp_cap;
     size_t off_cap;
+    size_t comp_lens_cap;
     size_t decomp_out_cap;
     size_t out_lens_cap;
 } hybrid_workspace_t;
