@@ -248,8 +248,7 @@ static cl_mem core_get_or_create_buffer(cl_context ctx, cl_mem* cached_buf, size
             *cached_buf = NULL;
             *cached_size = 0;
         }
-        cl_mem_flags create_flags = flags | CL_MEM_ALLOC_HOST_PTR;
-        *cached_buf = clCreateBuffer(ctx, create_flags, required_size, NULL, err_out);
+        *cached_buf = clCreateBuffer(ctx, flags, required_size, NULL, err_out);
         if (*err_out == CL_SUCCESS) {
             *cached_size = required_size;
         }
@@ -259,13 +258,41 @@ static cl_mem core_get_or_create_buffer(cl_context ctx, cl_mem* cached_buf, size
     return *cached_buf;
 }
 
+static int lzo_read_buffer_auto(cl_command_queue queue, cl_mem buf, void* dst, size_t bytes, int standard_copy) {
+    cl_int err;
+    void* mapped;
+
+    if (!buf || !dst || bytes == 0) return 0;
+
+    if (standard_copy) {
+        err = clEnqueueReadBuffer(queue, buf, CL_TRUE, 0, bytes, dst, 0, NULL, NULL);
+        return (err == CL_SUCCESS) ? 0 : -1;
+    }
+
+    mapped = clEnqueueMapBuffer(queue, buf, CL_TRUE, CL_MAP_READ, 0, bytes, 0, NULL, NULL, &err);
+    if (err == CL_SUCCESS && mapped) {
+        memcpy(dst, mapped, bytes);
+        err = clEnqueueUnmapMemObject(queue, buf, mapped, 0, NULL, NULL);
+        if (err != CL_SUCCESS) return -1;
+        clFinish(queue);
+        return 0;
+    }
+
+    err = clEnqueueReadBuffer(queue, buf, CL_TRUE, 0, bytes, dst, 0, NULL, NULL);
+    return (err == CL_SUCCESS) ? 0 : -1;
+}
+
 typedef struct {
     cl_mem d_in;
     cl_mem d_out;
     cl_mem d_len;
+    cl_mem d_packed_out;
+    cl_mem d_packed_off;
     size_t in_cap;
     size_t out_cap;
     size_t len_cap;
+    size_t packed_out_cap;
+    size_t packed_off_cap;
     cl_event kernel_ev;
     int inflight;
     size_t in_size;
@@ -293,7 +320,45 @@ static void lzo_pipeline_slot_release(lzo_pipeline_slot_t* slot) {
     if (slot->d_in) clReleaseMemObject(slot->d_in);
     if (slot->d_out) clReleaseMemObject(slot->d_out);
     if (slot->d_len) clReleaseMemObject(slot->d_len);
+    if (slot->d_packed_out) clReleaseMemObject(slot->d_packed_out);
+    if (slot->d_packed_off) clReleaseMemObject(slot->d_packed_off);
     memset(slot, 0, sizeof(*slot));
+}
+
+static int lzo_env_flag_value(const char* name, int* is_set) {
+    const char* env = getenv(name);
+    if (is_set) *is_set = 0;
+    if (!env || !*env) return 0;
+    if (is_set) *is_set = 1;
+    if (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0 || strcasecmp(env, "yes") == 0 || strcasecmp(env, "on") == 0) return 1;
+    if (strcmp(env, "0") == 0 || strcasecmp(env, "false") == 0 || strcasecmp(env, "no") == 0 || strcasecmp(env, "off") == 0) return 0;
+    return atoi(env) != 0;
+}
+
+static unsigned lzo_env_unsigned_value(const char* name, unsigned defv) {
+    const char* env = getenv(name);
+    char* end = NULL;
+    unsigned long parsed;
+    if (!env || !*env) return defv;
+    parsed = strtoul(env, &end, 10);
+    if (end == env || *end != '\0' || parsed > UINT_MAX) return defv;
+    return (unsigned)parsed;
+}
+
+static int lzo_should_use_device_compaction(size_t packed_bytes, size_t sparse_bytes, size_t num_blocks, cl_kernel pack_kernel) {
+    int force_set = 0;
+    int force_value = lzo_env_flag_value("LZO_GPU_FORCE_COMPACTION", &force_set);
+    if (!pack_kernel) return 0;
+    if (force_set) return force_value;
+    if (packed_bytes == 0 || sparse_bytes == 0 || packed_bytes >= sparse_bytes) return 0;
+    {
+        unsigned min_blocks = lzo_env_unsigned_value("LZO_GPU_COMPACTION_MIN_BLOCKS", 8U);
+        unsigned min_gain_pct = lzo_env_unsigned_value("LZO_GPU_COMPACTION_MIN_GAIN_PCT", 5U);
+        size_t saved_bytes;
+        if (num_blocks < (size_t)min_blocks) return 0;
+        saved_bytes = sparse_bytes - packed_bytes;
+        return saved_bytes * 100U >= sparse_bytes * (size_t)min_gain_pct;
+    }
 }
 
 static int lzo_read_exact_fd(int fd, unsigned char* dst, size_t need, unsigned long* read_us_accum) {
@@ -449,8 +514,10 @@ static int lzo_pipeline_finalize_output_file(FILE* out_fp,
 }
 
 static int lzo_pipeline_drain_slot(
+    cl_context ctx,
     cl_command_queue queue,
     lzo_pipeline_slot_t* slot,
+    cl_kernel pack_kernel,
     size_t worst_blk,
     int debug_sched,
     int discard_output,
@@ -463,6 +530,7 @@ static int lzo_pipeline_drain_slot(
     unsigned long* write_us_accum
 ) {
     cl_int err;
+    cl_uint* lens_chunk = NULL;
     if (!slot || !slot->inflight) return 0;
     if (!slot->kernel_ev) return -1;
 
@@ -495,55 +563,23 @@ static int lzo_pipeline_drain_slot(
         if (err != CL_SUCCESS || mapped_len == NULL) {
             return -1;
         }
+        lens_chunk = (cl_uint*)malloc(slot->block_count * sizeof(cl_uint));
+        if (!lens_chunk) {
+            clEnqueueUnmapMemObject(queue, slot->d_len, mapped_len, 0, NULL, NULL);
+            return -1;
+        }
+        memcpy(lens_chunk, mapped_len, slot->block_count * sizeof(cl_uint));
+        err = clEnqueueUnmapMemObject(queue, slot->d_len, mapped_len, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            free(lens_chunk);
+            return -1;
+        }
+        clFinish(queue);
         if (download_us_accum) {
             *download_us_accum += (unsigned long)((core_now_ns() - t_down_start) / 1000ULL);
         }
 
-        if (!discard_output) {
-            uint64_t t_out_down_start = core_now_ns();
-            void* mapped_out = clEnqueueMapBuffer(queue, slot->d_out, CL_TRUE, CL_MAP_READ,
-                                                  0, slot->block_count * worst_blk,
-                                                  0, NULL, NULL, &err);
-            if (err != CL_SUCCESS || mapped_out == NULL) {
-                clEnqueueUnmapMemObject(queue, slot->d_len, mapped_len, 0, NULL, NULL);
-                return -1;
-            }
-            if (download_us_accum) {
-                *download_us_accum += (unsigned long)((core_now_ns() - t_out_down_start) / 1000ULL);
-            }
-
-            {
-                uint64_t t_write_start = core_now_ns();
-                cl_uint* lens_chunk = (cl_uint*)mapped_len;
-                unsigned char* out_chunk = (unsigned char*)mapped_out;
-                size_t i;
-                for (i = 0; i < slot->block_count; i++) {
-                    size_t global_idx = slot->block_base + i;
-                    cl_uint clen = lens_chunk[i];
-                    if (global_idx < nblk_total) {
-                        lens_all[global_idx] = clen;
-                    }
-                    if (comp_total_out) *comp_total_out += (size_t)clen;
-                    if (clen > 0 && out_fp) {
-                        if (fwrite(out_chunk + i * worst_blk, 1, clen, out_fp) != clen) {
-                            clEnqueueUnmapMemObject(queue, slot->d_out, mapped_out, 0, NULL, NULL);
-                            clEnqueueUnmapMemObject(queue, slot->d_len, mapped_len, 0, NULL, NULL);
-                            return -1;
-                        }
-                    }
-                }
-                if (write_us_accum) {
-                    *write_us_accum += (unsigned long)((core_now_ns() - t_write_start) / 1000ULL);
-                }
-            }
-
-            err = clEnqueueUnmapMemObject(queue, slot->d_out, mapped_out, 0, NULL, NULL);
-            if (err != CL_SUCCESS) {
-                clEnqueueUnmapMemObject(queue, slot->d_len, mapped_len, 0, NULL, NULL);
-                return -1;
-            }
-        } else {
-            cl_uint* lens_chunk = (cl_uint*)mapped_len;
+        {
             size_t i;
             for (i = 0; i < slot->block_count; i++) {
                 size_t global_idx = slot->block_base + i;
@@ -555,8 +591,163 @@ static int lzo_pipeline_drain_slot(
             }
         }
 
-        err = clEnqueueUnmapMemObject(queue, slot->d_len, mapped_len, 0, NULL, NULL);
-        if (err != CL_SUCCESS) return -1;
+        if (!discard_output) {
+            size_t packed_total = 0;
+            size_t sparse_total = slot->block_count * worst_blk;
+            int use_compaction;
+            size_t i;
+            for (i = 0; i < slot->block_count; i++) {
+                packed_total += (size_t)lens_chunk[i];
+            }
+            use_compaction = lzo_should_use_device_compaction(packed_total, sparse_total, slot->block_count, pack_kernel);
+
+            if (use_compaction && packed_total > 0) {
+                cl_uint* packed_offsets = (cl_uint*)malloc(slot->block_count * sizeof(cl_uint));
+                unsigned char* packed_chunk = (unsigned char*)malloc(packed_total);
+                if (!packed_offsets || !packed_chunk) {
+                    free(packed_offsets);
+                    free(packed_chunk);
+                    free(lens_chunk);
+                    return -1;
+                }
+                {
+                    size_t off = 0;
+                    for (i = 0; i < slot->block_count; i++) {
+                        packed_offsets[i] = (cl_uint)off;
+                        off += (size_t)lens_chunk[i];
+                    }
+                }
+
+                slot->d_packed_off = core_get_or_create_buffer(ctx, &slot->d_packed_off, &slot->packed_off_cap,
+                                                               slot->block_count * sizeof(cl_uint), CL_MEM_READ_ONLY, &err);
+                if (err != CL_SUCCESS || !slot->d_packed_off) {
+                    free(packed_offsets);
+                    free(packed_chunk);
+                    free(lens_chunk);
+                    return -1;
+                }
+                slot->d_packed_out = core_get_or_create_buffer(ctx, &slot->d_packed_out, &slot->packed_out_cap,
+                                                               packed_total, CL_MEM_WRITE_ONLY, &err);
+                if (err != CL_SUCCESS || !slot->d_packed_out) {
+                    free(packed_offsets);
+                    free(packed_chunk);
+                    free(lens_chunk);
+                    return -1;
+                }
+                err = clEnqueueWriteBuffer(queue, slot->d_packed_off, CL_TRUE, 0,
+                                           slot->block_count * sizeof(cl_uint), packed_offsets, 0, NULL, NULL);
+                if (err != CL_SUCCESS) {
+                    free(packed_offsets);
+                    free(packed_chunk);
+                    free(lens_chunk);
+                    return -1;
+                }
+
+                {
+                    cl_uint worst_blk_cl = (cl_uint)worst_blk;
+                    cl_uint total_blocks_cl = (cl_uint)slot->block_count;
+                    size_t pack_global = slot->block_count ? slot->block_count : 1;
+                    uint64_t t_pack_start = core_now_ns();
+                    err  = clSetKernelArg(pack_kernel, 0, sizeof(cl_mem), &slot->d_out);
+                    err |= clSetKernelArg(pack_kernel, 1, sizeof(cl_mem), &slot->d_len);
+                    err |= clSetKernelArg(pack_kernel, 2, sizeof(cl_mem), &slot->d_packed_out);
+                    err |= clSetKernelArg(pack_kernel, 3, sizeof(cl_mem), &slot->d_packed_off);
+                    err |= clSetKernelArg(pack_kernel, 4, sizeof(cl_uint), &worst_blk_cl);
+                    err |= clSetKernelArg(pack_kernel, 5, sizeof(cl_uint), &total_blocks_cl);
+                    if (err != CL_SUCCESS) {
+                        free(packed_offsets);
+                        free(packed_chunk);
+                        free(lens_chunk);
+                        return -1;
+                    }
+                    err = clEnqueueNDRangeKernel(queue, pack_kernel, 1, NULL, &pack_global, NULL, 0, NULL, NULL);
+                    if (err != CL_SUCCESS) {
+                        free(packed_offsets);
+                        free(packed_chunk);
+                        free(lens_chunk);
+                        return -1;
+                    }
+                    clFinish(queue);
+                    if (kernel_us_accum) {
+                        *kernel_us_accum += (unsigned long)((core_now_ns() - t_pack_start) / 1000ULL);
+                    }
+                }
+
+                {
+                    uint64_t t_out_down_start = core_now_ns();
+                    void* mapped_packed = clEnqueueMapBuffer(queue, slot->d_packed_out, CL_TRUE, CL_MAP_READ,
+                                                             0, packed_total, 0, NULL, NULL, &err);
+                    if (err == CL_SUCCESS && mapped_packed) {
+                        memcpy(packed_chunk, mapped_packed, packed_total);
+                        clEnqueueUnmapMemObject(queue, slot->d_packed_out, mapped_packed, 0, NULL, NULL);
+                        clFinish(queue);
+                    } else {
+                        err = clEnqueueReadBuffer(queue, slot->d_packed_out, CL_TRUE, 0, packed_total, packed_chunk, 0, NULL, NULL);
+                        if (err != CL_SUCCESS) {
+                            free(packed_offsets);
+                            free(packed_chunk);
+                            free(lens_chunk);
+                            return -1;
+                        }
+                    }
+                    if (download_us_accum) {
+                        *download_us_accum += (unsigned long)((core_now_ns() - t_out_down_start) / 1000ULL);
+                    }
+                }
+
+                {
+                    uint64_t t_write_start = core_now_ns();
+                    if (out_fp && fwrite(packed_chunk, 1, packed_total, out_fp) != packed_total) {
+                        free(packed_offsets);
+                        free(packed_chunk);
+                        free(lens_chunk);
+                        return -1;
+                    }
+                    if (write_us_accum) {
+                        *write_us_accum += (unsigned long)((core_now_ns() - t_write_start) / 1000ULL);
+                    }
+                }
+                free(packed_offsets);
+                free(packed_chunk);
+            } else {
+                uint64_t t_out_down_start = core_now_ns();
+                void* mapped_out = clEnqueueMapBuffer(queue, slot->d_out, CL_TRUE, CL_MAP_READ,
+                                                      0, slot->block_count * worst_blk,
+                                                      0, NULL, NULL, &err);
+                if (err != CL_SUCCESS || mapped_out == NULL) {
+                    free(lens_chunk);
+                    return -1;
+                }
+                if (download_us_accum) {
+                    *download_us_accum += (unsigned long)((core_now_ns() - t_out_down_start) / 1000ULL);
+                }
+
+                {
+                    uint64_t t_write_start = core_now_ns();
+                    unsigned char* out_chunk = (unsigned char*)mapped_out;
+                    for (i = 0; i < slot->block_count; i++) {
+                        cl_uint clen = lens_chunk[i];
+                        if (clen > 0 && out_fp) {
+                            if (fwrite(out_chunk + i * worst_blk, 1, clen, out_fp) != clen) {
+                                clEnqueueUnmapMemObject(queue, slot->d_out, mapped_out, 0, NULL, NULL);
+                                free(lens_chunk);
+                                return -1;
+                            }
+                        }
+                    }
+                    if (write_us_accum) {
+                        *write_us_accum += (unsigned long)((core_now_ns() - t_write_start) / 1000ULL);
+                    }
+                }
+
+                err = clEnqueueUnmapMemObject(queue, slot->d_out, mapped_out, 0, NULL, NULL);
+                if (err != CL_SUCCESS) {
+                    free(lens_chunk);
+                    return -1;
+                }
+            }
+        }
+        free(lens_chunk);
     }
 
     if (slot->kernel_ev) {
@@ -572,6 +763,7 @@ static int lzo_compress_core_pipeline(
     cl_command_queue queue,
     cl_device_id device,
     cl_kernel kernel,
+    cl_kernel pack_kernel,
     const char* input_path,
     const char* output_path,
     const lzo_compress_params_t* params,
@@ -774,7 +966,7 @@ static int lzo_compress_core_pipeline(
             }
 
             if (slot->inflight) {
-                if (lzo_pipeline_drain_slot(queue, slot, worst_blk, debug_sched,
+                if (lzo_pipeline_drain_slot(ctx, queue, slot, pack_kernel, worst_blk, debug_sched,
                                             discard_output, (legacy_write ? tmp_data_fp : out_fp), lens_all,
                                             nblk, &comp_total,
                                             &kernel_exec_us, &download_us, &write_us) != 0) {
@@ -794,8 +986,12 @@ static int lzo_compress_core_pipeline(
             }
 
             t_ba_start = core_now_ns();
-            slot->d_in = core_get_or_create_buffer(ctx, &slot->d_in, &slot->in_cap,
-                                                   chunk_bytes, CL_MEM_READ_ONLY, &err);
+            {
+                cl_mem_flags in_flags = CL_MEM_READ_ONLY;
+                if (!use_standard_copy) in_flags |= CL_MEM_ALLOC_HOST_PTR;
+                slot->d_in = core_get_or_create_buffer(ctx, &slot->d_in, &slot->in_cap,
+                                                       chunk_bytes, in_flags, &err);
+            }
             if (err != CL_SUCCESS || !slot->d_in) {
                 fprintf(stderr, "[PIPE] failed allocating slot input buffer: %d\n", err);
                 goto cleanup;
@@ -893,7 +1089,7 @@ static int lzo_compress_core_pipeline(
                 drain_idx = (slots[0].block_base <= slots[1].block_base) ? 0 : 1;
             }
 
-            if (lzo_pipeline_drain_slot(queue, &slots[drain_idx], worst_blk, debug_sched,
+            if (lzo_pipeline_drain_slot(ctx, queue, &slots[drain_idx], pack_kernel, worst_blk, debug_sched,
                                         discard_output, (legacy_write ? tmp_data_fp : out_fp), lens_all,
                                         nblk, &comp_total,
                                         &kernel_exec_us, &download_us, &write_us) != 0) {
@@ -972,6 +1168,7 @@ int lzo_compress_core(
     cl_command_queue queue,
     cl_device_id device,
     cl_kernel kernel,
+    cl_kernel pack_kernel,
     const char* input_path,
     const char* output_path,
     const lzo_compress_params_t* params,
@@ -986,6 +1183,7 @@ int lzo_compress_core(
     int debug_counters = lzo_debug_counters_enabled();
 
     int use_standard_copy = params->standard_copy ? 1 : 0;
+    cl_mem d_in = NULL;
 
     /* 1. 获取文件大小 (使用 stat 替代 fopen/fseek, 避免重复打开) */
     struct stat st;
@@ -1047,6 +1245,7 @@ int lzo_compress_core(
                 queue,
                 device,
                 kernel,
+                pack_kernel,
                 input_path,
                 output_path,
                 params,
@@ -1065,7 +1264,11 @@ int lzo_compress_core(
 
     /* 2. 准备输入缓冲区 (如果是 Daemon 模式,此处通常会命中预分配好的常驻缓冲) */
     uint64_t t_buf_in_start = core_now_ns();
-    cl_mem d_in = core_get_or_create_buffer(ctx, &ws->d_in, &ws->in_size, in_sz, CL_MEM_READ_ONLY, &err);
+    {
+        cl_mem_flags in_flags = CL_MEM_READ_ONLY;
+        if (!use_standard_copy) in_flags |= CL_MEM_ALLOC_HOST_PTR;
+        d_in = core_get_or_create_buffer(ctx, &ws->d_in, &ws->in_size, in_sz, in_flags, &err);
+    }
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[CORE] failed to create input buffer: %d\n", err);
         return -1;
@@ -1156,7 +1359,9 @@ int lzo_compress_core(
     size_t len_needed = nblk * sizeof(cl_uint);
 
     uint64_t t_buf_out_start = core_now_ns();
-    cl_mem d_out = core_get_or_create_buffer(ctx, &ws->d_out, &ws->out_size, out_needed, CL_MEM_WRITE_ONLY, &err);
+    cl_mem d_out = core_get_or_create_buffer(ctx, &ws->d_out, &ws->out_size, out_needed,
+                                             use_standard_copy ? CL_MEM_WRITE_ONLY : (CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR),
+                                             &err);
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[CORE] failed to create output buffer: %d\n", err);
         return -1;
@@ -1165,7 +1370,9 @@ int lzo_compress_core(
     unsigned long buffer_out_us = (t_buf_out_end - t_buf_out_start) / 1000;
 
     /* Buffer Alloc (len) timing removed per request; keep allocation but don't time it */
-    cl_mem d_len = core_get_or_create_buffer(ctx, &ws->d_len, &ws->len_size, len_needed, CL_MEM_READ_WRITE, &err);
+    cl_mem d_len = core_get_or_create_buffer(ctx, &ws->d_len, &ws->len_size, len_needed,
+                                             use_standard_copy ? CL_MEM_READ_WRITE : (CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR),
+                                             &err);
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[CORE] failed to create len buffer: %d\n", err);
         return -1;
@@ -1334,10 +1541,12 @@ int lzo_compress_core(
     unsigned long exec_us_host = (unsigned long)((t_exec_end - t_exec_start) / 1000);
 
     cl_uint* len_arr = malloc(nblk * sizeof(cl_uint));
-    void* mapped_len = clEnqueueMapBuffer(queue, d_len, CL_TRUE, CL_MAP_READ, 0, nblk * sizeof(cl_uint), 0, NULL, NULL, &err);
-    CHECK(err);
-    memcpy(len_arr, mapped_len, nblk * sizeof(cl_uint));
-    CHECK(clEnqueueUnmapMemObject(queue, d_len, mapped_len, 0, NULL, NULL));
+    if (!len_arr || lzo_read_buffer_auto(queue, d_len, len_arr, nblk * sizeof(cl_uint), use_standard_copy) != 0) {
+        fprintf(stderr, "[CORE] failed to read len buffer\n");
+        if (len_arr) free(len_arr);
+        if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
+        return -1;
+    }
 
     size_t comp_total = 0;
     for (size_t i = 0; i < nblk; i++) {
@@ -1358,10 +1567,27 @@ int lzo_compress_core(
     unsigned long download_us = 0;
     void* host_comp = NULL;
 
-    /* Map the whole output buffer */
     uint64_t t_down_start = core_now_ns();
-    void* mapped_out = clEnqueueMapBuffer(queue, d_out, CL_TRUE, CL_MAP_READ, 0, out_needed, 0, NULL, NULL, &err); CHECK(err);
-    host_comp = mapped_out;
+    if (use_standard_copy) {
+        host_comp = malloc(out_needed);
+        if (!host_comp) {
+            fprintf(stderr, "[CORE] failed to allocate output staging buffer\n");
+            if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
+            free(len_arr);
+            return -1;
+        }
+        if (lzo_read_buffer_auto(queue, d_out, host_comp, out_needed, 1) != 0) {
+            fprintf(stderr, "[CORE] failed to download output buffer\n");
+            if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
+            free(len_arr);
+            free(host_comp);
+            return -1;
+        }
+    } else {
+        void* mapped_out = clEnqueueMapBuffer(queue, d_out, CL_TRUE, CL_MAP_READ, 0, out_needed, 0, NULL, NULL, &err);
+        CHECK(err);
+        host_comp = mapped_out;
+    }
     uint64_t t_down_end = core_now_ns();
     download_us = (unsigned long)((t_down_end - t_down_start) / 1000);
 
@@ -1382,13 +1608,21 @@ int lzo_compress_core(
 
     if (write_ret != 0) {
         fprintf(stderr, "[CORE] Failed to write compressed file\n");
-        CHECK(clEnqueueUnmapMemObject(queue, d_out, host_comp, 0, NULL, NULL));
+        if (!use_standard_copy) {
+            CHECK(clEnqueueUnmapMemObject(queue, d_out, host_comp, 0, NULL, NULL));
+        } else {
+            free(host_comp);
+        }
         if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
         free(len_arr);
         return -1;
     }
 
-    CHECK(clEnqueueUnmapMemObject(queue, d_out, host_comp, 0, NULL, NULL));
+    if (!use_standard_copy) {
+        CHECK(clEnqueueUnmapMemObject(queue, d_out, host_comp, 0, NULL, NULL));
+    } else {
+        free(host_comp);
+    }
 
     free(len_arr);
     if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
@@ -1550,8 +1784,12 @@ int lzo_decompress_core(
     len_arr = NULL;
 
     uint64_t t_buf_out_start = core_now_ns();
-    cl_mem d_out = core_get_or_create_buffer(ctx, &ws->d_decomp_out, &ws->decomp_out_size, orig_sz, CL_MEM_WRITE_ONLY, &err); CHECK(err);
-    cl_mem d_out_lens = core_get_or_create_buffer(ctx, &ws->d_out_lens, &ws->lens_size, nblk * sizeof(cl_uint), CL_MEM_WRITE_ONLY, &err); CHECK(err);
+    cl_mem d_out = core_get_or_create_buffer(ctx, &ws->d_decomp_out, &ws->decomp_out_size, orig_sz,
+                                             use_standard_copy_decomp ? CL_MEM_WRITE_ONLY : (CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR),
+                                             &err); CHECK(err);
+    cl_mem d_out_lens = core_get_or_create_buffer(ctx, &ws->d_out_lens, &ws->lens_size, nblk * sizeof(cl_uint),
+                                                  use_standard_copy_decomp ? CL_MEM_WRITE_ONLY : (CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR),
+                                                  &err); CHECK(err);
     uint64_t t_buf_out_end = core_now_ns();
     unsigned long buf_out_us = (t_buf_out_end - t_buf_out_start) / 1000;
 
@@ -1683,8 +1921,20 @@ int lzo_decompress_core(
     }
 
     uint64_t t_download_start = core_now_ns();
-    mapped_out = clEnqueueMapBuffer(queue, d_out, CL_TRUE, CL_MAP_READ, 0, orig_sz, 0, NULL, NULL, &err);
-    CHECK(err);
+    if (use_standard_copy_decomp) {
+        mapped_out = malloc(orig_sz);
+        if (!mapped_out) {
+            fprintf(stderr, "[DECOMP] malloc output staging buffer failed\n");
+            goto cleanup;
+        }
+        if (lzo_read_buffer_auto(queue, d_out, mapped_out, orig_sz, 1) != 0) {
+            fprintf(stderr, "[DECOMP] download output buffer failed\n");
+            goto cleanup;
+        }
+    } else {
+        mapped_out = clEnqueueMapBuffer(queue, d_out, CL_TRUE, CL_MAP_READ, 0, orig_sz, 0, NULL, NULL, &err);
+        CHECK(err);
+    }
     uint64_t t_download_end = core_now_ns();
     unsigned long download_us = (t_download_end - t_download_start) / 1000;
 
@@ -1702,8 +1952,13 @@ int lzo_decompress_core(
         fclose(fout);
         fout = NULL;
     }
-    CHECK(clEnqueueUnmapMemObject(queue, d_out, mapped_out, 0, NULL, NULL));
-    mapped_out = NULL;
+    if (use_standard_copy_decomp) {
+        free(mapped_out);
+        mapped_out = NULL;
+    } else {
+        CHECK(clEnqueueUnmapMemObject(queue, d_out, mapped_out, 0, NULL, NULL));
+        mapped_out = NULL;
+    }
     uint64_t t_write_end2 = core_now_ns();
     unsigned long write_us = (t_write_end2 - t_write_start2) / 1000;
 
@@ -1769,7 +2024,10 @@ cleanup:
         /* Note: in success path, comp_host is already NULL after unmap */
     }
     if (fout) fclose(fout);
-    if (mapped_out) clEnqueueUnmapMemObject(queue, d_out, mapped_out, 0, NULL, NULL);
+    if (mapped_out) {
+        if (use_standard_copy_decomp) free(mapped_out);
+        else clEnqueueUnmapMemObject(queue, d_out, mapped_out, 0, NULL, NULL);
+    }
     if (dbg_dec_buf) clReleaseMemObject(dbg_dec_buf);
 
     return ret;

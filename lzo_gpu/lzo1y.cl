@@ -720,3 +720,21 @@ __kernel void lzo1y_block_decompress(
     lzo1y_decompress(in_buf + in_off, in_len, out_buf + out_off, &out_len, NULL);
     out_lens[gid] = out_len;
 }
+
+__kernel void lzo_pack_compressed_blocks(__global const uchar* sparse_out,
+                                         __global const uint* block_lens,
+                                         __global uchar* packed_out,
+                                         __global const uint* packed_offsets,
+                                         uint worst_blk,
+                                         uint total_blocks)
+{
+    uint gid = get_global_id(0);
+    uint gsz = get_global_size(0);
+    for (uint idx = gid; idx < total_blocks; idx += gsz) {
+        uint len = block_lens[idx];
+        if (len == 0) continue;
+        uchar const* src = sparse_out + idx * worst_blk;
+        uchar* dst = packed_out + packed_offsets[idx];
+        for (uint i = 0; i < len; ++i) dst[i] = src[i];
+    }
+}

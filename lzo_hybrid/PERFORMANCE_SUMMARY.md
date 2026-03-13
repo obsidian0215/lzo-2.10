@@ -1,6 +1,10 @@
 # LZO Hybrid 实现：设计、优化与三引擎全量性能对比
 
-更新时间：2026-03-09（测量语义二次修正后）
+更新时间：2026-03-13（Windows + NVIDIA 正式定版）
+
+## Intel 平台（保留原文）
+
+以下现有内容保留为 Intel Core + Iris Xe 平台的历史总结；Windows + NVIDIA 的新增章节见文末。
 
 ---
 
@@ -323,11 +327,11 @@ Hybrid 不再适合作为统一默认推荐路径，但仍适合作为：
 
 ## 8. 当前结论
 
-1. **LZO hybrid 的系统结构和实现细节仍然重要**：CPU/GPU 分路、atomic 工作窃取、OpenCL workspace、adaptive split 等都是真实存在且可复现的实现资产。  
-2. **但当前 corrected 结果已经推翻旧结论**：Hybrid 不再是三引擎最优，更没有“100% 胜出”。同时，也不能再把 hybrid 描述成“几乎完全没有价值”的异常差路径。  
-3. **GPU 是当前 LZO family 的 compression 主导引擎**：吞吐最高、active compression power 也更优。  
-4. **Adaptive 已经不只是次要改善**：当前它在解压侧形成了明确优势，并在 fresh stitched artifact 上整体强于 fixed。  
-5. **CPU OpenCL 虽然已确认可运行，但当前只适合作为 portability / research path**，不构成替代 native CPU path 或当前 hybrid 设计的依据。  
+1. **LZO hybrid 的系统结构和实现细节仍然重要**：CPU/GPU 分路、atomic 工作窃取、OpenCL workspace、adaptive split 等都是真实存在且可复现的实现资产。
+2. **但当前 corrected 结果已经推翻旧结论**：Hybrid 不再是三引擎最优，更没有“100% 胜出”。同时，也不能再把 hybrid 描述成“几乎完全没有价值”的异常差路径。
+3. **GPU 是当前 LZO family 的 compression 主导引擎**：吞吐最高、active compression power 也更优。
+4. **Adaptive 已经不只是次要改善**：当前它在解压侧形成了明确优势，并在 fresh stitched artifact 上整体强于 fixed。
+5. **CPU OpenCL 虽然已确认可运行，但当前只适合作为 portability / research path**，不构成替代 native CPU path 或当前 hybrid 设计的依据。
 6. **LZO hybrid 当前最合理的定位是解压侧更强的研究型协同后端，而不是统一默认部署路径。**
 
 简言之：
@@ -371,3 +375,81 @@ Hybrid 不再适合作为统一默认推荐路径，但仍适合作为：
 4. 因此本轮优化更准确的价值是：
 
 > `lzo_hybrid` 的调度与 bench 路径已经被修正到可继续扩展的状态，但在当前 verified subset 上，它仍未形成对 `lzo_gpu` 的系统级反超。
+
+## Nvidia 平台（Windows + GeForce RTX 4070 Ti 系列，按 full 结果重写）
+
+正式工件（仅 full-corpus）：
+
+- CPU baseline：`exp_results/formal_full_lzo_cpu_baseline_t123468_energy/runs/20260312_003804/`
+- Hybrid pre-mod：`exp_results/formal_full_lzo_hybrid_baseline_unmodified_energy/runs/20260312_135720/`
+- Hybrid post-mod（final r2）：`exp_results/formal_full_lzo_hybrid_final_energy_r2/runs/20260313_015354/`
+
+### 1) Nvidia dGPU 与 Intel iGPU 的关键差异
+
+| 维度 | Intel Iris Xe（iGPU） | Nvidia RTX 4070 Ti（dGPU） | 对 LZO hybrid 的影响 |
+| --- | --- | --- | --- |
+| 访存 | 统一内存 | 显存/主存分离 | 分路后的打包与回传更敏感 |
+| 并行资源 | 中等 | 高 | GPU 子路径上限高，但 total 受 host 侧限制 |
+| 功耗观测 | 包级为主 | 板卡功耗独立 | 需要分开解释 CPU/GPU 能耗变化 |
+
+### 2) Nvidia 下 hybrid 压缩/解压设计
+
+```mermaid
+flowchart LR
+  A[Block Split: GPU/CPU] --> B[GPU branch: OpenCL kernels]
+  A --> C[CPU branch: liblzo2 + pthread]
+  B --> D[Hybrid container merge]
+  C --> D
+  D --> E[Decode: same metadata replay]
+```
+
+当前正式主配置仍是 `64K / fixed / R=0.3 / T=2 / LSZ=1`，并同时覆盖 `lzo1x` 与 `lzo1y`。
+
+### 3) Nvidia 侧优化（动机 / 原理 / 实现）
+
+1. **分布式 block assignment + gather/scatter**
+   - 动机：修正前缀切分造成的局部模式偏置；
+   - 原理：GPU 与 CPU 分配块索引解耦，分别 gather 后并行执行，再 scatter 回全局；
+   - 实现：`lzo_hybrid_core.c` 分路与容器路径更新。
+
+2. **GPU 子路径冗余同步压缩**
+   - 动机：阻塞调用后叠加 `clFinish` 会放大 wall-time；
+   - 原理：清理不必要的 host 等待点；
+   - 实现：`lzo_hybrid_core.c` 同步链路精简。
+
+3. **遥测与 total 口径统一**
+   - 动机：避免把旧测试流程噪声当成引擎差异；
+   - 实现：统一走 warmed `--bench-io` 与 Windows 能耗字段。
+
+### 4) Full 结果分析（CPU baseline / pre-mod / post-mod）
+
+#### 4.1 统计表（均值 / 中位数）
+
+| 组别 | Ratio mean / median % | Comp kernel mean / median | Dec kernel mean / median | Comp total mean / median | Dec total mean / median |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CPU baseline (`lzo1y,T=3`) | 26.2959 / 22.1200 | 9970.2098 / 5007.7000 | 3866.0646 / 4031.1100 | 1185.1370 / 1029.7822 | 898.7173 / 914.7607 |
+| Hybrid pre-mod `lzo1x` | 26.1524 / 21.5400 | 3717.3929 / 3293.8800 | 3438.5613 / 3503.0800 | 1590.5725 / 1459.3600 | 1358.6542 / 1379.0100 |
+| Hybrid post-mod r2 `lzo1x` | 26.1524 / 21.5400 | 3597.9777 / 3203.3500 | 3268.2736 / 3329.0600 | 1569.3339 / 1509.7700 | 1331.7969 / 1332.4000 |
+| Hybrid pre-mod `lzo1y` | 26.2494 / 21.9500 | 3738.9200 / 3400.3300 | 3414.1033 / 3436.4900 | 1599.1402 / 1517.8400 | 1362.7284 / 1377.6700 |
+| Hybrid post-mod r2 `lzo1y` | 26.2494 / 21.9500 | 3595.0499 / 3045.0600 | 3252.6571 / 3297.5600 | 1565.6482 / 1468.2300 | 1329.1629 / 1344.9800 |
+
+#### 4.2 pre-mod → post-mod 的模式
+
+- `lzo1x`：Comp total mean -1.3%，Dec total mean -2.0%；
+- `lzo1y`：Comp total mean -2.1%，Dec total mean -2.5%；
+- 两算法的 ratio 均值与中位数基本不变（稳定）。
+
+#### 4.3 例外与解释
+
+1. **`lzo1x` 压缩中位数上升（1459.36 → 1509.77）但均值下降**：说明收益集中在部分文件，长尾回退拉低了总体均值；
+2. **kernel 与 total 同向小幅下滑**：当前 post-mod 在 Nvidia 上仍未把分路优化转化为稳定总吞吐红利；
+3. **CPU baseline 仍明显低于 hybrid total**：虽然 post-mod 有回退，但 hybrid 主路径地位未变。
+
+### 5) 局限、结论与下一步
+
+- 局限：当前对比仍是单主配置面，未覆盖 adaptive 在 Nvidia 的全参复扫。
+- 结论：`lzo_hybrid` 在 Nvidia 上依旧是高总吞吐路径；但就 final r2 而言，post-mod 相对 pre-mod 呈现小幅回退而非全面提升。
+- 下一步：
+  1. 对回退文件做分层画像（高熵/低熵/页镜像）；
+  2. 单独优化解压路径的 gather/scatter 与同步；
+  3. 追加 fixed 与 adaptive 的 matched rerun，确认最终默认策略。

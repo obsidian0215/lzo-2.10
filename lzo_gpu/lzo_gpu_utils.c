@@ -558,6 +558,7 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
     cl_int err;
     cl_program prog = NULL;
     int want_debug = 0;
+    int allow_clbin = 1;
     char base_name[64];
 
     strncpy(base_name, alg_name, sizeof(base_name) - 1);
@@ -576,8 +577,22 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
         }
     }
 
+    {
+        const char* no_clbin_env = getenv("LZO_GPU_NO_CLBIN");
+        if (want_debug) {
+            allow_clbin = 0;
+        } else if (no_clbin_env && strcmp(no_clbin_env, "1") == 0) {
+            allow_clbin = 0;
+        }
+#if defined(_WIN32) || defined(_WIN64)
+        else if (!(no_clbin_env && strcmp(no_clbin_env, "0") == 0)) {
+            allow_clbin = 0;
+        }
+#endif
+    }
+
     /* Try bits-specific binary first: <alg>_<bits>.clbin */
-    if (!want_debug) {
+    if (allow_clbin) {
         char bin_name[64];
         if (bits > 0) snprintf(bin_name, sizeof(bin_name), "%s_%d.clbin", base_name, bits);
         else snprintf(bin_name, sizeof(bin_name), "%s.clbin", base_name);
@@ -625,7 +640,7 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
     }
 
     /* Try generic binary <alg>.clbin when bits-specific not used or failed */
-    if (!want_debug && bits > 0) {
+    if (allow_clbin && bits > 0) {
         char bin_name[64]; snprintf(bin_name, sizeof(bin_name), "%s.clbin", base_name);
         char resolved_bin[PATH_MAX];
         if (lzo_find_file_path(bin_name, resolved_bin, sizeof(resolved_bin)) == 0) {

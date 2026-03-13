@@ -87,6 +87,8 @@ void hybrid_workspace_free(hybrid_workspace_t* ws) {
     if (ws->d_in) clReleaseMemObject(ws->d_in);
     if (ws->d_out) clReleaseMemObject(ws->d_out);
     if (ws->d_len) clReleaseMemObject(ws->d_len);
+    if (ws->d_packed_out) clReleaseMemObject(ws->d_packed_out);
+    if (ws->d_packed_off) clReleaseMemObject(ws->d_packed_off);
     if (ws->d_dict) clReleaseMemObject(ws->d_dict);
     if (ws->d_comp) clReleaseMemObject(ws->d_comp);
     if (ws->d_off) clReleaseMemObject(ws->d_off);
@@ -114,6 +116,55 @@ static int zero_buffer(cl_command_queue q, cl_mem buf, size_t sz) {
     if (err != CL_SUCCESS) return -1;
     clFinish(q);
     return 0;
+}
+
+static int hybrid_env_flag_value(const char* name, int* is_set) {
+    const char* env = getenv(name);
+    if (is_set) *is_set = 0;
+    if (!env || !*env) return 0;
+    if (is_set) *is_set = 1;
+    if (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0 || strcasecmp(env, "yes") == 0 || strcasecmp(env, "on") == 0) return 1;
+    if (strcmp(env, "0") == 0 || strcasecmp(env, "false") == 0 || strcasecmp(env, "no") == 0 || strcasecmp(env, "off") == 0) return 0;
+    return atoi(env) != 0;
+}
+
+static unsigned hybrid_env_unsigned_value(const char* name, unsigned defv) {
+    const char* env = getenv(name);
+    char* end = NULL;
+    unsigned long parsed;
+    if (!env || !*env) return defv;
+    parsed = strtoul(env, &end, 10);
+    if (end == env || *end != '\0' || parsed > UINT32_MAX) return defv;
+    return (unsigned)parsed;
+}
+
+static int hybrid_should_use_device_compaction(size_t packed_bytes,
+                                               size_t sparse_bytes,
+                                               size_t num_blocks,
+                                               cl_kernel pack_kernel) {
+    int force_set = 0;
+    int force_value = hybrid_env_flag_value("LZO_HYBRID_FORCE_COMPACTION", &force_set);
+    unsigned min_blocks;
+    unsigned min_gain_pct;
+
+    if (!force_set) {
+        force_value = hybrid_env_flag_value("LZO_GPU_FORCE_COMPACTION", &force_set);
+    }
+    if (!pack_kernel) return 0;
+    if (force_set) return force_value;
+    if (packed_bytes == 0 || sparse_bytes == 0 || packed_bytes >= sparse_bytes) return 0;
+
+    min_blocks = hybrid_env_unsigned_value(
+        "LZO_HYBRID_COMPACTION_MIN_BLOCKS",
+        hybrid_env_unsigned_value("LZO_GPU_COMPACTION_MIN_BLOCKS", 8U)
+    );
+    min_gain_pct = hybrid_env_unsigned_value(
+        "LZO_HYBRID_COMPACTION_MIN_GAIN_PCT",
+        hybrid_env_unsigned_value("LZO_GPU_COMPACTION_MIN_GAIN_PCT", 5U)
+    );
+    if (num_blocks < (size_t)min_blocks) return 0;
+
+    return (sparse_bytes - packed_bytes) * 100U >= sparse_bytes * (size_t)min_gain_pct;
 }
 
 /* ---- CPU worker thread data ---- */
@@ -355,7 +406,7 @@ static double choose_adaptive_gpu_ratio(const unsigned char* input,
 
 static int hybrid_compress_buf(
     cl_context ctx, cl_command_queue queue, cl_device_id device,
-    cl_kernel gpu_kernel,
+    cl_kernel gpu_kernel, cl_kernel pack_kernel,
     const unsigned char* input_buf, size_t in_sz,
     unsigned char* out_buf, uint32_t* lengths,
     size_t blk, size_t nblk, size_t worst_blk,
@@ -419,6 +470,8 @@ static int hybrid_compress_buf(
 
     /* GPU compression */
     uint64_t t_gpu_k0 = 0, t_gpu_k1 = 0;
+    unsigned long pack_kernel_us = 0;
+    cl_uint* gpu_lengths = NULL;
 
     if (gpu_count > 0) {
         uint64_t t_up0 = hybrid_now_ns();
@@ -493,7 +546,6 @@ static int hybrid_compress_buf(
             CHECK_CL(clSetKernelArg(gpu_kernel, 10, sizeof(cl_uint), &dbg_flag));
         }
 
-        clFinish(queue);
         uint64_t t_up1 = hybrid_now_ns();
         timing.upload_us = (unsigned long)((t_up1 - t_up0) / 1000);
 
@@ -514,25 +566,121 @@ static int hybrid_compress_buf(
         void* mapped_len = clEnqueueMapBuffer(queue, ws->d_len, CL_TRUE, CL_MAP_READ,
                                                0, gpu_count * sizeof(cl_uint), 0, NULL, NULL, &err);
         if (err != CL_SUCCESS) goto fail;
+        gpu_lengths = (cl_uint*)malloc(gpu_count * sizeof(cl_uint));
+        if (!gpu_lengths) {
+            clEnqueueUnmapMemObject(queue, ws->d_len, mapped_len, 0, NULL, NULL);
+            goto fail;
+        }
         for (size_t i = 0; i < gpu_count; i++) {
-            lengths[gpu_idx[i]] = ((cl_uint*)mapped_len)[i];
+            gpu_lengths[i] = ((cl_uint*)mapped_len)[i];
+            lengths[gpu_idx[i]] = gpu_lengths[i];
         }
         clEnqueueUnmapMemObject(queue, ws->d_len, mapped_len, 0, NULL, NULL);
 
-        /* Read GPU compressed output — only copy actual compressed data per block */
-        void* mapped_out = clEnqueueMapBuffer(queue, ws->d_out, CL_TRUE, CL_MAP_READ,
-                                               0, gpu_count * worst_blk, 0, NULL, NULL, &err);
-        if (err != CL_SUCCESS) goto fail;
-        for (size_t i = 0; i < gpu_count; i++) {
-            size_t blk_idx = gpu_idx[i];
-            memcpy(out_buf + blk_idx * worst_blk,
-                   (unsigned char*)mapped_out + i * worst_blk,
-                   lengths[blk_idx]);
+        {
+            size_t packed_total = 0;
+            int use_compaction;
+            for (size_t i = 0; i < gpu_count; i++) packed_total += (size_t)gpu_lengths[i];
+
+            use_compaction = hybrid_should_use_device_compaction(
+                packed_total,
+                gpu_count * worst_blk,
+                gpu_count,
+                pack_kernel
+            );
+
+            if (use_compaction && packed_total > 0) {
+                cl_uint* packed_offsets = (cl_uint*)malloc(gpu_count * sizeof(cl_uint));
+                if (!packed_offsets) goto fail;
+
+                {
+                    size_t packed_offset = 0;
+                    uint64_t t_pack_up0 = hybrid_now_ns();
+                    for (size_t i = 0; i < gpu_count; i++) {
+                        packed_offsets[i] = (cl_uint)packed_offset;
+                        packed_offset += (size_t)gpu_lengths[i];
+                    }
+
+                    grow_buffer(ctx, &ws->d_packed_off, &ws->packed_off_cap,
+                                gpu_count * sizeof(cl_uint), CL_MEM_READ_ONLY, &err);
+                    if (err != CL_SUCCESS) {
+                        free(packed_offsets);
+                        goto fail;
+                    }
+                    grow_buffer(ctx, &ws->d_packed_out, &ws->packed_out_cap,
+                                packed_total, CL_MEM_WRITE_ONLY, &err);
+                    if (err != CL_SUCCESS) {
+                        free(packed_offsets);
+                        goto fail;
+                    }
+
+                    err = clEnqueueWriteBuffer(queue, ws->d_packed_off, CL_TRUE, 0,
+                                               gpu_count * sizeof(cl_uint), packed_offsets,
+                                               0, NULL, NULL);
+                    if (err != CL_SUCCESS) {
+                        free(packed_offsets);
+                        goto fail;
+                    }
+                    timing.upload_us += (unsigned long)((hybrid_now_ns() - t_pack_up0) / 1000);
+                }
+
+                {
+                    cl_uint worst_blk_cl = (cl_uint)worst_blk;
+                    cl_uint gpu_count_cl = (cl_uint)gpu_count;
+                    size_t pack_global = gpu_count;
+                    uint64_t t_pack_k0 = hybrid_now_ns();
+                    err  = clSetKernelArg(pack_kernel, 0, sizeof(cl_mem), &ws->d_out);
+                    err |= clSetKernelArg(pack_kernel, 1, sizeof(cl_mem), &ws->d_len);
+                    err |= clSetKernelArg(pack_kernel, 2, sizeof(cl_mem), &ws->d_packed_out);
+                    err |= clSetKernelArg(pack_kernel, 3, sizeof(cl_mem), &ws->d_packed_off);
+                    err |= clSetKernelArg(pack_kernel, 4, sizeof(cl_uint), &worst_blk_cl);
+                    err |= clSetKernelArg(pack_kernel, 5, sizeof(cl_uint), &gpu_count_cl);
+                    if (err != CL_SUCCESS) {
+                        free(packed_offsets);
+                        goto fail;
+                    }
+                    err = clEnqueueNDRangeKernel(queue, pack_kernel, 1, NULL, &pack_global, NULL, 0, NULL, NULL);
+                    if (err != CL_SUCCESS) {
+                        free(packed_offsets);
+                        goto fail;
+                    }
+                    clFinish(queue);
+                    pack_kernel_us = (unsigned long)((hybrid_now_ns() - t_pack_k0) / 1000);
+                }
+
+                {
+                    void* mapped_packed = clEnqueueMapBuffer(queue, ws->d_packed_out, CL_TRUE, CL_MAP_READ,
+                                                             0, packed_total, 0, NULL, NULL, &err);
+                    if (err != CL_SUCCESS) {
+                        free(packed_offsets);
+                        goto fail;
+                    }
+                    for (size_t i = 0; i < gpu_count; i++) {
+                        size_t blk_idx = gpu_idx[i];
+                        memcpy(out_buf + blk_idx * worst_blk,
+                               (unsigned char*)mapped_packed + packed_offsets[i],
+                               (size_t)gpu_lengths[i]);
+                    }
+                    clEnqueueUnmapMemObject(queue, ws->d_packed_out, mapped_packed, 0, NULL, NULL);
+                }
+                free(packed_offsets);
+            } else {
+                void* mapped_out = clEnqueueMapBuffer(queue, ws->d_out, CL_TRUE, CL_MAP_READ,
+                                                       0, gpu_count * worst_blk, 0, NULL, NULL, &err);
+                if (err != CL_SUCCESS) goto fail;
+                for (size_t i = 0; i < gpu_count; i++) {
+                    size_t blk_idx = gpu_idx[i];
+                    memcpy(out_buf + blk_idx * worst_blk,
+                           (unsigned char*)mapped_out + i * worst_blk,
+                           (size_t)gpu_lengths[i]);
+                }
+                clEnqueueUnmapMemObject(queue, ws->d_out, mapped_out, 0, NULL, NULL);
+            }
         }
-        clEnqueueUnmapMemObject(queue, ws->d_out, mapped_out, 0, NULL, NULL);
-        clFinish(queue);
         uint64_t t_dl1 = hybrid_now_ns();
         timing.download_us = (unsigned long)((t_dl1 - t_dl0) / 1000);
+        free(gpu_lengths);
+        gpu_lengths = NULL;
     }
 
     /* Wait for CPU workers */
@@ -545,7 +693,7 @@ static int hybrid_compress_buf(
         cpu_tids = NULL;
         timing.cpu_kernel_us = (unsigned long)((t_cpu_end - t_cpu_start) / 1000);
     }
-    timing.gpu_kernel_us = (t_gpu_k1 > t_gpu_k0) ? (unsigned long)((t_gpu_k1 - t_gpu_k0) / 1000) : 0;
+    timing.gpu_kernel_us = (t_gpu_k1 > t_gpu_k0) ? (unsigned long)((t_gpu_k1 - t_gpu_k0) / 1000) + pack_kernel_us : pack_kernel_us;
 
     if (cpu_job.rc != 0) goto fail;
 
@@ -563,6 +711,7 @@ static int hybrid_compress_buf(
 
 fail:
     free(gpu_idx); free(cpu_idx);
+    free(gpu_lengths);
     if (cpu_tids) {
         for (int i = 0; i < n_cpu_threads; i++) pthread_join(cpu_tids[i], NULL);
         free(cpu_tids);
@@ -770,6 +919,7 @@ int hybrid_compress(
     cl_command_queue queue,
     cl_device_id device,
     cl_kernel gpu_kernel,
+    cl_kernel pack_kernel,
     const char* input_path,
     const char* output_path,
     const hybrid_params_t* params,
@@ -813,7 +963,7 @@ int hybrid_compress(
 
     /* Compress using buffer-based function */
     hybrid_timing_t timing = {0};
-    int rc = hybrid_compress_buf(ctx, queue, device, gpu_kernel,
+    int rc = hybrid_compress_buf(ctx, queue, device, gpu_kernel, pack_kernel,
                                   input_buf, in_sz, out_buf, lengths,
                                   blk, nblk, worst_blk, params, ws, &timing);
     if (rc != 0) {
@@ -968,6 +1118,7 @@ int hybrid_bench(
     cl_command_queue queue,
     cl_device_id device,
     cl_kernel comp_kernel,
+    cl_kernel pack_kernel,
     cl_kernel dec_kernel,
     const char* input_path,
     const hybrid_params_t* params,
@@ -1044,6 +1195,7 @@ int hybrid_bench(
             unsigned char* dec_ref = NULL;
 
             rc = hybrid_compress(ctx, queue, device, comp_kernel,
+                                 pack_kernel,
                                  input_path, tmp_comp_path, params, ws, &tc);
             if (rc != 0) { verify_ok = 0; break; }
             comp_total = tc.out_size;
@@ -1076,7 +1228,7 @@ int hybrid_bench(
         } else {
             /* ---- COMPRESS (in-memory) ---- */
             memset(lengths, 0, nblk * sizeof(uint32_t));
-            rc = hybrid_compress_buf(ctx, queue, device, comp_kernel,
+            rc = hybrid_compress_buf(ctx, queue, device, comp_kernel, pack_kernel,
                                      input_ref, in_size, out_buf, lengths,
                                      blk, nblk, worst_blk, params, ws, &tc);
             if (rc != 0) { verify_ok = 0; break; }

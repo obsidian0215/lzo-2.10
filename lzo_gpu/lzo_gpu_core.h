@@ -63,6 +63,7 @@ int lzo_compress_core(
     cl_command_queue queue,
     cl_device_id device,
     cl_kernel kernel,
+    cl_kernel pack_kernel,
     const char* input_path,
     const char* output_path,
     const lzo_compress_params_t* params,

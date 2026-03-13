@@ -98,6 +98,7 @@ static void show_help(const char* prog) {
 }
 
 int main(int argc, char** argv) {
+    cl_int err;
     int decompress_mode = 0;
     int bench_mode = 0;
     int bench_include_io = 0;
@@ -230,6 +231,7 @@ int main(int argc, char** argv) {
     char build_log[8192] = {0};
     cl_program comp_prog = NULL;
     cl_kernel comp_krn = NULL;
+    cl_kernel pack_krn = NULL;
     int kernel_has_dbg = 0;
     if (lzo_load_comp_kernel(g_ctx, g_dev, alg_name, comp_level, debug,
                              &comp_prog, &comp_krn, &kernel_has_dbg,
@@ -239,21 +241,30 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    pack_krn = clCreateKernel(comp_prog, "lzo_pack_compressed_blocks", &err);
+    if (err != CL_SUCCESS) {
+        pack_krn = NULL;
+        if (verbose) {
+            fprintf(stderr, "Warning: lzo_pack_compressed_blocks unavailable, hybrid compaction disabled (err=%d)\n", err);
+        }
+    }
+
     cl_program dec_prog = lzo_load_program_with_dbits(g_ctx, g_dev, alg_name, comp_level,
                                                        build_log, sizeof(build_log));
     if (!dec_prog) {
         fprintf(stderr, "Error: failed to load decompression program: %s\n", build_log);
+        if (pack_krn) clReleaseKernel(pack_krn);
         clReleaseKernel(comp_krn); clReleaseProgram(comp_prog);
         ocl_cleanup();
         return 1;
     }
 
     char krn_name[64];
-    cl_int err;
     snprintf(krn_name, sizeof(krn_name), "%s_block_decompress", alg_name);
     cl_kernel dec_krn = clCreateKernel(dec_prog, krn_name, &err);
     if (err != CL_SUCCESS || !dec_krn) {
         fprintf(stderr, "Error: failed to create decompression kernel '%s' (err=%d)\n", krn_name, err);
+        if (pack_krn) clReleaseKernel(pack_krn);
         clReleaseProgram(dec_prog); clReleaseKernel(comp_krn); clReleaseProgram(comp_prog);
         ocl_cleanup();
         return 1;
@@ -265,7 +276,7 @@ int main(int argc, char** argv) {
     int rc = 0;
 
     if (bench_mode) {
-        rc = hybrid_bench(g_ctx, g_queue, g_dev, comp_krn, dec_krn,
+        rc = hybrid_bench(g_ctx, g_queue, g_dev, comp_krn, pack_krn, dec_krn,
                           in_path, &params, &ws, bench_seconds, bench_include_io);
     } else if (decompress_mode) {
         char default_out[512];
@@ -297,7 +308,7 @@ int main(int argc, char** argv) {
             output_path = default_out;
         }
         hybrid_timing_t timing = {0};
-        rc = hybrid_compress(g_ctx, g_queue, g_dev, comp_krn,
+        rc = hybrid_compress(g_ctx, g_queue, g_dev, comp_krn, pack_krn,
                              in_path, output_path, &params, &ws, &timing);
         uint64_t t1 = now_ns();
         if (rc == 0) {
@@ -313,6 +324,7 @@ int main(int argc, char** argv) {
     }
 
     hybrid_workspace_free(&ws);
+    if (pack_krn) clReleaseKernel(pack_krn);
     clReleaseKernel(dec_krn);
     clReleaseProgram(dec_prog);
     clReleaseKernel(comp_krn);

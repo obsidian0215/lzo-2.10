@@ -410,6 +410,7 @@ int handle_compress_request(request_t* req, response_t* resp, worker_res_t* work
         worker->queue,
         g_state.device,
         kernel,
+        NULL,
         req->input_path,
         req->output_path,
         &params,

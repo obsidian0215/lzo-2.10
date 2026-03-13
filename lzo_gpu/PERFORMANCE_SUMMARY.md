@@ -1,6 +1,10 @@
 # LZO GPU 实现：设计、优化与性能分析
 
-更新时间：2026-03-09
+更新时间：2026-03-13
+
+## Intel 平台（保留原文）
+
+以下原有内容作为 Intel Core + Iris Xe 平台的保留章节；Windows + NVIDIA 的结果在文末单独补充。
 
 ---
 
@@ -483,6 +487,84 @@ fresh subset 验证表明：CPU OpenCL **功能上可运行**，并且在部分 
 简言之：
 
 > 当前 `lzo_gpu` 是一条既有完整系统结构、又经过历史优化收敛、并且在 fresh 83-file corrected stitched artifact 下仍然强势的正式主路径。
+
+## Nvidia 平台（Windows + GeForce RTX 4070 Ti 系列，按 full 结果重写）
+
+正式工件（仅 full-corpus）：
+
+- CPU baseline：`exp_results/formal_full_lzo_cpu_baseline_t123468_energy/runs/20260312_003804/`
+- GPU pre-mod：`exp_results/formal_full_lzo_gpu_baseline_unmodified_energy/runs/20260312_101741/`
+- GPU post-mod（final r2）：`exp_results/formal_full_lzo_gpu_final_energy_r2/runs/20260313_025756/`
+
+### 1) Nvidia dGPU 与 Intel iGPU 的关键差异
+
+| 维度 | Intel Iris Xe（iGPU） | Nvidia RTX 4070 Ti（dGPU） | 对 LZO GPU 的影响 |
+| --- | --- | --- | --- |
+| 内存 | 统一内存 | 分离显存/主存 | dGPU 上“读回字节量”更关键 |
+| 并行能力 | 中等 | 高并行 | kernel 容易大幅提升 |
+| 系统开销占比 | 相对低 | 相对高 | kernel 提升不必然等比转化 total |
+
+### 2) Nvidia 下 GPU 压缩/解压设计
+
+```mermaid
+flowchart LR
+  A[Input Blocks] --> B[LZO Compress Kernel]
+  B --> C[lzo_pack_compressed_blocks]
+  C --> D[Packed payload + offsets]
+  D --> E[Host readback + container]
+  E --> F[LZO Decompress Kernel]
+```
+
+关键差异：Nvidia 路径下 pack kernel 的收益主要在于降低 D2H 无效读回，而非直接提升编码逻辑本身。
+
+### 3) Nvidia 侧优化（动机 / 原理 / 实现）
+
+1. **device-aware transfer**
+    - 动机：避免 dGPU 上错误的“类零拷贝”路径；
+    - 原理：按设备能力选择显式传输；
+    - 实现：`lzo_gpu_core.c` 的缓冲区读写路径分流。
+
+2. **Windows kernel 加载可靠性**
+    - 动机：stale `.clbin` 会造成“测的不是当前代码”；
+    - 实现：禁用陈旧二进制直载并保留源码回退。
+
+3. **device-side compaction**
+    - 动机：减少固定槽位输出中的冗余字节；
+    - 原理：GPU 端 pack + offsets，主机端按 offsets 组装；
+    - 实现：`lzo1x.cl` / `lzo1y.cl` 新增 pack kernel，runtime 增加阈值判定。
+
+### 4) Full 结果分析（CPU baseline / pre-mod / post-mod）
+
+#### 4.1 统计表（均值 / 中位数）
+
+| 组别 | Ratio mean / median % | Comp kernel mean / median | Dec kernel mean / median | Comp total mean / median | Dec total mean / median |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CPU baseline (`lzo1y,T=3`) | 26.2959 / 22.1200 | 9970.2098 / 5007.7000 | 3866.0646 / 4031.1100 | 1185.1370 / 1029.7822 | 898.7173 / 914.7607 |
+| GPU pre-mod `lzo1x` | 25.6387 / 21.0800 | 8021.8175 / 5313.5000 | 14832.3714 / 9726.5900 | 380.7167 / 320.1800 | 387.2857 / 325.1500 |
+| GPU post-mod r2 `lzo1x` | 27.4970 / 23.2500 | 17667.5943 / 13508.1500 | 33244.6714 / 28220.3500 | 394.1454 / 325.1500 | 408.9986 / 349.9500 |
+| GPU pre-mod `lzo1y` | 25.7202 / 21.1100 | 8025.4872 / 4496.2700 | 15003.7659 / 9289.5200 | 378.6029 / 310.4400 | 385.8259 / 326.2600 |
+| GPU post-mod r2 `lzo1y` | 27.6058 / 23.0800 | 17635.2798 / 13450.6400 | 33212.4867 / 28201.7100 | 394.3429 / 329.8900 | 406.4041 / 337.2000 |
+
+#### 4.2 pre-mod → post-mod 的模式
+
+- `lzo1x`：Comp total +3.5%，Dec total +5.6%；
+- `lzo1y`：Comp total +4.2%，Dec total +5.3%；
+- kernel 吞吐大幅提升（两算法均约 +120%），但 total 只小幅提升。
+
+#### 4.3 例外与解释
+
+1. **kernel 提升远大于 total 提升**：系统瓶颈仍在文件路径与主机侧调度；
+2. **ratio 上升（变差）**：`+1.8pp` 级别，说明吞吐收益并非“完全无代价”；
+3. **依旧显著低于 CPU baseline total**：GPU-only 在 Nvidia 上已改善，但在该 full 工件中仍不是 family 冠军。
+
+### 5) 局限、结论与下一步
+
+- 局限：当前对比是“代表配置 + 工件内统计”，尚未做 matched best-per-file 包络对齐。
+- 结论：`lzo_gpu` 的 post-mod r2 在 Nvidia 上达成了“稳定小幅 total 增益 + 大幅 kernel 增益”，但 total 仍受 host/runtime 限制。
+- 下一步：
+  1. 继续压缩 readback/组装路径开销；
+  2. 按文件压缩性分层调 compaction 阈值；
+  3. 补一轮 matched 参数矩阵验证 ratio 与 total 的最优平衡点。
 
 ## 9. 2026-03-09 块大小敏感性快照
 

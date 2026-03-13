@@ -60,10 +60,14 @@ typedef struct {
     cl_mem d_in;
     cl_mem d_out;
     cl_mem d_len;
+    cl_mem d_packed_out;
+    cl_mem d_packed_off;
     cl_mem d_dict;
     size_t in_cap;
     size_t out_cap;
     size_t len_cap;
+    size_t packed_out_cap;
+    size_t packed_off_cap;
     size_t dict_cap;
     uint32_t comp_epoch_base;
 
@@ -95,6 +99,7 @@ int hybrid_compress(
     cl_command_queue queue,
     cl_device_id device,
     cl_kernel gpu_kernel,
+    cl_kernel pack_kernel,
     const char* input_path,
     const char* output_path,
     const hybrid_params_t* params,
@@ -129,6 +134,7 @@ int hybrid_bench(
     cl_command_queue queue,
     cl_device_id device,
     cl_kernel comp_kernel,
+    cl_kernel pack_kernel,
     cl_kernel dec_kernel,
     const char* input_path,
     const hybrid_params_t* params,

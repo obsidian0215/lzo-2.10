@@ -92,6 +92,23 @@ static cl_context  ctx;
 static cl_command_queue q;
 static cl_device_id dev;
 
+static int lzo_device_host_unified_memory(cl_device_id device)
+{
+    cl_bool unified = CL_FALSE;
+    if (!device) return 1;
+    if (clGetDeviceInfo(device, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(unified), &unified, NULL) != CL_SUCCESS) {
+        return 1;
+    }
+    return unified == CL_TRUE;
+}
+
+static int lzo_resolve_standard_copy(cl_device_id device)
+{
+    const char* env = getenv("LZO_STANDARD_COPY");
+    if (env && *env) return atoi(env) == 1;
+    return lzo_device_host_unified_memory(device) ? 0 : 1;
+}
+
 static cl_device_type preferred_opencl_device_type(void)
 {
     const char* pref = getenv("FORCE_OPENCL_DEVICE");
@@ -286,6 +303,8 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
     /* load compression kernel */
     cl_program prog_c = NULL;
     cl_kernel krn_c = NULL;
+    cl_kernel pack_krn = NULL;
+    cl_int err = CL_SUCCESS;
     char build_log[8192] = {0};
     int kernel_has_dbg = 0;
     int debug_counters = lzo_debug_counters_enabled_cli();
@@ -298,7 +317,11 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
     uint64_t tk2 = now_ns();
     g_kernel_load_us = (unsigned long)((tk2 - tk1) / 1000);
 
-    int standard_copy = (getenv("LZO_STANDARD_COPY") && atoi(getenv("LZO_STANDARD_COPY")) == 1) ? 1 : 0;
+    err = CL_SUCCESS;
+    pack_krn = clCreateKernel(prog_c, "lzo_pack_compressed_blocks", &err);
+    if (err != CL_SUCCESS || !pack_krn) pack_krn = NULL;
+
+    int standard_copy = lzo_resolve_standard_copy(dev);
     size_t block_size = g_cli_fixed_block_bytes;
     int alg_id = (strcmp(alg_name, "lzo1y") == 0) ? 1 : 0;
 
@@ -319,7 +342,7 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
     size_t output_size = 0;
     timing_t t_out = {0};
 
-    int ret = lzo_compress_core(ctx, q, dev, krn_c, in_path, output_path, &params, &ws, &time_us, &output_size, &t_out);
+    int ret = lzo_compress_core(ctx, q, dev, krn_c, pack_krn, in_path, output_path, &params, &ws, &time_us, &output_size, &t_out);
     uint64_t t_total_end = now_ns();
     unsigned long overall_us = (unsigned long)((t_total_end - t_total_start) / 1000ULL);
 
@@ -336,6 +359,7 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
             printf("%s : %zu -> %zu (%.2f:1) in %.2f ms\n", in_path, t_out.in_size, t_out.out_size, ratio, overall_us / 1000.0);
         }
     }
+    if (pack_krn) clReleaseKernel(pack_krn);
     if (krn_c) clReleaseKernel(krn_c);
     if (prog_c) clReleaseProgram(prog_c);
     if (q) { clReleaseCommandQueue(q); q = NULL; }
@@ -346,7 +370,7 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
 static int do_decompress_mode(const char* lz_path, const char* output_path, int output_explicit, int suppress_non_data)
 {
     if (!lz_path) { fprintf(stderr, "error: missing input .lzo\n"); return 1; }
-    int standard_copy = (getenv("LZO_STANDARD_COPY") && atoi(getenv("LZO_STANDARD_COPY")) == 1) ? 1 : 0;
+    int standard_copy = 0;
 
     FILE* f = fopen(lz_path, "rb");
     if (!f) { perror("fopen"); return 1; }
@@ -370,6 +394,7 @@ static int do_decompress_mode(const char* lz_path, const char* output_path, int 
         fprintf(stderr, "error: failed to initialize OpenCL runtime\n");
         return 1;
     }
+    standard_copy = lzo_resolve_standard_copy(dev);
     cl_program prog_d = NULL;
     cl_int err;
     char build_log[8192] = {0};
@@ -451,7 +476,7 @@ static int run_lzo_bench(const char *in_path,
         return 1;
     }
 
-    int standard_copy = (getenv("LZO_STANDARD_COPY") && atoi(getenv("LZO_STANDARD_COPY")) == 1) ? 1 : 0;
+    int standard_copy = 0;
     int alg_id = (strcmp(alg_name, "lzo1y") == 0) ? 1 : 0;
     int debug_counters = lzo_debug_counters_enabled_cli();
 
@@ -461,9 +486,12 @@ static int run_lzo_bench(const char *in_path,
         free(input_ref);
         return 1;
     }
+    standard_copy = lzo_resolve_standard_copy(dev);
 
     cl_program prog_c = NULL;
     cl_kernel krn_c = NULL;
+    cl_kernel pack_krn = NULL;
+    cl_int err = CL_SUCCESS;
     int kernel_has_dbg = 0;
     char build_log[8192] = {0};
     if (lzo_load_comp_kernel(ctx, dev, alg_name, comp_level, debug_counters,
@@ -476,6 +504,10 @@ static int run_lzo_bench(const char *in_path,
         free(input_ref);
         return 1;
     }
+
+    err = CL_SUCCESS;
+    pack_krn = clCreateKernel(prog_c, "lzo_pack_compressed_blocks", &err);
+    if (err != CL_SUCCESS || !pack_krn) pack_krn = NULL;
 
     char decomp_base[64];
     if (debug_counters)
@@ -498,7 +530,6 @@ static int run_lzo_bench(const char *in_path,
     }
 
     char krn_name[64];
-    cl_int err = CL_SUCCESS;
     cl_kernel krn_d = NULL;
 
     snprintf(krn_name, sizeof(krn_name), "%s_block_decompress", alg_name);
@@ -573,7 +604,7 @@ static int run_lzo_bench(const char *in_path,
         cl_uint *h_dbg_dec = NULL;
         cl_mem d_dbg_dec = NULL;
 
-        int rc = lzo_compress_core(ctx, q, dev, krn_c, in_path, "/dev/null",
+        int rc = lzo_compress_core(ctx, q, dev, krn_c, pack_krn, in_path, "/dev/null",
                                    &params, &ws, &time_us, &out_size, &tc);
         if (rc != 0) {
             verify_ok = 0;
@@ -867,6 +898,7 @@ static int run_lzo_bench(const char *in_path,
     free(ratio_pct);
     free(input_ref);
     lzo_gpu_workspace_free(&ws);
+    if (pack_krn) clReleaseKernel(pack_krn);
     if (krn_d) clReleaseKernel(krn_d);
     if (prog_d) clReleaseProgram(prog_d);
     if (krn_c) clReleaseKernel(krn_c);
