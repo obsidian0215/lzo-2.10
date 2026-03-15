@@ -54,23 +54,15 @@ __pycache__/
 
 # If there are specific build outputs in subdirs, add them explicitly
 # e.g. ignore any lzo_cpu executables or preprocessed outputs
-lzo_cpu/*.exe
-
-lzo_cpu/*.i
-lzo_cpu/pre*.i
 lzo_cpu/lzo_cpu
-lzo_cpu/samples/
 
 lzo_gpu/lzo_gpu
-lzo_gpu/samples/
 samples/
 lzo_gpu/build_kernel
 lzo_debug/
-analysis/
 
 exp_results/
 build/
-param_scan_*/
 archived/
 lzo_hybrid/lzo_hybrid
 lzo_hybrid/*.cl
