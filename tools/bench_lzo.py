@@ -43,16 +43,21 @@ CPU_CONTROL_SCRIPT = str(REPO_ROOT / "tools" / "cpu_control.sh")
 GPU_CONTROL_SCRIPT = str(REPO_ROOT / "tools" / "gpu_control.sh")
 
 ALGS = ["lzo1x", "lzo1y"]
-CPU_BLOCK_SIZES = ["64K"]
-GPU_BLOCK_SIZES = ["32K", "64K"]
-CPU_THREADS = [1, 2, 3, 4]
+CPU_BLOCK_SIZES = ["1M"]
+GPU_BLOCK_SIZES = ["64K", "128K", "256K"]
+CPU_LEVELS = [14]
+CPU_THREADS = [1, 4, 0]
 GPU_LEVELS = [14, 15]
 GPU_LOCAL_SIZES = [1]
-HYBRID_BLOCK_SIZES = ["64K"]
+HYBRID_BLOCK_SIZES = ["64K", "128K", "256K"]
 HYBRID_LOCAL_SIZES = [1]
 HYBRID_GPU_RATIOS = [0.0, 0.3, 0.5, 0.7, 1.0]
-HYBRID_CPU_THREADS = [1, 2, 4, 8]
+HYBRID_CPU_THREADS = [1, 4, 0]
 HYBRID_SPLIT_MODES = ["fixed", "adaptive"]
+
+# Default frequency configs (for intel iGPU)
+DEFAULT_CPU_FREQ_MHZ = "800,1900,3000,5000"
+DEFAULT_GPU_FREQ_MHZ = "300,1500"
 
 
 
@@ -537,6 +542,7 @@ def run_command_with_telemetry(cmd, telemetry=None, env=None, sample_interval_s=
         "cpu_freq_avg_mhz": float(cpu_avg),
         "gpu_freq_avg_mhz": float(gpu_avg),
         "cpu_energy_j": float(delta.get("cpu_energy_j", 0.0) or 0.0),
+        "core_energy_j": float(delta.get("core_energy_j", 0.0) or 0.0),
         "gpu_energy_j": float(delta.get("gpu_energy_j", 0.0) or 0.0),
     }
     completed = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
@@ -573,6 +579,7 @@ def run_command_with_telemetry_cwd(cmd, cwd=None, telemetry=None, env=None, samp
         "cpu_freq_avg_mhz": float(cpu_avg),
         "gpu_freq_avg_mhz": float(gpu_avg),
         "cpu_energy_j": float(delta.get("cpu_energy_j", 0.0) or 0.0),
+        "core_energy_j": float(delta.get("core_energy_j", 0.0) or 0.0),
         "gpu_energy_j": float(delta.get("gpu_energy_j", 0.0) or 0.0),
     }
     completed = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
@@ -584,6 +591,7 @@ def apply_wall_energy(stats, tel_window, comp_elapsed_s, dec_elapsed_s, energy_s
     stats['cpu_freq_avg_mhz'] = float(tel_window.get('cpu_freq_avg_mhz', 0.0) or 0.0)
     stats['gpu_freq_avg_mhz'] = float(tel_window.get('gpu_freq_avg_mhz', 0.0) or 0.0)
     pkg_energy_j = float(tel_window.get('cpu_energy_j', 0.0) or 0.0)
+    core_energy_j = float(tel_window.get('core_energy_j', 0.0) or 0.0)
     elapsed_s = float(tel_window.get('elapsed_s', 0.0) or 0.0)
 
     if elapsed_s > 0.0:
@@ -601,9 +609,10 @@ def apply_wall_energy(stats, tel_window, comp_elapsed_s, dec_elapsed_s, energy_s
         stats['dec_time_s'] = file_size_mb / dec_kernel_mbs
 
     comp_time = float(stats.get('comp_time_s', 0.0) or 0.0)
-    stats['cpu_energy_j'] = pkg_energy_j
+    stats['cpu_energy_j'] = core_energy_j if core_energy_j > 0.0 else pkg_energy_j
     stats['gpu_energy_j'] = gpu_est_power_w * comp_time if comp_time > 0 else 0.0
-    stats['comp_cpu_power_w'] = pkg_power_w
+    cpu_e = stats['cpu_energy_j']
+    stats['comp_cpu_power_w'] = (cpu_e / elapsed_s) if elapsed_s > 0.0 else 0.0
     stats['comp_gpu_power_w'] = gpu_est_power_w
     stats['energy_source'] = energy_source
 
@@ -806,15 +815,16 @@ def warm_lzo_gpu_daemon(file_path, alg, level, bs_arg, lsz):
         safe_remove(warm_dec)
 
 
-def run_lzo_cpu(file_path, alg, bs, threads, orig_hash=None, telemetry=None, bench_seconds=3.0):
+def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=None, bench_seconds=3.0):
     # Mapping "lzo1x" to "1x" for CPU tool
     alg_short = alg.replace("lzo", "")
-    print(f"Bench_CPU: {file_path.name} A={alg_short} BS={bs} T={threads}")
+    print(f"Bench_CPU: {file_path.name} A={alg_short} L={level} BS={bs} T={threads}")
     cmd = [
         LZO_CPU_BIN,
         "--bench",
-        "--bench-seconds", str(bench_seconds),
+        str(bench_seconds),
         "-a", alg_short,
+        "-L", str(level),
         "-B", str(bs),
         "-t", str(threads),
         str(file_path),
@@ -859,6 +869,7 @@ def run_lzo_cpu(file_path, alg, bs, threads, orig_hash=None, telemetry=None, ben
                 cmd_comp_total = [
                     LZO_CPU_BIN,
                     "-a", alg_short,
+                    "-L", str(level),
                     "-B", str(bs),
                     "-t", str(threads),
                     "-o", tmp_comp,
@@ -1223,6 +1234,7 @@ def main():
     parser.add_argument('--hybrid-only', action='store_true', help='Run Hybrid sweep only (skip CPU and GPU)')
     parser.add_argument('--cpu-threads', default=','.join(str(x) for x in CPU_THREADS), help='CPU thread list, comma-separated (default: 1,2)')
     parser.add_argument('--algs', default=','.join(ALGS), help='Algorithms, comma-separated (default: lzo1x,lzo1y)')
+    parser.add_argument('--cpu-levels', default=','.join(str(x) for x in CPU_LEVELS), help='CPU levels (D_BITS: 11=1k,12=1l,13=1o,14=standard,999), comma-separated')
     parser.add_argument('--cpu-block-sizes', default=','.join(CPU_BLOCK_SIZES), help='CPU block sizes, comma-separated')
     parser.add_argument('--gpu-block-sizes', default=','.join(GPU_BLOCK_SIZES), help='GPU block sizes, comma-separated')
     parser.add_argument('--gpu-levels', default=','.join(str(x) for x in GPU_LEVELS), help='GPU levels, comma-separated')
@@ -1234,8 +1246,8 @@ def main():
     parser.add_argument('--hybrid-split-modes', default=','.join(HYBRID_SPLIT_MODES), help='Hybrid split modes, comma-separated (fixed,adaptive)')
     parser.add_argument('--freq-percent', type=int, default=None, help='Set both CPU and GPU to one shared frequency percent (0-100)')
     parser.add_argument('--freq-points', default='', help='Shared CPU/GPU frequency points, comma-separated (e.g. 40,70,100)')
-    parser.add_argument('--cpu-freq-points', default='', help='CPU frequency points in MHz, comma-separated (e.g. 400,800,1200,1600,1900)')
-    parser.add_argument('--gpu-freq-points', default='', help='GPU frequency points in MHz, comma-separated (e.g. 300,600,900,1200,1500)')
+    parser.add_argument('--cpu-freq-points', default=DEFAULT_CPU_FREQ_MHZ, help='CPU frequency points in MHz, comma-separated (default: %(default)s)')
+    parser.add_argument('--gpu-freq-points', default=DEFAULT_GPU_FREQ_MHZ, help='GPU frequency points in MHz, comma-separated (default: %(default)s)')
     parser.add_argument('--hybrid-freq-pairs', default='', help='Hybrid CPU+GPU freq pairs in MHz, semicolon-separated (e.g. "800,300;800,1500;5000,300;5000,1500")')
     parser.add_argument('--single-file', default='', help='Only benchmark one file (path or basename under samples dir)')
     parser.add_argument('--no-telemetry', action='store_true', help='Disable freq/energy telemetry collection')
@@ -1260,6 +1272,7 @@ def main():
 
     cpu_threads = parse_int_list(args.cpu_threads, CPU_THREADS)
     algs = parse_str_list(args.algs, ALGS)
+    cpu_levels = parse_str_list(args.cpu_levels, CPU_LEVELS)
     cpu_block_sizes = parse_str_list(args.cpu_block_sizes, CPU_BLOCK_SIZES)
     gpu_block_sizes = parse_str_list(args.gpu_block_sizes, GPU_BLOCK_SIZES)
     gpu_levels = parse_int_list(args.gpu_levels, GPU_LEVELS)
@@ -1353,38 +1366,39 @@ def main():
                             orig_hash = hash_cache[sample_key]
 
                             for alg in algs:
-                                for bs in cpu_block_sizes:
-                                    for t in cpu_threads:
-                                        cpu_stats = run_lzo_cpu(sample, alg, bs, t, orig_hash=orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds)
-                                        writer.writerow([
-                                            sample.name,
-                                            point_idx,
-                                            "" if cpu_freq_target is None else cpu_freq_target,
-                                            "" if gpu_freq_target is None else gpu_freq_target,
-                                            "CPU", alg, "N/A", bs, t,
-                                            fmtf(cpu_stats['ratio'], 2),
-                                            fmtf(cpu_stats['comp_mbs'], 2),
-                                            fmtf(cpu_stats['dec_mbs'], 2),
-                                            fmtf(cpu_stats.get('comp_total_mbs', 0), 2),
-                                            fmtf(cpu_stats.get('dec_total_mbs', 0), 2),
-                                            fmtf(cpu_stats['comp_time_s'], 6),
-                                            fmtf(cpu_stats['dec_time_s'], 6),
-                                            fmtf(cpu_stats['cpu_freq_avg_mhz'], 2),
-                                            fmtf(cpu_stats['gpu_freq_avg_mhz'], 2),
-                                            fmtf(cpu_stats['cpu_energy_j'], 6),
-                                            fmtf(cpu_stats['gpu_energy_j'], 6),
-                                            fmtf(cpu_stats['comp_cpu_power_w'], 6),
-                                            fmtf(cpu_stats['comp_gpu_power_w'], 6),
-                                            "yes" if cpu_stats.get('roundtrip_verified') else "no",
-                                        ])
-                                        f.flush()
+                                for level in cpu_levels:
+                                    for bs in cpu_block_sizes:
+                                        for t in cpu_threads:
+                                            cpu_stats = run_lzo_cpu(sample, alg, level, bs, t, orig_hash=orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds)
+                                            writer.writerow([
+                                                sample.name,
+                                                point_idx,
+                                                "" if cpu_freq_target is None else cpu_freq_target,
+                                                "" if gpu_freq_target is None else gpu_freq_target,
+                                                "CPU", alg, level, bs, t,
+                                                fmtf(cpu_stats['ratio'], 2),
+                                                fmtf(cpu_stats['comp_mbs'], 2),
+                                                fmtf(cpu_stats['dec_mbs'], 2),
+                                                fmtf(cpu_stats.get('comp_total_mbs', 0), 2),
+                                                fmtf(cpu_stats.get('dec_total_mbs', 0), 2),
+                                                fmtf(cpu_stats['comp_time_s'], 6),
+                                                fmtf(cpu_stats['dec_time_s'], 6),
+                                                fmtf(cpu_stats['cpu_freq_avg_mhz'], 2),
+                                                fmtf(cpu_stats['gpu_freq_avg_mhz'], 2),
+                                                fmtf(cpu_stats['cpu_energy_j'], 6),
+                                                fmtf(cpu_stats['gpu_energy_j'], 6),
+                                                fmtf(cpu_stats['comp_cpu_power_w'], 6),
+                                                fmtf(cpu_stats['comp_gpu_power_w'], 6),
+                                                "yes" if cpu_stats.get('roundtrip_verified') else "no",
+                                            ])
+                                            f.flush()
 
-                                        cpu_cfg_label = (
-                                            f"FP={point_idx};A={alg};BS={bs};T={t}"
-                                        )
-                                        emit_case_average(sample.name, "CPU", cpu_cfg_label, cpu_stats)
-                                        if cpu_stats.get("roundtrip_verified", False):
-                                            summary_records.append(build_summary_record("CPU", cpu_cfg_label, cpu_stats))
+                                            cpu_cfg_label = (
+                                                f"FP={point_idx};A={alg};L={level};BS={bs};T={t}"
+                                            )
+                                            emit_case_average(sample.name, "CPU", cpu_cfg_label, cpu_stats)
+                                            if cpu_stats.get("roundtrip_verified", False):
+                                                summary_records.append(build_summary_record("CPU", cpu_cfg_label, cpu_stats))
 
                 if run_gpu:
                     print(f"[Phase 2/3] GPU-only freq sweep ({len(gpu_freq_mhz_points)} points)")
@@ -1515,38 +1529,39 @@ def main():
                         # CPU Sweep
                         if run_cpu:
                             for alg in algs:
-                                for bs in cpu_block_sizes:
-                                    for t in cpu_threads:
-                                        cpu_stats = run_lzo_cpu(sample, alg, bs, t, orig_hash=orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds)
-                                        writer.writerow([
-                                            sample.name,
-                                            point_idx,
-                                            "" if cpu_freq_target is None else cpu_freq_target,
-                                            "" if gpu_freq_target is None else gpu_freq_target,
-                                            "CPU", alg, "N/A", bs, t,
-                                            fmtf(cpu_stats['ratio'], 2),
-                                            fmtf(cpu_stats['comp_mbs'], 2),
-                                            fmtf(cpu_stats['dec_mbs'], 2),
-                                            fmtf(cpu_stats.get('comp_total_mbs', 0), 2),
-                                            fmtf(cpu_stats.get('dec_total_mbs', 0), 2),
-                                            fmtf(cpu_stats['comp_time_s'], 6),
-                                            fmtf(cpu_stats['dec_time_s'], 6),
-                                            fmtf(cpu_stats['cpu_freq_avg_mhz'], 2),
-                                            fmtf(cpu_stats['gpu_freq_avg_mhz'], 2),
-                                            fmtf(cpu_stats['cpu_energy_j'], 6),
-                                            fmtf(cpu_stats['gpu_energy_j'], 6),
-                                            fmtf(cpu_stats['comp_cpu_power_w'], 6),
-                                            fmtf(cpu_stats['comp_gpu_power_w'], 6),
-                                            "yes" if cpu_stats.get('roundtrip_verified') else "no",
-                                        ])
-                                        f.flush()
+                                for level in cpu_levels:
+                                    for bs in cpu_block_sizes:
+                                        for t in cpu_threads:
+                                            cpu_stats = run_lzo_cpu(sample, alg, level, bs, t, orig_hash=orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds)
+                                            writer.writerow([
+                                                sample.name,
+                                                point_idx,
+                                                "" if cpu_freq_target is None else cpu_freq_target,
+                                                "" if gpu_freq_target is None else gpu_freq_target,
+                                                "CPU", alg, level, bs, t,
+                                                fmtf(cpu_stats['ratio'], 2),
+                                                fmtf(cpu_stats['comp_mbs'], 2),
+                                                fmtf(cpu_stats['dec_mbs'], 2),
+                                                fmtf(cpu_stats.get('comp_total_mbs', 0), 2),
+                                                fmtf(cpu_stats.get('dec_total_mbs', 0), 2),
+                                                fmtf(cpu_stats['comp_time_s'], 6),
+                                                fmtf(cpu_stats['dec_time_s'], 6),
+                                                fmtf(cpu_stats['cpu_freq_avg_mhz'], 2),
+                                                fmtf(cpu_stats['gpu_freq_avg_mhz'], 2),
+                                                fmtf(cpu_stats['cpu_energy_j'], 6),
+                                                fmtf(cpu_stats['gpu_energy_j'], 6),
+                                                fmtf(cpu_stats['comp_cpu_power_w'], 6),
+                                                fmtf(cpu_stats['comp_gpu_power_w'], 6),
+                                                "yes" if cpu_stats.get('roundtrip_verified') else "no",
+                                            ])
+                                            f.flush()
 
-                                        cpu_cfg_label = (
-                                            f"FP={point_idx};A={alg};BS={bs};T={t}"
-                                        )
-                                        emit_case_average(sample.name, "CPU", cpu_cfg_label, cpu_stats)
-                                        if cpu_stats.get("roundtrip_verified", False):
-                                            summary_records.append(build_summary_record("CPU", cpu_cfg_label, cpu_stats))
+                                            cpu_cfg_label = (
+                                                f"FP={point_idx};A={alg};L={level};BS={bs};T={t}"
+                                            )
+                                            emit_case_average(sample.name, "CPU", cpu_cfg_label, cpu_stats)
+                                            if cpu_stats.get("roundtrip_verified", False):
+                                                summary_records.append(build_summary_record("CPU", cpu_cfg_label, cpu_stats))
 
                         # GPU Sweep
                         if run_gpu:

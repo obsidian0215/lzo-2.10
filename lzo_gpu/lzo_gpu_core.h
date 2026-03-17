@@ -33,6 +33,22 @@ typedef struct {
     size_t comp_lens_size;
     size_t decomp_out_size;
     size_t lens_size;
+
+    int comp_kernel_args_set;
+    cl_kernel comp_cached_kernel;
+    cl_mem comp_cached_d_in;
+    cl_mem comp_cached_d_out;
+    cl_mem comp_cached_d_len;
+    cl_mem comp_cached_d_dict;
+    cl_uint comp_cached_in_sz;
+    cl_uint comp_cached_blk;
+    cl_uint comp_cached_worst_blk;
+    cl_uint comp_cached_pool_size;
+    int comp_cached_is_999;
+
+    size_t comp_cached_input_size;
+    size_t comp_cached_blk_size;
+    size_t comp_cached_nblk;
 } lzo_gpu_workspace_t;
 
 void lzo_gpu_workspace_init(lzo_gpu_workspace_t* ws);
@@ -67,6 +83,7 @@ int lzo_compress_core(
     const char* input_path,
     const char* output_path,
     const lzo_compress_params_t* params,
+    int skip_input_upload,
     lzo_gpu_workspace_t* ws,      /* Thread-safe workspace */
     unsigned long* time_us_out,
     size_t* output_size_out,

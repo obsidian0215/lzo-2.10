@@ -179,96 +179,6 @@ const char* lzo_daemon_pidfile_path(void) {
     return "/tmp/lzo_gpu_daemon.pid";
 }
 
-int lzo_apply_autotune_config(request_t* req)
-{
-    char conf_path[PATH_MAX];
-    const char* envp = getenv("LZO_GPU_AUTOTUNE_CONF");
-    FILE* f = NULL;
-
-    /* 1) env var override */
-    if (envp && *envp) {
-        snprintf(conf_path, sizeof(conf_path), "%s", envp);
-        f = fopen(conf_path, "r");
-    }
-
-    /* 2) exe-directory default: lzo_gpu.autotune.conf, .lzo_gpu.autotune.conf, or ../lzo_gpu/... */
-    if (!f) {
-        char exe_path[PATH_MAX] = {0};
-        if (lzo_get_executable_path(exe_path, sizeof(exe_path)) == 0) {
-            char* slash = strrchr(exe_path,
-#if defined(_WIN32) || defined(_WIN64)
-                                  '\\'
-#else
-                                  '/'
-#endif
-            );
-            if (!slash) slash = strrchr(exe_path, '/');
-            if (slash) {
-                *slash = '\0';
-                snprintf(conf_path, sizeof(conf_path), "%s/lzo_gpu.autotune.conf", exe_path);
-                f = fopen(conf_path, "r");
-                if (!f) {
-                    snprintf(conf_path, sizeof(conf_path), "%s/.lzo_gpu.autotune.conf", exe_path);
-                    f = fopen(conf_path, "r");
-                }
-                if (!f) {
-                    snprintf(conf_path, sizeof(conf_path), "%s/../lzo_gpu/lzo_gpu.autotune.conf", exe_path);
-                    f = fopen(conf_path, "r");
-                }
-                if (!f) {
-                    snprintf(conf_path, sizeof(conf_path), "%s/../lzo_gpu/.lzo_gpu.autotune.conf", exe_path);
-                    f = fopen(conf_path, "r");
-                }
-            }
-        }
-    }
-
-    if (!f) return -1; /* no config found */
-
-    int cfg_alg = -1, cfg_level = -1, cfg_block_kb = -1, cfg_lsz = -1;
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || *p == '\n' || *p == '\0') continue;
-        char key[128], val[128];
-        if (sscanf(p, "%127[^=]=%127s", key, val) == 2) {
-            if (strcmp(key, "global_alg") == 0) {
-                if (strcmp(val, "1x") == 0 || strcmp(val, "lzo1x") == 0) cfg_alg = 0;
-                else if (strcmp(val, "1y") == 0 || strcmp(val, "lzo1y") == 0) cfg_alg = 1;
-                else if (val[0] >= '0' && val[0] <= '9') cfg_alg = atoi(val);
-            } else if (strcmp(key, "global_level") == 0) {
-                cfg_level = atoi(val);
-            } else if (strcmp(key, "global_block_kb") == 0) {
-                cfg_block_kb = atoi(val);
-            } else if (strcmp(key, "global_lsz") == 0) {
-                cfg_lsz = atoi(val);
-            }
-        }
-    }
-    fclose(f);
-
-    /* Apply only to fields that are unspecified (do not override user choices) */
-    if (req->block_size == 0 && cfg_block_kb > 0) req->block_size = cfg_block_kb;
-    if (req->local_size == 0 && cfg_lsz > 0) req->local_size = (uint32_t)cfg_lsz;
-    if (req->operation == 'C') {
-        if (req->level <= 0 && cfg_level > 0) req->level = cfg_level;
-        if (req->alg < 0 && cfg_alg >= 0) req->alg = cfg_alg;
-    } else {
-        /* For decompress, only apply local_size and block size (if needed) */
-        if (req->alg < 0 && cfg_alg >= 0) req->alg = cfg_alg;
-    }
-
-
-
-    /* Final fallbacks if still unspecified */
-    if (req->alg < 0) req->alg = 0; /* default lzo1x */
-    if (req->level <= 0 && req->operation == 'C') req->level = LZO_DEFAULT_COMP_LEVEL;
-    if (req->local_size == 0) req->local_size = LZO_LOCAL_SIZE_DEFAULT;
-    if (req->block_size == 0) req->block_size = LZO_DEFAULT_BLOCK_KB;
-
-    return 0;
-}
 /* lzo_utils: adaptive entropy/blocking helpers */
 double lzo_calc_entropy(const unsigned char* data, size_t size)
 {
@@ -565,7 +475,7 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
     base_name[sizeof(base_name) - 1] = '\0';
 
     /* Guard against invalid D_BITS (e.g. 0), which can cause unstable kernel builds. */
-    if (bits < 10 || bits > 20) {
+    if (bits != 999 && bits != 99 && (bits < 10 || bits > 20)) {
         bits = LZO_DEFAULT_COMP_LEVEL;
     }
 
@@ -701,7 +611,11 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
         }
 
         char base_src[128];
-        if (dbg_flag)
+        if (bits == 999) {
+            snprintf(base_src, sizeof(base_src), "%s_999.cl", source_alg);
+        } else if (bits == 99) {
+            snprintf(base_src, sizeof(base_src), "%s_99.cl", source_alg);
+        } else if (dbg_flag)
             snprintf(base_src, sizeof(base_src), "%s_debug.cl", source_alg);
         else
             snprintf(base_src, sizeof(base_src), "%s.cl", source_alg);
@@ -718,11 +632,31 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
         prog = clCreateProgramWithSource(ctx, 1, (const char**)&src, &src_len, &err);
         if (err != CL_SUCCESS) { if (build_log) snprintf(build_log, build_log_len, "clCreateProgramWithSource failed (err=%d)", err); free(src); return NULL; }
 
-        /* Build with appropriate macros based on variant flags. */
-        char build_opts[320];
-        snprintf(build_opts, sizeof(build_opts),
-             "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I. -I./lzo_gpu -I../lzo_gpu -I.. -D D_BITS=%d -D LZO_GPU_DEBUG_COUNTERS_RUNTIME=%d",
-             bits, dbg_flag ? 1 : 0);
+        /* Build with appropriate macros based on variant flags.
+         * Use the resolved source directory as the primary -I path so that
+         * #include "lzo_gpu.h" etc. are found regardless of CWD. */
+        char src_dir[PATH_MAX];
+        strncpy(src_dir, resolved_src, sizeof(src_dir) - 1);
+        src_dir[sizeof(src_dir) - 1] = '\0';
+        {
+            char *sl = strrchr(src_dir, '/');
+            if (sl) *sl = '\0'; else src_dir[0] = '.', src_dir[1] = '\0';
+        }
+        char build_opts[512];
+        if (bits == 999) {
+            snprintf(build_opts, sizeof(build_opts),
+                 "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I\"%s\" -I. -I./lzo_gpu -I../lzo_gpu -I.. -D LZO_GPU_DEBUG_COUNTERS_RUNTIME=%d",
+                 src_dir, dbg_flag ? 1 : 0);
+        } else if (bits == 99) {
+            /* Level 99 kernel has D_BITS hardcoded (D_BITS=14, 4-way dict). */
+            snprintf(build_opts, sizeof(build_opts),
+                 "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I\"%s\" -I. -I./lzo_gpu -I../lzo_gpu -I.. -D LZO_GPU_DEBUG_COUNTERS_RUNTIME=%d",
+                 src_dir, dbg_flag ? 1 : 0);
+        } else {
+            snprintf(build_opts, sizeof(build_opts),
+                 "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I\"%s\" -I. -I./lzo_gpu -I../lzo_gpu -I.. -D D_BITS=%d -D LZO_GPU_DEBUG_COUNTERS_RUNTIME=%d",
+                 src_dir, bits, dbg_flag ? 1 : 0);
+        }
         err = clBuildProgram(prog, 1, &dev, build_opts, NULL, NULL);
         if (err != CL_SUCCESS) {
             size_t log_sz = 0; clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
@@ -771,7 +705,12 @@ int lzo_load_comp_kernel(cl_context ctx, cl_device_id dev, const char *alg_name,
     }
 
     char krn_name[96];
-    snprintf(krn_name, sizeof(krn_name), "%s_block_compress", prog_base_name);
+    if (comp_level == 999)
+        snprintf(krn_name, sizeof(krn_name), "%s_block_compress_999", prog_base_name);
+    else if (comp_level == 99)
+        snprintf(krn_name, sizeof(krn_name), "%s_block_compress_99", prog_base_name);
+    else
+        snprintf(krn_name, sizeof(krn_name), "%s_block_compress", prog_base_name);
 
     krn = clCreateKernel(prog, krn_name, &err);
     if (err != CL_SUCCESS) {

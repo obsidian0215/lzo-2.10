@@ -147,8 +147,6 @@ int decompress_with_daemon(const char* input, const char* output, int alg)
 
     /* fill options from env for fields still unspecified */
     fill_request_env_flags(&req);
-    /* apply autotune config (if available) to any unspecified options */
-    lzo_apply_autotune_config(&req);
 
     // 发送请求
     if (send(sock, &req, sizeof(req), 0) != sizeof(req)) {
@@ -243,8 +241,6 @@ int compress_with_daemon(const char* input, const char* output, int alg, int lev
 
     /* fill options from env for fields still unspecified */
     fill_request_env_flags(&req);
-    /* apply autotune config (if available) to any unspecified options */
-    lzo_apply_autotune_config(&req);
 
     // 发送请求
     if (send(sock, &req, sizeof(req), 0) != sizeof(req)) {
@@ -282,7 +278,7 @@ static void show_help(const char* prog) {
     fprintf(stderr, "用法: %s [选项] <input1> [input2 ...]\n", prog);
     fprintf(stderr, "选项:\n");
     fprintf(stderr, "  -h, --help                    Show help and exit.\n");
-    fprintf(stderr, "  -L, -l, --level <10-15>       Set compression level (bits). Default: 11.\n");
+    fprintf(stderr, "  -L, -l, --level <10-15>       Set GPU dictionary bits for the hash-dictionary kernel. Default: 11.\n");
     fprintf(stderr, "  -a, --alg <lzo1x|lzo1y>       Set algorithm. Default: lzo1x.\n");
     fprintf(stderr, "  -d, --decompress              Decompress mode.\n");
     fprintf(stderr, "  -o, --output <file>           Output file (only valid for single input).\n");
@@ -306,9 +302,9 @@ int run_lzo_client(int argc, char** argv)
     const char** inputs = malloc(argc * sizeof(char*));
     int input_count = 0;
     const char* output_arg = NULL;
-    /* When unspecified we use autotune config or fallbacks; use -1 as sentinel */
-    int level = -1;  /* 未指定: 让服务端或 autotune 决定 */
-    int alg = -1;    /* 未指定: 让服务端或 autotune 决定 */
+    /* Use -1 as sentinel for unspecified; let server decide */
+    int level = -1;  /* 未指定: 让服务端决定 */
+    int alg = -1;    /* 未指定: 让服务端决定 */
     char operation = 'C';  /* 默认压缩 */
     int show_help_flag = 0;
 
@@ -346,9 +342,8 @@ int run_lzo_client(int argc, char** argv)
         } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "-L") == 0 || strcmp(argv[i], "--level") == 0) {
             if (i + 1 < argc) {
                 i++;
-                // 支持 10-18
                 int val = atoi(argv[i]);
-                if (val >= 10 && val <= 18) {
+                if (val == 999 || (val >= 10 && val <= 18)) {
                     level = val;
                 } else {
                     // 尝试兼容旧参数

@@ -300,12 +300,6 @@ typedef struct {
     size_t block_base;
 } lzo_pipeline_slot_t;
 
-static int lzo_env_flag_default_on(const char* name) {
-    const char* v = getenv(name);
-    if (!v || !*v) return 1;
-    return (strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 || strcasecmp(v, "yes") == 0);
-}
-
 static size_t lzo_env_size_mb_to_bytes(const char* name, size_t default_mb) {
     unsigned mb = lzo_env_u32(name, (unsigned)default_mb);
     return (size_t)mb * 1024ULL * 1024ULL;
@@ -430,65 +424,6 @@ static int lzo_pipeline_open_output_file(const char* output_path,
     return 0;
 }
 
-static int lzo_pipeline_write_final_file_legacy(const char* output_path,
-                                                size_t orig_size,
-                                                size_t blk_size,
-                                                size_t nblk,
-                                                const cl_uint* lens,
-                                                FILE* data_fp,
-                                                int alg_id) {
-    FILE* fout = fopen(output_path, "wb");
-    if (!fout) return -1;
-
-    {
-        uint16_t magic = 0x4C5A;
-        uint32_t header[4];
-        header[0] = (uint32_t)orig_size;
-        header[1] = (uint32_t)blk_size;
-        header[2] = (uint32_t)nblk;
-        header[3] = (uint32_t)alg_id;
-
-        if (fwrite(&magic, sizeof(magic), 1, fout) != 1) {
-            fclose(fout);
-            return -1;
-        }
-        if (fwrite(header, sizeof(uint32_t), 4, fout) != 4) {
-            fclose(fout);
-            return -1;
-        }
-        if (fwrite(lens, sizeof(uint32_t), nblk, fout) != nblk) {
-            fclose(fout);
-            return -1;
-        }
-    }
-
-    if (!data_fp) {
-        fclose(fout);
-        return -1;
-    }
-
-    rewind(data_fp);
-    {
-        unsigned char* copy_buf = (unsigned char*)malloc(1024 * 1024);
-        if (!copy_buf) {
-            fclose(fout);
-            return -1;
-        }
-        for (;;) {
-            size_t nr = fread(copy_buf, 1, 1024 * 1024, data_fp);
-            if (nr == 0) break;
-            if (fwrite(copy_buf, 1, nr, fout) != nr) {
-                free(copy_buf);
-                fclose(fout);
-                return -1;
-            }
-        }
-        free(copy_buf);
-    }
-
-    fclose(fout);
-    return 0;
-}
 
 static int lzo_pipeline_finalize_output_file(FILE* out_fp,
                                              long lens_offset,
@@ -782,7 +717,6 @@ static int lzo_compress_core_pipeline(
     int fd = -1;
     int use_standard_copy = params->standard_copy ? 1 : 0;
     int discard_output = (!output_path || strcmp(output_path, "/dev/null") == 0);
-    int legacy_write = lzo_env_flag_enabled("LZO_PIPELINE_LEGACY_WRITE");
 
     size_t chunk_blocks_cfg = (size_t)lzo_env_u32("LZO_PIPELINE_CHUNK_BLOCKS", 512U);
     if (chunk_blocks_cfg < 64) chunk_blocks_cfg = 64;
@@ -803,7 +737,6 @@ static int lzo_compress_core_pipeline(
     unsigned char* host_stage[2] = {NULL, NULL};
     lzo_pipeline_slot_t slots[2];
     cl_uint* lens_all = NULL;
-    FILE* tmp_data_fp = NULL;
     FILE* out_fp = NULL;
     long out_lens_offset = 0;
     cl_mem d_dict = NULL;
@@ -813,24 +746,18 @@ static int lzo_compress_core_pipeline(
     size_t target_items = chunk_blocks_cfg;
     size_t global_size = 1;
     uint32_t pool_size = 1;
-    uint32_t epoch_base_start;
+    uint32_t epoch_base_start = 0;
+    int is_999 = (params->level == 999);
+    int is_99 = (params->level == 99);
 
     memset(slots, 0, sizeof(slots));
 
     if (!discard_output) {
-        if (legacy_write) {
-            tmp_data_fp = tmpfile();
-            if (!tmp_data_fp) {
-                perror("tmpfile");
-                goto cleanup;
-            }
-        } else {
-            if (lzo_pipeline_open_output_file(output_path, in_sz, blk, nblk,
-                                              params->alg_id, &out_fp,
-                                              &out_lens_offset) != 0) {
-                perror("pipeline output open");
-                goto cleanup;
-            }
+        if (lzo_pipeline_open_output_file(output_path, in_sz, blk, nblk,
+                                          params->alg_id, &out_fp,
+                                          &out_lens_offset) != 0) {
+            perror("pipeline output open");
+            goto cleanup;
         }
     }
 
@@ -864,11 +791,19 @@ static int lzo_compress_core_pipeline(
         cl_uint cus = 0;
         cl_ulong global_mem = 0;
         cl_ulong max_alloc = 0;
-        size_t dict_per_block = (1ULL << params->level) * sizeof(uint32_t);
+        size_t dict_per_block;
         size_t occ_cap = 0;
         size_t mem_cap = 0;
         size_t safe_mem = 0;
         size_t safe_alloc = 0;
+
+        if (is_999) {
+            dict_per_block = 458752ULL;
+        } else if (is_99) {
+            dict_per_block = (1ULL << 14) * 4 * sizeof(uint32_t);
+        } else {
+            dict_per_block = (1ULL << params->level) * sizeof(uint32_t);
+        }
 
         if (params->local_size_param > 0) {
             local_size = (size_t)params->local_size_param;
@@ -887,6 +822,9 @@ static int lzo_compress_core_pipeline(
             if (sched_wi_per_cu > 1024U) sched_wi_per_cu = 1024U;
             occ_cap = (cus > 0) ? ((size_t)cus * (size_t)sched_wi_per_cu) : 4096U;
             if (occ_cap < 1024U) occ_cap = 1024U;
+        }
+        if (is_999) {
+            if (occ_cap > 64) occ_cap = 64;
         }
 
         if (dict_per_block > 0) {
@@ -932,15 +870,17 @@ static int lzo_compress_core_pipeline(
         }
     }
 
-    if (ws->comp_epoch_base == 0) ws->comp_epoch_base = 1;
-    if ((uint32_t)nblk + 2U >= 4095U || ws->comp_epoch_base + (uint32_t)nblk + 1U > 4095U) {
-        if (d_dict && d_dict_cap > 0) {
-            (void)lzo_zero_buffer(queue, d_dict, d_dict_cap);
+    if (!is_999) {
+        if (ws->comp_epoch_base == 0) ws->comp_epoch_base = 1;
+        if ((uint32_t)nblk + 2U >= 4095U || ws->comp_epoch_base + (uint32_t)nblk + 1U > 4095U) {
+            if (d_dict && d_dict_cap > 0) {
+                (void)lzo_zero_buffer(queue, d_dict, d_dict_cap);
+            }
+            ws->comp_epoch_base = 1;
         }
-        ws->comp_epoch_base = 1;
+        epoch_base_start = ws->comp_epoch_base;
+        ws->comp_epoch_base += (uint32_t)nblk + 1U;
     }
-    epoch_base_start = ws->comp_epoch_base;
-    ws->comp_epoch_base += (uint32_t)nblk + 1U;
 
     if (debug_sched) {
         double blk_per_wi = (target_items > 0) ? ((double)chunk_blocks_cfg / (double)target_items) : 0.0;
@@ -967,7 +907,7 @@ static int lzo_compress_core_pipeline(
 
             if (slot->inflight) {
                 if (lzo_pipeline_drain_slot(ctx, queue, slot, pack_kernel, worst_blk, debug_sched,
-                                            discard_output, (legacy_write ? tmp_data_fp : out_fp), lens_all,
+                                            discard_output, out_fp, lens_all,
                                             nblk, &comp_total,
                                             &kernel_exec_us, &download_us, &write_us) != 0) {
                     fprintf(stderr, "[PIPE] failed draining inflight slot\n");
@@ -1050,8 +990,17 @@ static int lzo_compress_core_pipeline(
                 CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uint), &blk_cl));
                 CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uint), &worst_blk_cl));
                 CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem), &d_dict));
-                CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uint), &pool_size));
-                CHECK(clSetKernelArg(kernel, 8, sizeof(cl_uint), &epoch_base));
+                if (is_999) {
+                    cl_uint swd_pool_count_cl = pool_size;
+                    cl_uint try_lazy_cl = 2;
+                    cl_uint max_chain_cl = 4096;
+                    CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uint), &swd_pool_count_cl));
+                    CHECK(clSetKernelArg(kernel, 8, sizeof(cl_uint), &try_lazy_cl));
+                    CHECK(clSetKernelArg(kernel, 9, sizeof(cl_uint), &max_chain_cl));
+                } else {
+                    CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uint), &pool_size));
+                    CHECK(clSetKernelArg(kernel, 8, sizeof(cl_uint), &epoch_base));
+                }
 
                 err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL,
                                              &global_size, &local_size,
@@ -1090,7 +1039,7 @@ static int lzo_compress_core_pipeline(
             }
 
             if (lzo_pipeline_drain_slot(ctx, queue, &slots[drain_idx], pack_kernel, worst_blk, debug_sched,
-                                        discard_output, (legacy_write ? tmp_data_fp : out_fp), lens_all,
+                                        discard_output, out_fp, lens_all,
                                         nblk, &comp_total,
                                         &kernel_exec_us, &download_us, &write_us) != 0) {
                 fprintf(stderr, "[PIPE] failed draining tail slot\n");
@@ -1101,20 +1050,11 @@ static int lzo_compress_core_pipeline(
 
     if (!discard_output) {
         uint64_t t_write_start = core_now_ns();
-        if (legacy_write) {
-            if (lzo_pipeline_write_final_file_legacy(output_path, in_sz, blk, nblk,
-                                                     lens_all, tmp_data_fp,
-                                                     params->alg_id) != 0) {
-                fprintf(stderr, "[PIPE] failed writing final compressed file (legacy)\n");
-                goto cleanup;
-            }
-        } else {
-            if (lzo_pipeline_finalize_output_file(out_fp, out_lens_offset, nblk, lens_all) != 0) {
-                fprintf(stderr, "[PIPE] failed finalizing compressed file\n");
-                goto cleanup;
-            }
-            out_fp = NULL;
+        if (lzo_pipeline_finalize_output_file(out_fp, out_lens_offset, nblk, lens_all) != 0) {
+            fprintf(stderr, "[PIPE] failed finalizing compressed file\n");
+            goto cleanup;
         }
+        out_fp = NULL;
         write_us += (unsigned long)((core_now_ns() - t_write_start) / 1000ULL);
     }
 
@@ -1149,7 +1089,6 @@ static int lzo_compress_core_pipeline(
 
 cleanup:
     if (fd >= 0) close(fd);
-    if (tmp_data_fp) fclose(tmp_data_fp);
     if (out_fp) fclose(out_fp);
     if (lens_all) free(lens_all);
     if (host_stage[0]) free(host_stage[0]);
@@ -1172,6 +1111,7 @@ int lzo_compress_core(
     const char* input_path,
     const char* output_path,
     const lzo_compress_params_t* params,
+    int skip_input_upload,
     lzo_gpu_workspace_t* ws,
     unsigned long* time_us_out,
     size_t* output_size_out,
@@ -1215,7 +1155,7 @@ int lzo_compress_core(
         if (entropy_max < 0.0) entropy_max = 0.0;
         if (entropy_max > 8.0) entropy_max = 8.0;
 
-        allow_pipeline = (pipeline_enabled && in_sz >= pipeline_threshold && nblk_probe >= 2 && !debug_counters);
+        allow_pipeline = (pipeline_enabled && !skip_input_upload && in_sz >= pipeline_threshold && nblk_probe >= 2 && !debug_counters);
 
         if (debug_counters && debug_sched) {
             fprintf(stderr, "[LZO-PIPE-GATE] disabled because LZO_GPU_DEBUG_COUNTERS=1\n");
@@ -1264,18 +1204,24 @@ int lzo_compress_core(
 
     /* 2. 准备输入缓冲区 (如果是 Daemon 模式,此处通常会命中预分配好的常驻缓冲) */
     uint64_t t_buf_in_start = core_now_ns();
-    {
+    if (!skip_input_upload) {
         cl_mem_flags in_flags = CL_MEM_READ_ONLY;
         if (!use_standard_copy) in_flags |= CL_MEM_ALLOC_HOST_PTR;
         d_in = core_get_or_create_buffer(ctx, &ws->d_in, &ws->in_size, in_sz, in_flags, &err);
-    }
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "[CORE] failed to create input buffer: %d\n", err);
-        return -1;
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "[CORE] failed to create input buffer: %d\n", err);
+            return -1;
+        }
+    } else {
+        if (!ws->d_in || ws->in_size < in_sz) {
+            fprintf(stderr, "[CORE] skip_input_upload requested but cached input buffer is unavailable\n");
+            return -1;
+        }
+        d_in = ws->d_in;
     }
 
     void* mapped_in = NULL;
-    if (!use_standard_copy) {
+    if (!skip_input_upload && !use_standard_copy) {
         /* Map with Non-blocking if possible, but CORE uses CL_TRUE for simplicity */
         mapped_in = clEnqueueMapBuffer(queue, d_in, CL_TRUE, CL_MAP_WRITE, 0, in_sz, 0, NULL, NULL, &err);
         if (err != CL_SUCCESS) {
@@ -1290,7 +1236,7 @@ int lzo_compress_core(
     unsigned long upload_us = 0;
     void* host_in = NULL;
 
-    if (!use_standard_copy) {
+    if (!skip_input_upload && !use_standard_copy) {
         /* 直接读入映射好的显存空间 (Zero-copy 核心) */
         if (lzo_read_file_to_buf(input_path, mapped_in, in_sz, &read_us) != 0) {
             perror("lzo_read_file_to_buf");
@@ -1298,7 +1244,7 @@ int lzo_compress_core(
             return -1;
         }
         /* upload_us will be measured after unmap */
-    } else {
+    } else if (!skip_input_upload) {
         int rc_mem = lzo_aligned_alloc_portable(&host_in, ALIGN_BYTES, in_sz);
         if (rc_mem != 0 || host_in == NULL) {
             host_in = malloc(in_sz);
@@ -1320,25 +1266,31 @@ int lzo_compress_core(
     /* 3. Blocking calculation */
     uint64_t t_blocking_start = core_now_ns();
     size_t blk = 0, nblk = 0;
-    const unsigned char* entropy_ptr = NULL;
-    if (use_standard_copy)
-        entropy_ptr = (const unsigned char*)host_in;
-    else
-        entropy_ptr = (const unsigned char*)mapped_in;
+    if (skip_input_upload && ws->comp_cached_input_size == in_sz &&
+        ws->comp_cached_blk_size > 0 && ws->comp_cached_nblk > 0) {
+        blk = ws->comp_cached_blk_size;
+        nblk = ws->comp_cached_nblk;
+    } else {
+        const unsigned char* entropy_ptr = NULL;
+        if (use_standard_copy)
+            entropy_ptr = (const unsigned char*)host_in;
+        else
+            entropy_ptr = (const unsigned char*)mapped_in;
 
-    size_t blk_bytes = (params->block_size > 0) ? params->block_size : 0;
-    lzo_choose_blocking_adaptive(entropy_ptr, in_sz, device, blk_bytes, 0, &blk, &nblk, params->debug);
+        size_t blk_bytes = (params->block_size > 0) ? params->block_size : 0;
+        lzo_choose_blocking_adaptive(entropy_ptr, in_sz, device, blk_bytes, 0, &blk, &nblk, params->debug);
+    }
 
 
     uint64_t t_blocking_end = core_now_ns();
     unsigned long blocking_us = (t_blocking_end - t_blocking_start) / 1000;
 
-    if (!use_standard_copy) {
+    if (!skip_input_upload && !use_standard_copy) {
         uint64_t t_unmap_start = core_now_ns();
         CHECK(clEnqueueUnmapMemObject(queue, d_in, mapped_in, 0, NULL, NULL));
         uint64_t t_unmap_end = core_now_ns();
         upload_us = (t_unmap_end - t_unmap_start) / 1000;
-    } else {
+    } else if (!skip_input_upload) {
         uint64_t t_upload_start2 = core_now_ns();
         err = clEnqueueWriteBuffer(queue, d_in, CL_TRUE, 0, in_sz, host_in, 0, NULL, NULL);
         if (err != CL_SUCCESS) {
@@ -1391,12 +1343,6 @@ int lzo_compress_core(
     }
 
     cl_uint in_sz_cl = (cl_uint)in_sz, blk_cl = (cl_uint)blk, worst_blk_cl = (cl_uint)worst_blk;
-    CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_in));
-    CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_out));
-    CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &d_len));
-    CHECK(clSetKernelArg(kernel, 3, sizeof(cl_uint), &in_sz_cl));
-    CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uint), &blk_cl));
-    CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uint), &worst_blk_cl));
 
     /* Dictionary pool follows active work-items for one-work-item-per-block scheduling. */
     size_t local_size = 1;
@@ -1406,17 +1352,27 @@ int lzo_compress_core(
         if (params->debug) fprintf(stderr, "[CORE] using local_size=%zu\n", local_size);
     }
 
+    int is_999 = (params->level == 999);
+    int is_99 = (params->level == 99);
     size_t target_items = nblk;
     if (target_items == 0) target_items = 1;
     {
         cl_uint cus = 0;
         cl_ulong global_mem = 0;
         cl_ulong max_alloc = 0;
-        size_t dict_per_block = (1ULL << params->level) * sizeof(uint32_t);
+        size_t dict_per_block;
         size_t occ_cap = 0;
         size_t mem_cap = 0;
         size_t safe_mem = 0;
         size_t safe_alloc = 0;
+
+        if (is_999) {
+            dict_per_block = 458752ULL;
+        } else if (is_99) {
+            dict_per_block = (1ULL << 14) * 4 * sizeof(uint32_t);
+        } else {
+            dict_per_block = (1ULL << params->level) * sizeof(uint32_t);
+        }
 
         (void)clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cus), &cus, NULL);
         (void)clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem), &global_mem, NULL);
@@ -1428,6 +1384,9 @@ int lzo_compress_core(
         if (sched_wi_per_cu > 1024U) sched_wi_per_cu = 1024U;
         occ_cap = (cus > 0) ? ((size_t)cus * (size_t)sched_wi_per_cu) : 4096U;
         if (occ_cap < 1024U) occ_cap = 1024U;
+        if (is_999) {
+            if (occ_cap > 64) occ_cap = 64;
+        }
 
         if (dict_per_block > 0) {
             size_t cap_by_global = SIZE_MAX;
@@ -1470,19 +1429,30 @@ int lzo_compress_core(
                 params->alg_id, params->level, nblk, blk, local_size, target_items, global_size, sched_wi_per_cu, blk_per_wi);
     }
 
-    if (ws->comp_epoch_base == 0) ws->comp_epoch_base = 1;
-    if ((uint32_t)nblk + 2U >= 4095U || ws->comp_epoch_base + (uint32_t)nblk + 1U > 4095U) {
-        if (ws->d_dict && ws->dict_size > 0) {
-            (void)lzo_zero_buffer(queue, ws->d_dict, ws->dict_size);
+    if (!is_999) {
+        if (ws->comp_epoch_base == 0) ws->comp_epoch_base = 1;
+        if ((uint32_t)nblk + 2U >= 4095U || ws->comp_epoch_base + (uint32_t)nblk + 1U > 4095U) {
+            if (ws->d_dict && ws->dict_size > 0) {
+                (void)lzo_zero_buffer(queue, ws->d_dict, ws->dict_size);
+            }
+            ws->comp_epoch_base = 1;
         }
-        ws->comp_epoch_base = 1;
     }
-    uint32_t epoch_base = ws->comp_epoch_base;
-    ws->comp_epoch_base += (uint32_t)nblk + 1U;
+    uint32_t epoch_base = is_999 ? 0U : ws->comp_epoch_base;
+    if (!is_999) {
+        ws->comp_epoch_base += (uint32_t)nblk + 1U;
+    }
 
     {
-        /* 32-bit packed dictionary: epoch_12|offset_20 in one uint32 per hash entry. */
-        size_t dict_per_block = (1ULL << params->level) * sizeof(uint32_t);
+        size_t dict_per_block;
+        if (is_999) {
+            dict_per_block = 458752ULL;
+        } else if (is_99) {
+            dict_per_block = (1ULL << 14) * 4 * sizeof(uint32_t);
+        } else {
+            /* 32-bit packed dictionary: epoch_12|offset_20 in one uint32 per hash entry. */
+            dict_per_block = (1ULL << params->level) * sizeof(uint32_t);
+        }
         size_t total_dict_size = (size_t)pool_size * dict_per_block;
         size_t prev_dict_size = ws->dict_size;
 
@@ -1494,25 +1464,85 @@ int lzo_compress_core(
         if (ws->dict_size != prev_dict_size) {
             (void)lzo_zero_buffer(queue, d_dict, ws->dict_size);
         }
-        CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem), &d_dict));
-        CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uint), &pool_size));
-        CHECK(clSetKernelArg(kernel, 8, sizeof(cl_uint), &epoch_base));
 
-        if (dbg_comp_enabled) {
-            size_t dbg_comp_bytes = nblk * LZO_DBG_COMP_N * sizeof(uint32_t);
-            dbg_comp_buf = clCreateBuffer(ctx, CL_MEM_READ_WRITE, dbg_comp_bytes, NULL, &err);
-            if (err != CL_SUCCESS || !dbg_comp_buf || lzo_zero_buffer(queue, dbg_comp_buf, dbg_comp_bytes) != 0) {
-                if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
-                dbg_comp_buf = NULL;
-                dbg_comp_enabled = 0;
-                fprintf(stderr, "[LZO-DBG][COMP] warning: failed to enable debug counters\n");
+        if (is_999) {
+            /* 999 kernel: 10 args — swd_pool, swd_pool_count, try_lazy, max_chain */
+            cl_uint swd_pool_count = pool_size;
+            cl_uint try_lazy_val = 2U;
+            cl_uint max_chain_val = 4096U;
+            CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_in));
+            CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_out));
+            CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &d_len));
+            CHECK(clSetKernelArg(kernel, 3, sizeof(cl_uint), &in_sz_cl));
+            CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uint), &blk_cl));
+            CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uint), &worst_blk_cl));
+            CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem), &d_dict));
+            CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uint), &swd_pool_count));
+            CHECK(clSetKernelArg(kernel, 8, sizeof(cl_uint), &try_lazy_val));
+            CHECK(clSetKernelArg(kernel, 9, sizeof(cl_uint), &max_chain_val));
+            ws->comp_kernel_args_set = 0;
+            ws->comp_cached_kernel = NULL;
+        } else {
+            int need_set_stable_args = 1;
+            if (skip_input_upload &&
+                ws->comp_kernel_args_set &&
+                ws->comp_cached_kernel == kernel &&
+                ws->comp_cached_d_in == d_in &&
+                ws->comp_cached_d_out == d_out &&
+                ws->comp_cached_d_len == d_len &&
+                ws->comp_cached_d_dict == d_dict &&
+                ws->comp_cached_in_sz == in_sz_cl &&
+                ws->comp_cached_blk == blk_cl &&
+                ws->comp_cached_worst_blk == worst_blk_cl &&
+                ws->comp_cached_pool_size == (cl_uint)pool_size &&
+                ws->comp_cached_is_999 == 0) {
+                need_set_stable_args = 0;
             }
-        }
-        if (kernel_has_dbg) {
-            cl_mem dbg_arg = dbg_comp_enabled ? dbg_comp_buf : d_len;
-            cl_uint dbg_flag = dbg_comp_enabled ? 1U : 0U;
-            CHECK(clSetKernelArg(kernel, 9, sizeof(cl_mem), &dbg_arg));
-            CHECK(clSetKernelArg(kernel, 10, sizeof(cl_uint), &dbg_flag));
+
+            if (need_set_stable_args) {
+                CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_in));
+                CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_out));
+                CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &d_len));
+                CHECK(clSetKernelArg(kernel, 3, sizeof(cl_uint), &in_sz_cl));
+                CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uint), &blk_cl));
+                CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uint), &worst_blk_cl));
+                CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem), &d_dict));
+                CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uint), &pool_size));
+
+                ws->comp_kernel_args_set = 1;
+                ws->comp_cached_kernel = kernel;
+                ws->comp_cached_d_in = d_in;
+                ws->comp_cached_d_out = d_out;
+                ws->comp_cached_d_len = d_len;
+                ws->comp_cached_d_dict = d_dict;
+                ws->comp_cached_in_sz = in_sz_cl;
+                ws->comp_cached_blk = blk_cl;
+                ws->comp_cached_worst_blk = worst_blk_cl;
+                ws->comp_cached_pool_size = (cl_uint)pool_size;
+                ws->comp_cached_is_999 = 0;
+                ws->comp_cached_input_size = in_sz;
+                ws->comp_cached_blk_size = blk;
+                ws->comp_cached_nblk = nblk;
+            }
+
+            CHECK(clSetKernelArg(kernel, 8, sizeof(cl_uint), &epoch_base));
+
+            if (dbg_comp_enabled) {
+                size_t dbg_comp_bytes = nblk * LZO_DBG_COMP_N * sizeof(uint32_t);
+                dbg_comp_buf = clCreateBuffer(ctx, CL_MEM_READ_WRITE, dbg_comp_bytes, NULL, &err);
+                if (err != CL_SUCCESS || !dbg_comp_buf || lzo_zero_buffer(queue, dbg_comp_buf, dbg_comp_bytes) != 0) {
+                    if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
+                    dbg_comp_buf = NULL;
+                    dbg_comp_enabled = 0;
+                    fprintf(stderr, "[LZO-DBG][COMP] warning: failed to enable debug counters\n");
+                }
+            }
+            if (kernel_has_dbg) {
+                cl_mem dbg_arg = dbg_comp_enabled ? dbg_comp_buf : d_len;
+                cl_uint dbg_flag = dbg_comp_enabled ? 1U : 0U;
+                CHECK(clSetKernelArg(kernel, 9, sizeof(cl_mem), &dbg_arg));
+                CHECK(clSetKernelArg(kernel, 10, sizeof(cl_uint), &dbg_flag));
+            }
         }
     }
 

@@ -84,10 +84,10 @@ static void show_help(const char* prog) {
     fprintf(stderr, "  -d, --decompress     Decompress mode\n");
     fprintf(stderr, "  -o, --output FILE    Output file\n");
     fprintf(stderr, "  -a, --alg ALG        Algorithm: lzo1x (default), lzo1y\n");
-    fprintf(stderr, "  -L, --level LEVEL    Dictionary bits (10-15, default: 12)\n");
+     fprintf(stderr, "  -L, --level LEVEL    Dictionary bits (8-20, 99=enhanced, 999=optimal, default: 12)\n");
     fprintf(stderr, "  -B, --block-size N   Block size (B/KB/MB, default: adaptive)\n");
     fprintf(stderr, "  --local N            OpenCL work-group size (default: 1)\n");
-    fprintf(stderr, "  --cpu-threads N      CPU worker threads (default: 2)\n");
+    fprintf(stderr, "  --cpu-threads N      CPU worker threads (default: auto = all cores)\n");
     fprintf(stderr, "  --gpu-ratio F        GPU block fraction 0.0-1.0 (default: 0.8)\n");
     fprintf(stderr, "  --adaptive           Enable adaptive per-file CPU/GPU split\n");
     fprintf(stderr, "  --sample-blocks N    Adaptive sample block count (default: 8)\n");
@@ -110,7 +110,7 @@ int main(int argc, char** argv) {
     int comp_level = LZO_DEFAULT_COMP_LEVEL;
     size_t block_size = 0;
     int local_size = 0;
-    int cpu_threads = 2;
+    int cpu_threads = 0;  /* 0 = auto-detect */
     double gpu_ratio = 0.8;
     int adaptive_mode = 0;
     size_t adaptive_sample_blocks = 8;
@@ -150,10 +150,10 @@ int main(int argc, char** argv) {
         }
         if (strcmp(arg, "-L") == 0 || strcmp(arg, "--level") == 0) {
             if (++i >= argc) { fprintf(stderr, "Error: -L requires argument\n"); return 1; }
-            comp_level = atoi(argv[i]);
-            if (comp_level < 8 || comp_level > 20) {
-                fprintf(stderr, "Error: level must be 8-20 (got %d)\n", comp_level); return 1;
-            }
+             comp_level = atoi(argv[i]);
+             if (comp_level != 999 && comp_level != 99 && (comp_level < 11 || comp_level > 16)) {
+                 fprintf(stderr, "Error: level must be 11-16, 99, or 999 (got %d)\n", comp_level); return 1;
+             }
             continue;
         }
         if (strcmp(arg, "-B") == 0 || strcmp(arg, "--block-size") == 0) {
@@ -204,7 +204,10 @@ int main(int argc, char** argv) {
 
     if (gpu_ratio < 0.0) gpu_ratio = 0.0;
     if (gpu_ratio > 1.0) gpu_ratio = 1.0;
-    if (cpu_threads < 0) cpu_threads = 0;
+    if (cpu_threads <= 0) {
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        cpu_threads = (n > 0) ? (int)n : 4;
+    }
 
     int alg_id = (strcmp(alg_name, "lzo1y") == 0) ? 1 : 0;
 
@@ -223,51 +226,58 @@ int main(int argc, char** argv) {
 
     uint64_t t0 = now_ns();
 
-    if (ocl_init() != 0) {
-        fprintf(stderr, "Error: OpenCL initialization failed\n");
-        return 1;
-    }
-
     char build_log[8192] = {0};
     cl_program comp_prog = NULL;
     cl_kernel comp_krn = NULL;
     cl_kernel pack_krn = NULL;
+    cl_program dec_prog = NULL;
+    cl_kernel dec_krn = NULL;
     int kernel_has_dbg = 0;
-    if (lzo_load_comp_kernel(g_ctx, g_dev, alg_name, comp_level, debug,
-                             &comp_prog, &comp_krn, &kernel_has_dbg,
-                             build_log, sizeof(build_log)) != 0) {
-        fprintf(stderr, "Error: failed to load compression kernel: %s\n", build_log);
-        ocl_cleanup();
-        return 1;
-    }
-
-    pack_krn = clCreateKernel(comp_prog, "lzo_pack_compressed_blocks", &err);
-    if (err != CL_SUCCESS) {
-        pack_krn = NULL;
-        if (verbose) {
-            fprintf(stderr, "Warning: lzo_pack_compressed_blocks unavailable, hybrid compaction disabled (err=%d)\n", err);
+    int use_opencl = !((gpu_ratio <= 0.0) && !adaptive_mode && cpu_threads > 0);
+    if (use_opencl) {
+        if (ocl_init() != 0) {
+            fprintf(stderr, "Error: OpenCL initialization failed\n");
+            return 1;
         }
-    }
 
-    cl_program dec_prog = lzo_load_program_with_dbits(g_ctx, g_dev, alg_name, comp_level,
-                                                       build_log, sizeof(build_log));
-    if (!dec_prog) {
-        fprintf(stderr, "Error: failed to load decompression program: %s\n", build_log);
-        if (pack_krn) clReleaseKernel(pack_krn);
-        clReleaseKernel(comp_krn); clReleaseProgram(comp_prog);
-        ocl_cleanup();
-        return 1;
-    }
+        if (lzo_load_comp_kernel(g_ctx, g_dev, alg_name, comp_level, debug,
+                                 &comp_prog, &comp_krn, &kernel_has_dbg,
+                                 build_log, sizeof(build_log)) != 0) {
+            fprintf(stderr, "Error: failed to load compression kernel: %s\n", build_log);
+            ocl_cleanup();
+            return 1;
+        }
 
-    char krn_name[64];
-    snprintf(krn_name, sizeof(krn_name), "%s_block_decompress", alg_name);
-    cl_kernel dec_krn = clCreateKernel(dec_prog, krn_name, &err);
-    if (err != CL_SUCCESS || !dec_krn) {
-        fprintf(stderr, "Error: failed to create decompression kernel '%s' (err=%d)\n", krn_name, err);
-        if (pack_krn) clReleaseKernel(pack_krn);
-        clReleaseProgram(dec_prog); clReleaseKernel(comp_krn); clReleaseProgram(comp_prog);
-        ocl_cleanup();
-        return 1;
+        pack_krn = clCreateKernel(comp_prog, "lzo_pack_compressed_blocks", &err);
+        if (err != CL_SUCCESS) {
+            pack_krn = NULL;
+            if (verbose) {
+                fprintf(stderr, "Warning: lzo_pack_compressed_blocks unavailable, hybrid compaction disabled (err=%d)\n", err);
+            }
+        }
+
+        dec_prog = lzo_load_program_with_dbits(g_ctx, g_dev, alg_name, comp_level,
+                                               build_log, sizeof(build_log));
+        if (!dec_prog) {
+            fprintf(stderr, "Error: failed to load decompression program: %s\n", build_log);
+            if (pack_krn) clReleaseKernel(pack_krn);
+            clReleaseKernel(comp_krn); clReleaseProgram(comp_prog);
+            ocl_cleanup();
+            return 1;
+        }
+
+        {
+            char krn_name[64];
+            snprintf(krn_name, sizeof(krn_name), "%s_block_decompress", alg_name);
+            dec_krn = clCreateKernel(dec_prog, krn_name, &err);
+            if (err != CL_SUCCESS || !dec_krn) {
+                fprintf(stderr, "Error: failed to create decompression kernel '%s' (err=%d)\n", krn_name, err);
+                if (pack_krn) clReleaseKernel(pack_krn);
+                clReleaseProgram(dec_prog); clReleaseKernel(comp_krn); clReleaseProgram(comp_prog);
+                ocl_cleanup();
+                return 1;
+            }
+        }
     }
 
     hybrid_workspace_t ws;
@@ -276,7 +286,10 @@ int main(int argc, char** argv) {
     int rc = 0;
 
     if (bench_mode) {
-        rc = hybrid_bench(g_ctx, g_queue, g_dev, comp_krn, pack_krn, dec_krn,
+        rc = hybrid_bench(use_opencl ? g_ctx : NULL,
+                          use_opencl ? g_queue : NULL,
+                          use_opencl ? g_dev : NULL,
+                          comp_krn, pack_krn, dec_krn,
                           in_path, &params, &ws, bench_seconds, bench_include_io);
     } else if (decompress_mode) {
         char default_out[512];
@@ -290,7 +303,10 @@ int main(int argc, char** argv) {
             output_path = default_out;
         }
         hybrid_timing_t timing = {0};
-        rc = hybrid_decompress(g_ctx, g_queue, g_dev, dec_krn,
+        rc = hybrid_decompress(use_opencl ? g_ctx : NULL,
+                               use_opencl ? g_queue : NULL,
+                               use_opencl ? g_dev : NULL,
+                               dec_krn,
                                in_path, output_path, &params, &ws, &timing);
         uint64_t t1 = now_ns();
         if (rc == 0) {
@@ -308,7 +324,10 @@ int main(int argc, char** argv) {
             output_path = default_out;
         }
         hybrid_timing_t timing = {0};
-        rc = hybrid_compress(g_ctx, g_queue, g_dev, comp_krn, pack_krn,
+        rc = hybrid_compress(use_opencl ? g_ctx : NULL,
+                             use_opencl ? g_queue : NULL,
+                             use_opencl ? g_dev : NULL,
+                             comp_krn, pack_krn,
                              in_path, output_path, &params, &ws, &timing);
         uint64_t t1 = now_ns();
         if (rc == 0) {
@@ -325,11 +344,11 @@ int main(int argc, char** argv) {
 
     hybrid_workspace_free(&ws);
     if (pack_krn) clReleaseKernel(pack_krn);
-    clReleaseKernel(dec_krn);
-    clReleaseProgram(dec_prog);
-    clReleaseKernel(comp_krn);
-    clReleaseProgram(comp_prog);
-    ocl_cleanup();
+    if (dec_krn) clReleaseKernel(dec_krn);
+    if (dec_prog) clReleaseProgram(dec_prog);
+    if (comp_krn) clReleaseKernel(comp_krn);
+    if (comp_prog) clReleaseProgram(comp_prog);
+    if (use_opencl) ocl_cleanup();
 
     return rc;
 }

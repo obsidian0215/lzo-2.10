@@ -18,6 +18,7 @@
 #include <stdbool.h>
 #include <time.h>
 #include <stdatomic.h>
+#include <unistd.h>
 
 #ifdef _WIN32
 #include <io.h>
@@ -29,7 +30,7 @@
 #include "lzo_levels.h"
 
 #define MAGIC_TAG            0x4C5A       /* 'L''Z' */
-#define DEFAULT_THREAD_COUNT 1
+#define DEFAULT_THREAD_COUNT 0  /* 0 = auto-detect at runtime */
 #define MIN_BLOCK_SIZE       (64u * 1024u)
 #define MAX_BLOCK_SIZE       (512u * 1024u)
 #define LZO_WORK_MEM_SIZE    LZO1X_1_MEM_COMPRESS
@@ -60,6 +61,7 @@ typedef enum {
     VAR_1K = 2,
     VAR_1L = 3,
     VAR_1O = 4,
+    VAR_999 = 999,
 } variant_t;
 
 static alg_t g_alg = ALG_1X;
@@ -74,11 +76,29 @@ static alg_t alg_from_string(const char *s) {
 
 static variant_t variant_from_string(const char *s) {
     if (!s) return VAR_1;
+    /* Accept string variants */
     if (strcasecmp(s, "1") == 0) return VAR_1;
     if (strcasecmp(s, "1k") == 0) return VAR_1K;
     if (strcasecmp(s, "1l") == 0) return VAR_1L;
     if (strcasecmp(s, "1o") == 0) return VAR_1O;
+    if (strcasecmp(s, "999") == 0) return VAR_999;
+    /* Accept numeric level strings: 11->1k, 12->1l, 13->1o, 14->1 */
+    if (strcasecmp(s, "11") == 0) return VAR_1K;
+    if (strcasecmp(s, "12") == 0) return VAR_1L;
+    if (strcasecmp(s, "13") == 0) return VAR_1O;
+    if (strcasecmp(s, "14") == 0) return VAR_1;
     return VAR_1;
+}
+
+static size_t workmem_size_for(alg_t alg, variant_t variant) {
+    if (variant == VAR_999) {
+        return (alg == ALG_1Y) ? (size_t)LZO1Y_999_MEM_COMPRESS : (size_t)LZO1X_999_MEM_COMPRESS;
+    }
+    if (alg == ALG_1Y) return (size_t)LZO1Y_MEM_COMPRESS;
+    if (variant == VAR_1K) return (size_t)LZO1X_1_12_MEM_COMPRESS;
+    if (variant == VAR_1L) return (size_t)LZO1X_1_11_MEM_COMPRESS;
+    if (variant == VAR_1O) return (size_t)LZO1X_1_15_MEM_COMPRESS;
+    return (size_t)LZO1X_1_MEM_COMPRESS;
 }
 
 static const char *alg_to_str(alg_t a) {
@@ -181,6 +201,11 @@ static double median_double(const double *vals, size_t n) {
 }
 
 static size_t g_cli_fixed_block_bytes = 0;
+
+static int auto_detect_threads(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return (n > 0) ? (int)n : 4;
+}
 
 static size_t choose_block_size(size_t total_bytes, int threads) {
     if (g_cli_fixed_block_bytes > 0) {
@@ -368,8 +393,8 @@ static void *compress_worker(void *opaque) {
     #define LZO_CPU_ALIGNED_ALLOC(ptr, align, size) posix_memalign((void **)(ptr), (align), (size))
     #define LZO_CPU_ALIGNED_FREE(ptr) free((ptr))
 #endif
-    /* try to allocate per-thread workspace to reuse across compress calls */
-    if (LZO_CPU_ALIGNED_ALLOC((void **)&thread_wrkmem, sizeof(lzo_align_t), LZO_WORK_MEM_SIZE) == 0) {
+    size_t wrkmem_sz = workmem_size_for(job->compression_alg, job->variant);
+    if (LZO_CPU_ALIGNED_ALLOC((void **)&thread_wrkmem, sizeof(lzo_align_t), wrkmem_sz) == 0) {
         have_wrkmem = 1;
     } else {
         thread_wrkmem = NULL;
@@ -1380,7 +1405,7 @@ static int parse_int(const char *s, int *out) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
     if (!end || *end != '\0') return -1;
-    if (v <= 0 || v > INT_MAX) return -1;
+    if (v < 0 || v > INT_MAX) return -1;
     *out = (int)v;
     return 0;
 }
@@ -1390,19 +1415,21 @@ static void print_usage(const char *prog) {
             "Usage: %s [options] <input>\n"
             "Options:\n"
             "  -d              Decompress instead of compress\n"
-            "  -t <threads>    Worker thread count (default %d)\n"
+            "  -t <threads>    Worker thread count (0=auto, default: auto)\n"
             "  --verify        Verify round-trip instead of writing outputs\n"
             "  -a <alg>        Select algorithm (1x, 1y). Default 1x.\n"
-            "  -l <level>      Select level/variant for 1x (1, 1k, 1l, 1o). Default 1.\n"
+            "  -l <level>      Select variant: numeric (11/12/13/14/999) or string (1/1k/1l/1o/999). Default 14.\n"
+            "                   11=1k, 12=1l, 13=1o, 14=1 (standard), 999=slow compression\n"
+            "  -L              Alias for -l\n"
+            "  -B, --block-size <N>  Block size with suffix B/KB/MB (default: 256KB)\n"
             "  -o <path>       Output path (- for stdout). If omitted a default is generated from input\n"
-            "  --bench         Run stable kernel benchmark for several seconds\n"
-            "  --bench-seconds <s>  Benchmark duration in seconds (default 3)\n"
+            "  --bench [N]     Run stable kernel benchmark for optional N seconds (default 3)\n"
             "  --benchmark     Run benchmark metrics after operation\n"
             "  --debug-metrics Enable per-block CPU timing/metrics (debug only)\n"
             "  -h, --help      Show this help\n"
             "  Use '-' for stdin/stdout. Output defaults to input with .lzo (compress)\n"
             "  or stripped .lzo extension (decompress).\n",
-            prog, DEFAULT_THREAD_COUNT);
+            prog);
 }
 
 int main(int argc, char **argv) {
@@ -1457,25 +1484,7 @@ int main(int argc, char **argv) {
             verbose = 1;
         } else if (strcmp(arg, "--bench") == 0) {
             bench_mode = 1;
-        } else if (strcmp(arg, "--bench-seconds") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "--bench-seconds requires an argument\n");
-                free(auto_output);
-                return 1;
-            }
-            bench_seconds = atof(argv[++i]);
-            if (bench_seconds <= 0.0) {
-                fprintf(stderr, "invalid --bench-seconds value\n");
-                free(auto_output);
-                return 1;
-            }
-        } else if (strncmp(arg, "--bench-seconds=", 16) == 0) {
-            bench_seconds = atof(arg + 16);
-            if (bench_seconds <= 0.0) {
-                fprintf(stderr, "invalid --bench-seconds value\n");
-                free(auto_output);
-                return 1;
-            }
+            if (i + 1 < argc && argv[i + 1][0] != '-') bench_seconds = atof(argv[++i]);
         } else if (strcmp(arg, "-B") == 0 || strcmp(arg, "--block-size") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "-B requires an argument\n");
@@ -1496,7 +1505,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
             ++i;
-        } else if (strcmp(arg, "--benchmark") == 0 || strcmp(arg, "-b") == 0) {
+        } else if (strcmp(arg, "--benchmark") == 0) {
             do_bench = 1;
         } else if (strcmp(arg, "--verify") == 0) {
             verify_only = 1;
@@ -1564,9 +1573,11 @@ int main(int argc, char **argv) {
     }
 
     /* Enforce variant restrictions */
-    if (g_alg == ALG_1Y) {
+    if (g_alg == ALG_1Y && g_variant != VAR_1 && g_variant != VAR_999) {
         g_variant = VAR_1;
     }
+
+    if (threads <= 0) threads = auto_detect_threads();
 
     if (!output) {
         if (strcmp(input, "-") == 0) {
@@ -1621,7 +1632,8 @@ int main(int argc, char **argv) {
             (g_variant == VAR_1) ? "1" :
             (g_variant == VAR_1K) ? "1k" :
             (g_variant == VAR_1L) ? "1l" :
-            (g_variant == VAR_1O) ? "1o" : "unknown");
+            (g_variant == VAR_1O) ? "1o" :
+            (g_variant == VAR_999) ? "999" : "unknown");
     }
 
     if (mode_decompress) {
@@ -1644,18 +1656,26 @@ static int compress_block_into(const unsigned char *in, size_t in_size,
                                alg_t compression_alg, variant_t variant, void *wrkmem_in) {
     if (!out || out_cap == 0) return LZO_E_OUT_OF_MEMORY;
     lzo_align_t *wrkmem_ptr = NULL;
+    lzo_align_t *wrkmem_heap = NULL;
     if (wrkmem_in) {
         wrkmem_ptr = (lzo_align_t *)wrkmem_in;
     } else {
-        HEAP_ALLOC(_wrkmem_local, LZO_WORK_MEM_SIZE);
-        wrkmem_ptr = _wrkmem_local;
+        size_t wrkmem_sz = workmem_size_for(compression_alg, variant);
+        if (posix_memalign((void **)&wrkmem_heap, sizeof(lzo_align_t), wrkmem_sz) != 0) {
+            wrkmem_heap = NULL;
+        }
+        if (!wrkmem_heap) return LZO_E_OUT_OF_MEMORY;
+        memset(wrkmem_heap, 0, wrkmem_sz);
+        wrkmem_ptr = wrkmem_heap;
     }
 
     lzo_uint dst_len = (lzo_uint)out_cap;
     int rc;
     switch (compression_alg) {
         case ALG_1X:
-            if (variant == VAR_1K)
+            if (variant == VAR_999)
+                rc = lzo1x_999_compress_level(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr, NULL, 0, NULL, 9);
+            else if (variant == VAR_1K)
                 rc = lzo1x_1_12_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);
             else if (variant == VAR_1L)
                 rc = lzo1x_1_11_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);
@@ -1665,12 +1685,16 @@ static int compress_block_into(const unsigned char *in, size_t in_size,
                 rc = lzo1x_1_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);
             break;
         case ALG_1Y:
-            rc = lzo1y_1_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);
+            if (variant == VAR_999)
+                rc = lzo1y_999_compress_level(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr, NULL, 0, NULL, 9);
+            else
+                rc = lzo1y_1_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);
             break;
         default:
             rc = lzo1x_1_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);
             break;
     }
+    if (wrkmem_heap) free(wrkmem_heap);
     if (rc != LZO_E_OK) return rc;
     *out_size = (size_t)dst_len;
     return LZO_E_OK;

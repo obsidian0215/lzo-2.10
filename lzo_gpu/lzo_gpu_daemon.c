@@ -414,6 +414,7 @@ int handle_compress_request(request_t* req, response_t* resp, worker_res_t* work
         req->input_path,
         req->output_path,
         &params,
+        0,
         &worker->ws,
         &time_us,
         &output_size,

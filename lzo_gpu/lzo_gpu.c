@@ -7,7 +7,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <math.h>
 #include <sys/stat.h>
 #include <errno.h>
 #include <time.h>
@@ -63,10 +62,6 @@ uint32  len[nblk]               // 每块压缩长度
 -----   nblk 个压缩块数据
 */
 #define MAGIC  0x4C5A   /* 'L''Z' */
-#define D_BITS          11
-//#define BLK_SIZE        (32 * 1024)
-/* Compression ratio tracking */
-#define ENABLE_COMPRESSION_RATIO_TRACKING 1
 
 static inline void print_ns(const char* tag, uint64_t ns) {
     unsigned long us = (unsigned long)(ns / 1000ULL);
@@ -225,12 +220,11 @@ static inline void show_help(char *prog_name)
     fprintf(stderr, "  -d, --decompress     Decompress mode\n");
     fprintf(stderr, "  -o, --output FILE    Output file (use '-' for stdout)\n");
     fprintf(stderr, "  -a, --alg ALG        Algorithm (lzo1x, lzo1y) (default: lzo1x)\n");
-    fprintf(stderr, "  -L, --level LEVEL    Dictionary bits (10-15) (default: 12)\n");
+    fprintf(stderr, "  -L, --level LEVEL    Compression level: 11-15=D_BITS (default: 14), 99=enhanced greedy, 999=optimal (SWD)\n");
     fprintf(stderr, "  -B, --block-size N   Block size (B/KB/MB) (default: 16KB)\n");
     fprintf(stderr, "  -v, --verbose        Enable performance statistics\n");
     fprintf(stderr, "  --local N            Local work-group size (default: 1)\n");
-    fprintf(stderr, "  --bench [SECONDS]    Stable benchmark (compress+decompress+verify)\n");
-    fprintf(stderr, "  --bench-seconds N    Benchmark duration in seconds (default: 3)\n");
+    fprintf(stderr, "  --bench [N]          Stable benchmark (compress+decompress+verify), optional N seconds (default: 3)\n");
     fprintf(stderr, "Detailed Help:\n");
     fprintf(stderr, "  %s --daemon -h           # Daemon-specific settings\n", prog_name);
     fprintf(stderr, "  %s --use-daemon -h       # Client-specific settings\n\n", prog_name);
@@ -342,7 +336,7 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
     size_t output_size = 0;
     timing_t t_out = {0};
 
-    int ret = lzo_compress_core(ctx, q, dev, krn_c, pack_krn, in_path, output_path, &params, &ws, &time_us, &output_size, &t_out);
+    int ret = lzo_compress_core(ctx, q, dev, krn_c, pack_krn, in_path, output_path, &params, 0, &ws, &time_us, &output_size, &t_out);
     uint64_t t_total_end = now_ns();
     unsigned long overall_us = (unsigned long)((t_total_end - t_total_start) / 1000ULL);
 
@@ -514,7 +508,8 @@ static int run_lzo_bench(const char *in_path,
         snprintf(decomp_base, sizeof(decomp_base), "%s_debug", alg_name);
     else
         snprintf(decomp_base, sizeof(decomp_base), "%s", alg_name);
-    cl_program prog_d = lzo_load_program_with_dbits(ctx, dev, decomp_base, comp_level, build_log, sizeof(build_log));
+    int decomp_bits = (comp_level == 999 || comp_level == 99) ? LZO_DEFAULT_COMP_LEVEL : comp_level;
+    cl_program prog_d = lzo_load_program_with_dbits(ctx, dev, decomp_base, decomp_bits, build_log, sizeof(build_log));
     if (!prog_d) {
         if (build_log[0]) {
             fprintf(stderr, "bench error: failed to load decompressor program (D_BITS=%d): %s\n", comp_level, build_log);
@@ -604,8 +599,9 @@ static int run_lzo_bench(const char *in_path,
         cl_uint *h_dbg_dec = NULL;
         cl_mem d_dbg_dec = NULL;
 
+        int skip_input_upload = (n > 0) ? 1 : 0;
         int rc = lzo_compress_core(ctx, q, dev, krn_c, pack_krn, in_path, "/dev/null",
-                                   &params, &ws, &time_us, &out_size, &tc);
+                                   &params, skip_input_upload, &ws, &time_us, &out_size, &tc);
         if (rc != 0) {
             verify_ok = 0;
             break;
@@ -947,18 +943,6 @@ int run_lzo_standalone(int argc, char** argv)
             }
             continue;
         }
-        if (strcmp(arg, "--bench-seconds") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "Error: missing argument for %s\n", arg);
-                return 1;
-            }
-            bench_seconds = atof(argv[++i]);
-            continue;
-        }
-        if (strncmp(arg, "--bench-seconds=", 16) == 0) {
-            bench_seconds = atof(arg + 16);
-            continue;
-        }
         if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
             g_verbose = 1;
             continue;
@@ -978,10 +962,11 @@ int run_lzo_standalone(int argc, char** argv)
                 fprintf(stderr, "Error: missing argument for %s\n", arg);
                 return 1;
             }
-            comp_level = atoi(argv[++i]);
+            const char* level_arg = argv[++i];
+            comp_level = atoi(level_arg);
             comp_level_specified = 1;
-            if (comp_level < 8 || comp_level > 20) {
-                fprintf(stderr, "error: dictionary size must be between 8 and 20 bits (got %d)\n", comp_level);
+            if (comp_level != 999 && comp_level != 99 && (comp_level < 11 || comp_level > 15)) {
+                fprintf(stderr, "error: dictionary size must be between 11 and 15 bits (got %d)\n", comp_level);
                 return 1;
             }
             continue;
@@ -1085,36 +1070,6 @@ int run_lzo_standalone(int argc, char** argv)
                 snprintf(default_output, sizeof(default_output), "%s.lzo", in_path);
                 output_path = default_output;
             }
-        }
-    }
-
-    /* Apply autotune config for compression if present (only change unspecified fields). */
-    if (!decompress_mode) {
-        request_t ar;
-        memset(&ar, 0, sizeof(ar));
-        ar.operation = 'C';
-        ar.block_size = (g_cli_fixed_block_bytes > 0) ? (int)(g_cli_fixed_block_bytes / 1024) : 0;
-        ar.local_size = (uint32_t)g_cli_local_size;
-        ar.alg = alg_specified ? ((strcmp(alg_name, "lzo1y") == 0) ? 1 : 0) : -1;
-        ar.level = comp_level_specified ? comp_level : -1;
-        if (in_path) {
-            struct stat st;
-            if (stat(in_path, &st) == 0) ar.input_size = st.st_size;
-        }
-
-        if (lzo_apply_autotune_config(&ar) == 0) {
-            if (!alg_specified && ar.alg >= 0) {
-                alg_name = (ar.alg == 1) ? "lzo1y" : "lzo1x";
-            }
-            if (!comp_level_specified && ar.level > 0) comp_level = ar.level;
-            if (g_cli_fixed_block_bytes == 0 && ar.block_size > 0) g_cli_fixed_block_bytes = (size_t)ar.block_size * 1024;
-            if (g_cli_local_size == 0 && ar.local_size > 0) g_cli_local_size = (size_t)ar.local_size;
-            if (g_verbose) {
-                fprintf(stderr, "[AUTOTUNE] Applied autotune suggestions: alg=%d level=%d block_kb=%d local_size=%u\n",
-                        ar.alg, ar.level, ar.block_size, ar.local_size);
-            }
-        } else {
-            if (g_verbose) fprintf(stderr, "[AUTOTUNE] No autotune config found in exe dir or LZO_GPU_AUTOTUNE_CONF\n");
         }
     }
 

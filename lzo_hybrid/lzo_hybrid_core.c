@@ -25,8 +25,6 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
-#include <errno.h>
-#include <math.h>
 #include <stdatomic.h>
 
 /* CPU LZO library */
@@ -67,6 +65,33 @@ static size_t sampled_block_index(size_t sample_pos, size_t sample_count, size_t
     return (sample_pos * (num_blocks - 1)) / (sample_count - 1);
 }
 
+static void hybrid_choose_blocking(const unsigned char* data,
+                                   size_t in_sz,
+                                   cl_device_id dev,
+                                   cl_kernel gpu_kernel,
+                                   size_t blk_bytes,
+                                   int debug,
+                                   size_t* blk_out,
+                                   size_t* nblk_out) {
+    if (dev && gpu_kernel) {
+        lzo_choose_blocking_adaptive(data, in_sz, dev, blk_bytes, 0, blk_out, nblk_out, debug);
+        return;
+    }
+
+    if (blk_bytes > 0) {
+        size_t blk = blk_bytes;
+        if (blk < LZO_MIN_BLOCK_BYTES_DEFAULT) blk = LZO_MIN_BLOCK_BYTES_DEFAULT;
+        if (blk > LZO_MAX_BLOCK_BYTES_DEFAULT) blk = LZO_MAX_BLOCK_BYTES_DEFAULT;
+        *blk_out = blk;
+        *nblk_out = (in_sz + blk - 1) / blk;
+    } else {
+        size_t blk = (size_t)LZO_DEFAULT_BLOCK_KB * 1024U;
+        if (blk == 0) blk = 16 * 1024;
+        *blk_out = blk;
+        *nblk_out = (in_sz + blk - 1) / blk;
+    }
+}
+
 /* ---- Device-aware adaptive scheduler infrastructure ---- */
 
 static void ensure_lzo_init(void);
@@ -78,6 +103,8 @@ typedef struct {
     double cpu_throughput;    /* single-thread CPU throughput (bytes/s) */
     double gpu_throughput;    /* GPU throughput (bytes/s) */
     double gpu_overhead_s;    /* GPU fixed overhead (seconds) */
+    double cpu_energy_per_byte; /* CPU energy cost (J/byte), 0 if unavailable */
+    double gpu_energy_per_byte; /* GPU energy cost (J/byte), 0 if unavailable */
     int    is_unified_memory;
     int    valid;
 } lzo_device_profile_t;
@@ -88,6 +115,13 @@ static double lzo_read_sysfs_double(const char* path) {
     FILE* f = fopen(path, "r");
     double val = -1.0;
     if (f) { if (fscanf(f, "%lf", &val) != 1) val = -1.0; fclose(f); }
+    return val;
+}
+
+static uint64_t lzo_read_rapl_energy_uj(const char* domain_path) {
+    FILE* f = fopen(domain_path, "r");
+    uint64_t val = 0;
+    if (f) { if (fscanf(f, "%lu", &val) != 1) val = 0; fclose(f); }
     return val;
 }
 
@@ -132,7 +166,9 @@ static void lzo_calibrate_device_profile(cl_context ctx, cl_command_queue queue,
 
     {
         cl_bool unified = CL_FALSE;
-        clGetDeviceInfo(device, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(unified), &unified, NULL);
+        if (device) {
+            clGetDeviceInfo(device, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(unified), &unified, NULL);
+        }
         g_lzo_dev_profile.is_unified_memory = (unified == CL_TRUE) ? 1 : 0;
     }
 
@@ -169,22 +205,33 @@ static void lzo_calibrate_device_profile(cl_context ctx, cl_command_queue queue,
         memset(wrkmem, 0, wrkmem_sz);
         ensure_lzo_init();
 
-        t0 = hybrid_now_ns();
-        for (int rep = 0; rep < 3; rep++) {
-            lzo_uint out_len = (lzo_uint)lzo_worst_size(cal_size);
-            if (params->alg_id == 1)
-                lzo1y_1_compress(cal_buf, (lzo_uint)cal_size, cal_out, &out_len, wrkmem);
-            else
-                lzo1x_1_compress(cal_buf, (lzo_uint)cal_size, cal_out, &out_len, wrkmem);
+        {
+            uint64_t e0 = lzo_read_rapl_energy_uj("/sys/class/powercap/intel-rapl:0:0/energy_uj");
+            t0 = hybrid_now_ns();
+            for (int rep = 0; rep < 3; rep++) {
+                lzo_uint out_len = (lzo_uint)lzo_worst_size(cal_size);
+                if (params->alg_id == 1)
+                    lzo1y_1_compress(cal_buf, (lzo_uint)cal_size, cal_out, &out_len, wrkmem);
+                else
+                    lzo1x_1_compress(cal_buf, (lzo_uint)cal_size, cal_out, &out_len, wrkmem);
+            }
+            t1 = hybrid_now_ns();
+            g_lzo_dev_profile.cpu_throughput = (3.0 * (double)cal_size) / ((double)(t1 - t0) * 1e-9);
+
+            {
+                uint64_t e1 = lzo_read_rapl_energy_uj("/sys/class/powercap/intel-rapl:0:0/energy_uj");
+                if (e0 > 0 && e1 > e0) {
+                    double energy_j = (double)(e1 - e0) * 1e-6;
+                    g_lzo_dev_profile.cpu_energy_per_byte = energy_j / (3.0 * (double)cal_size);
+                }
+            }
         }
-        t1 = hybrid_now_ns();
-        g_lzo_dev_profile.cpu_throughput = (3.0 * (double)cal_size) / ((double)(t1 - t0) * 1e-9);
 
         free(cal_out);
         free(wrkmem);
 
         /* GPU calibration: compress the same 2MB through the kernel */
-        if (gpu_kernel && ws) {
+        if (gpu_kernel && ws && ctx && queue && device) {
             size_t blk = (params->block_size > 0) ? params->block_size : 65536;
             size_t cal_nblk = (cal_size + blk - 1) / blk;
             size_t worst_blk = lzo_worst_size(blk);
@@ -204,17 +251,24 @@ static void lzo_calibrate_device_profile(cl_context ctx, cl_command_queue queue,
             }
             if (err == CL_SUCCESS) {
                 int comp_level = (params->comp_level > 0) ? params->comp_level : 14;
-                size_t dict_per_block = (1ULL << comp_level) * sizeof(uint32_t);
+                int is_999 = (comp_level == 999);
+                size_t dict_per_block;
+                if (is_999) {
+                    dict_per_block = 458752ULL;  /* SWD_POOL_STRIDE */
+                } else {
+                    dict_per_block = (1ULL << comp_level) * sizeof(uint32_t);
+                }
                 size_t total_dict = cal_nblk * dict_per_block;
                 grow_buffer(ctx, &ws->d_dict, &ws->dict_cap, total_dict, CL_MEM_READ_WRITE, &err);
                 if (err == CL_SUCCESS) zero_buffer(queue, ws->d_dict, ws->dict_cap);
             }
             if (err == CL_SUCCESS) {
+                int comp_level = (params->comp_level > 0) ? params->comp_level : 14;
+                int is_999 = (comp_level == 999);
                 cl_uint cal_in_sz = (cl_uint)cal_size;
                 cl_uint blk_cl = (cl_uint)blk;
                 cl_uint worst_blk_cl = (cl_uint)worst_blk;
                 cl_uint pool_size_cl = (cl_uint)cal_nblk;
-                uint32_t epoch_base = 1;
 
                 clSetKernelArg(gpu_kernel, 0, sizeof(cl_mem), &ws->d_in);
                 clSetKernelArg(gpu_kernel, 1, sizeof(cl_mem), &ws->d_out);
@@ -223,10 +277,20 @@ static void lzo_calibrate_device_profile(cl_context ctx, cl_command_queue queue,
                 clSetKernelArg(gpu_kernel, 4, sizeof(cl_uint), &blk_cl);
                 clSetKernelArg(gpu_kernel, 5, sizeof(cl_uint), &worst_blk_cl);
                 clSetKernelArg(gpu_kernel, 6, sizeof(cl_mem), &ws->d_dict);
-                clSetKernelArg(gpu_kernel, 7, sizeof(cl_uint), &pool_size_cl);
-                clSetKernelArg(gpu_kernel, 8, sizeof(cl_uint), &epoch_base);
 
-                {
+                if (is_999) {
+                    /* 999 kernel: 10 args — swd_pool, swd_pool_count, try_lazy, max_chain */
+                    cl_uint swd_pool_count_cl = pool_size_cl;
+                    cl_uint try_lazy_cl = 2U;
+                    cl_uint max_chain_cl = 4096U;
+                    clSetKernelArg(gpu_kernel, 7, sizeof(cl_uint), &swd_pool_count_cl);
+                    clSetKernelArg(gpu_kernel, 8, sizeof(cl_uint), &try_lazy_cl);
+                    clSetKernelArg(gpu_kernel, 9, sizeof(cl_uint), &max_chain_cl);
+                } else {
+                    uint32_t epoch_base = 1;
+                    clSetKernelArg(gpu_kernel, 7, sizeof(cl_uint), &pool_size_cl);
+                    clSetKernelArg(gpu_kernel, 8, sizeof(cl_uint), &epoch_base);
+
                     cl_uint krn_num_args = 0;
                     clGetKernelInfo(gpu_kernel, CL_KERNEL_NUM_ARGS, sizeof(krn_num_args), &krn_num_args, NULL);
                     if (krn_num_args >= 11U) {
@@ -243,17 +307,30 @@ static void lzo_calibrate_device_profile(cl_context ctx, cl_command_queue queue,
                     global_size = ((global_size + local_size - 1) / local_size) * local_size;
                     if (global_size == 0) global_size = 1;
 
-                    t0 = hybrid_now_ns();
-                    err = clEnqueueNDRangeKernel(queue, gpu_kernel, 1, NULL, &global_size, &local_size, 0, NULL, NULL);
-                    if (err == CL_SUCCESS) {
-                        clFinish(queue);
-                        t1 = hybrid_now_ns();
-                        g_lzo_dev_profile.gpu_throughput = (double)cal_size / ((double)(t1 - t0) * 1e-9);
-                        g_lzo_dev_profile.gpu_overhead_s = 0.001;
+                    {
+                        uint64_t ge0 = lzo_read_rapl_energy_uj("/sys/class/powercap/intel-rapl:0:1/energy_uj");
+                        t0 = hybrid_now_ns();
+                        err = clEnqueueNDRangeKernel(queue, gpu_kernel, 1, NULL, &global_size, &local_size, 0, NULL, NULL);
+                        if (err == CL_SUCCESS) {
+                            clFinish(queue);
+                            t1 = hybrid_now_ns();
+                            g_lzo_dev_profile.gpu_throughput = (double)cal_size / ((double)(t1 - t0) * 1e-9);
+                            g_lzo_dev_profile.gpu_overhead_s = 0.001;
+
+                            {
+                                uint64_t ge1 = lzo_read_rapl_energy_uj("/sys/class/powercap/intel-rapl:0:1/energy_uj");
+                                if (ge0 > 0 && ge1 > ge0) {
+                                    double energy_j = (double)(ge1 - ge0) * 1e-6;
+                                    g_lzo_dev_profile.gpu_energy_per_byte = energy_j / (double)cal_size;
+                                }
+                            }
+                        }
                     }
                 }
 
-                ws->comp_epoch_base = (uint32_t)cal_nblk + 2;
+                if (!is_999) {
+                    ws->comp_epoch_base = (uint32_t)cal_nblk + 2;
+                }
             }
 
             if (g_lzo_dev_profile.gpu_throughput <= 0.0) {
@@ -573,8 +650,10 @@ static double choose_adaptive_gpu_ratio(cl_context ctx, cl_command_queue queue,
     size_t sampled = 0;
     double sample_cpu_throughput = 0.0;
 
+    if (!gpu_kernel) return 0.0;
+
     if (!params || nblk == 0 || blk == 0 || total_input_sz == 0)
-        return params ? params->gpu_ratio : 1.0;
+        return 0.5;
 
     /* --- 1. Device capability profile (cached) --- */
     lzo_calibrate_device_profile(ctx, queue, device, gpu_kernel, params, ws);
@@ -690,10 +769,20 @@ static double choose_adaptive_gpu_ratio(cl_context ctx, cl_command_queue queue,
         return 0.0;
     }
 
-    if (Pc_eff + Pg_eff <= 0.0) return params->gpu_ratio;
+    if (Pc_eff + Pg_eff <= 0.0) return 0.5;
     r_star = Pg_eff / (Pc_eff + Pg_eff);
     if (B > 0.0 && t0 > 0.0) {
         r_star -= (t0 * Pc_eff * Pg_eff) / (B * (Pc_eff + Pg_eff));
+    }
+
+    /* --- 4. Energy-aware correction --- */
+    {
+        double eC = g_lzo_dev_profile.cpu_energy_per_byte;
+        double eG = g_lzo_dev_profile.gpu_energy_per_byte;
+        if (eC > 0.0 && eG > 0.0) {
+            double r_energy = (Pg_eff * eC) / (Pc_eff * eG + Pg_eff * eC);
+            r_star = 0.7 * r_star + 0.3 * r_energy;
+        }
     }
 
     if (r_star < 0.0) r_star = 0.0;
@@ -703,10 +792,13 @@ static double choose_adaptive_gpu_ratio(cl_context ctx, cl_command_queue queue,
         fprintf(stderr,
                 "Adaptive: Pc0=%.0f gC=%.2f sC=%.2f threads=%ld Pc_eff=%.0f | "
                 "Pg0=%.0f gG=%.2f sG=%.2f Pg_eff=%.0f | "
-                "t0=%.6f B=%.0f entropy=%.2f r*=%.4f\n",
+                "t0=%.6f B=%.0f entropy=%.2f eC=%.2e eG=%.2e r*=%.4f\n",
                 Pc0, gC, sC, thread_count, Pc_eff,
                 Pg0, gG, sG, Pg_eff,
-                t0, B, mean_entropy, r_star);
+                t0, B, mean_entropy,
+                g_lzo_dev_profile.cpu_energy_per_byte,
+                g_lzo_dev_profile.gpu_energy_per_byte,
+                r_star);
     }
 
     return r_star;
@@ -721,6 +813,7 @@ static int hybrid_compress_buf(
     unsigned char* out_buf, uint32_t* lengths,
     size_t blk, size_t nblk, size_t worst_blk,
     const hybrid_params_t* params, hybrid_workspace_t* ws,
+    int skip_upload,
     hybrid_timing_t* timing_out
 ) {
     cl_int err;
@@ -736,11 +829,45 @@ static int hybrid_compress_buf(
     size_t* cpu_idx = NULL;
     size_t gpu_count = 0, cpu_count = 0;
     double gpu_ratio = params->gpu_ratio;
+    int n_cpu_threads = 0;
+    pthread_t* cpu_tids = NULL;
+    int force_cpu_only = 0;
+    int force_gpu_only = 0;
     if (params->cpu_threads <= 0) gpu_ratio = 1.0;
     if (params->split_mode == HYBRID_SPLIT_ADAPTIVE) {
         gpu_ratio = choose_adaptive_gpu_ratio(ctx, queue, device, gpu_kernel, input_buf, in_sz, blk, nblk, params, ws);
     }
-    partition_blocks(nblk, gpu_ratio, &gpu_idx, &gpu_count, &cpu_idx, &cpu_count);
+
+    if (gpu_kernel == NULL) gpu_ratio = 0.0;
+    if (gpu_ratio <= 0.0) {
+        force_cpu_only = 1;
+    } else if (gpu_ratio >= 1.0 || params->cpu_threads <= 0) {
+        force_gpu_only = 1;
+    }
+
+    if (force_cpu_only) {
+        gpu_count = 0;
+        cpu_count = nblk;
+        if (cpu_count > 0) {
+            cpu_idx = (size_t*)malloc(cpu_count * sizeof(size_t));
+            if (!cpu_idx) goto fail;
+            for (size_t i = 0; i < cpu_count; ++i) cpu_idx[i] = i;
+        }
+    } else if (force_gpu_only) {
+        gpu_count = nblk;
+        cpu_count = 0;
+        if (gpu_count > 0) {
+            gpu_idx = (size_t*)malloc(gpu_count * sizeof(size_t));
+            if (!gpu_idx) goto fail;
+            for (size_t i = 0; i < gpu_count; ++i) gpu_idx[i] = i;
+        }
+    } else {
+        partition_blocks(nblk, gpu_ratio, &gpu_idx, &gpu_count, &cpu_idx, &cpu_count);
+    }
+
+    if (gpu_count > 0 && (gpu_kernel == NULL || ctx == NULL || queue == NULL || ws == NULL)) {
+        goto fail;
+    }
     timing.gpu_blocks = gpu_count;
     timing.cpu_blocks = cpu_count;
 
@@ -763,9 +890,8 @@ static int hybrid_compress_buf(
         .next_idx = 0,
     };
 
-    int n_cpu_threads = (cpu_count > 0) ? params->cpu_threads : 0;
+    n_cpu_threads = (cpu_count > 0) ? params->cpu_threads : 0;
     if (n_cpu_threads > (int)cpu_count) n_cpu_threads = (int)cpu_count;
-    pthread_t* cpu_tids = NULL;
     uint64_t t_cpu_start = hybrid_now_ns();
     if (n_cpu_threads > 0) {
         if (n_cpu_threads == 1) {
@@ -781,12 +907,12 @@ static int hybrid_compress_buf(
     /* GPU compression */
     uint64_t t_gpu_k0 = 0, t_gpu_k1 = 0;
     unsigned long pack_kernel_us = 0;
-    cl_uint* gpu_lengths = NULL;
 
     if (gpu_count > 0) {
         uint64_t t_up0 = hybrid_now_ns();
         const unsigned char* gpu_upload_ptr;
         size_t gpu_input_sz;
+        int can_skip_upload = (skip_upload && force_gpu_only && cpu_count == 0);
 
         if (cpu_count == 0) {
             gpu_upload_ptr = input_buf;
@@ -804,9 +930,13 @@ static int hybrid_compress_buf(
             gpu_upload_ptr = gpu_input;
         }
 
-        grow_buffer(ctx, &ws->d_in, &ws->in_cap, gpu_input_sz, CL_MEM_READ_ONLY, &err);
-        if (err != CL_SUCCESS) { if (cpu_count != 0) free((void*)(uintptr_t)gpu_upload_ptr); goto fail; }
-        err = clEnqueueWriteBuffer(queue, ws->d_in, CL_TRUE, 0, gpu_input_sz, gpu_upload_ptr, 0, NULL, NULL);
+        if (!can_skip_upload) {
+            grow_buffer(ctx, &ws->d_in, &ws->in_cap, gpu_input_sz, CL_MEM_READ_ONLY, &err);
+            if (err != CL_SUCCESS) { if (cpu_count != 0) free((void*)(uintptr_t)gpu_upload_ptr); goto fail; }
+            err = clEnqueueWriteBuffer(queue, ws->d_in, CL_TRUE, 0, gpu_input_sz, gpu_upload_ptr, 0, NULL, NULL);
+        } else {
+            err = CL_SUCCESS;
+        }
         if (cpu_count != 0) free((void*)(uintptr_t)gpu_upload_ptr);
         if (err != CL_SUCCESS) goto fail;
 
@@ -818,49 +948,72 @@ static int hybrid_compress_buf(
         grow_buffer(ctx, &ws->d_len, &ws->len_cap, len_needed, CL_MEM_READ_WRITE, &err);
         if (err != CL_SUCCESS) goto fail;
 
-        /* Dictionary pool */
-        size_t dict_per_block = (1ULL << params->comp_level) * sizeof(uint32_t);
+        /* Dictionary / SWD pool */
+        int is_999 = (params->comp_level == 999);
+        size_t dict_per_block;
+        if (is_999) {
+            dict_per_block = 458752ULL;
+        } else {
+            dict_per_block = (1ULL << params->comp_level) * sizeof(uint32_t);
+        }
         size_t pool_size = gpu_count;
         size_t total_dict = pool_size * dict_per_block;
         size_t prev_dict = ws->dict_cap;
         grow_buffer(ctx, &ws->d_dict, &ws->dict_cap, total_dict, CL_MEM_READ_WRITE, &err);
         if (err != CL_SUCCESS) goto fail;
-        if (ws->dict_cap != prev_dict) {
+        if (is_999 || ws->dict_cap != prev_dict) {
             zero_buffer(queue, ws->d_dict, ws->dict_cap);
         }
 
-        /* Epoch management */
-        if (ws->comp_epoch_base == 0) ws->comp_epoch_base = 1;
-        if ((uint32_t)gpu_count + 2U >= 4095U ||
-            ws->comp_epoch_base + (uint32_t)gpu_count + 1U > 4095U) {
-            zero_buffer(queue, ws->d_dict, ws->dict_cap);
-            ws->comp_epoch_base = 1;
+        uint32_t epoch_base = 0;
+        if (!is_999) {
+            if (ws->comp_epoch_base == 0) ws->comp_epoch_base = 1;
+            if ((uint32_t)gpu_count + 2U >= 4095U ||
+                ws->comp_epoch_base + (uint32_t)gpu_count + 1U > 4095U) {
+                zero_buffer(queue, ws->d_dict, ws->dict_cap);
+                ws->comp_epoch_base = 1;
+            }
+            epoch_base = ws->comp_epoch_base;
+            ws->comp_epoch_base += (uint32_t)gpu_count + 1U;
         }
-        uint32_t epoch_base = ws->comp_epoch_base;
-        ws->comp_epoch_base += (uint32_t)gpu_count + 1U;
 
-        /* Set kernel args */
         cl_uint gpu_in_sz = (cl_uint)gpu_input_sz;
         cl_uint blk_cl = (cl_uint)blk;
         cl_uint worst_blk_cl = (cl_uint)worst_blk;
         cl_uint pool_size_cl = (cl_uint)pool_size;
-        CHECK_CL(clSetKernelArg(gpu_kernel, 0, sizeof(cl_mem), &ws->d_in));
-        CHECK_CL(clSetKernelArg(gpu_kernel, 1, sizeof(cl_mem), &ws->d_out));
-        CHECK_CL(clSetKernelArg(gpu_kernel, 2, sizeof(cl_mem), &ws->d_len));
-        CHECK_CL(clSetKernelArg(gpu_kernel, 3, sizeof(cl_uint), &gpu_in_sz));
-        CHECK_CL(clSetKernelArg(gpu_kernel, 4, sizeof(cl_uint), &blk_cl));
-        CHECK_CL(clSetKernelArg(gpu_kernel, 5, sizeof(cl_uint), &worst_blk_cl));
-        CHECK_CL(clSetKernelArg(gpu_kernel, 6, sizeof(cl_mem), &ws->d_dict));
-        CHECK_CL(clSetKernelArg(gpu_kernel, 7, sizeof(cl_uint), &pool_size_cl));
-        CHECK_CL(clSetKernelArg(gpu_kernel, 8, sizeof(cl_uint), &epoch_base));
 
-        /* Handle optional debug args */
-        cl_uint krn_num_args = 0;
-        clGetKernelInfo(gpu_kernel, CL_KERNEL_NUM_ARGS, sizeof(krn_num_args), &krn_num_args, NULL);
-        if (krn_num_args >= 11U) {
-            cl_uint dbg_flag = 0U;
-            CHECK_CL(clSetKernelArg(gpu_kernel, 9, sizeof(cl_mem), &ws->d_len));
-            CHECK_CL(clSetKernelArg(gpu_kernel, 10, sizeof(cl_uint), &dbg_flag));
+        if (!can_skip_upload) {
+            CHECK_CL(clSetKernelArg(gpu_kernel, 0, sizeof(cl_mem), &ws->d_in));
+            CHECK_CL(clSetKernelArg(gpu_kernel, 1, sizeof(cl_mem), &ws->d_out));
+            CHECK_CL(clSetKernelArg(gpu_kernel, 2, sizeof(cl_mem), &ws->d_len));
+            CHECK_CL(clSetKernelArg(gpu_kernel, 3, sizeof(cl_uint), &gpu_in_sz));
+            CHECK_CL(clSetKernelArg(gpu_kernel, 4, sizeof(cl_uint), &blk_cl));
+            CHECK_CL(clSetKernelArg(gpu_kernel, 5, sizeof(cl_uint), &worst_blk_cl));
+            CHECK_CL(clSetKernelArg(gpu_kernel, 6, sizeof(cl_mem), &ws->d_dict));
+
+            if (is_999) {
+                cl_uint swd_pool_count_cl = pool_size_cl;
+                cl_uint try_lazy_cl = 2U;
+                cl_uint max_chain_cl = 4096U;
+                CHECK_CL(clSetKernelArg(gpu_kernel, 7, sizeof(cl_uint), &swd_pool_count_cl));
+                CHECK_CL(clSetKernelArg(gpu_kernel, 8, sizeof(cl_uint), &try_lazy_cl));
+                CHECK_CL(clSetKernelArg(gpu_kernel, 9, sizeof(cl_uint), &max_chain_cl));
+            } else {
+                CHECK_CL(clSetKernelArg(gpu_kernel, 7, sizeof(cl_uint), &pool_size_cl));
+                CHECK_CL(clSetKernelArg(gpu_kernel, 8, sizeof(cl_uint), &epoch_base));
+
+                {
+                    cl_uint krn_num_args = 0;
+                    clGetKernelInfo(gpu_kernel, CL_KERNEL_NUM_ARGS, sizeof(krn_num_args), &krn_num_args, NULL);
+                    if (krn_num_args >= 11U) {
+                        cl_uint dbg_flag = 0U;
+                        CHECK_CL(clSetKernelArg(gpu_kernel, 9, sizeof(cl_mem), &ws->d_len));
+                        CHECK_CL(clSetKernelArg(gpu_kernel, 10, sizeof(cl_uint), &dbg_flag));
+                    }
+                }
+            }
+        } else if (!is_999) {
+            CHECK_CL(clSetKernelArg(gpu_kernel, 8, sizeof(cl_uint), &epoch_base));
         }
 
         uint64_t t_up1 = hybrid_now_ns();
@@ -883,21 +1036,15 @@ static int hybrid_compress_buf(
         void* mapped_len = clEnqueueMapBuffer(queue, ws->d_len, CL_TRUE, CL_MAP_READ,
                                                0, gpu_count * sizeof(cl_uint), 0, NULL, NULL, &err);
         if (err != CL_SUCCESS) goto fail;
-        gpu_lengths = (cl_uint*)malloc(gpu_count * sizeof(cl_uint));
-        if (!gpu_lengths) {
-            clEnqueueUnmapMemObject(queue, ws->d_len, mapped_len, 0, NULL, NULL);
-            goto fail;
-        }
         for (size_t i = 0; i < gpu_count; i++) {
-            gpu_lengths[i] = ((cl_uint*)mapped_len)[i];
-            lengths[gpu_idx[i]] = gpu_lengths[i];
+            lengths[gpu_idx[i]] = ((cl_uint*)mapped_len)[i];
         }
         clEnqueueUnmapMemObject(queue, ws->d_len, mapped_len, 0, NULL, NULL);
 
         {
             size_t packed_total = 0;
             int use_compaction;
-            for (size_t i = 0; i < gpu_count; i++) packed_total += (size_t)gpu_lengths[i];
+            for (size_t i = 0; i < gpu_count; i++) packed_total += (size_t)lengths[gpu_idx[i]];
 
             use_compaction = hybrid_should_use_device_compaction(
                 packed_total,
@@ -907,36 +1054,27 @@ static int hybrid_compress_buf(
             );
 
             if (use_compaction && packed_total > 0) {
-                cl_uint* packed_offsets = (cl_uint*)malloc(gpu_count * sizeof(cl_uint));
-                if (!packed_offsets) goto fail;
-
                 {
-                    size_t packed_offset = 0;
                     uint64_t t_pack_up0 = hybrid_now_ns();
-                    for (size_t i = 0; i < gpu_count; i++) {
-                        packed_offsets[i] = (cl_uint)packed_offset;
-                        packed_offset += (size_t)gpu_lengths[i];
-                    }
 
                     grow_buffer(ctx, &ws->d_packed_off, &ws->packed_off_cap,
                                 gpu_count * sizeof(cl_uint), CL_MEM_READ_ONLY, &err);
-                    if (err != CL_SUCCESS) {
-                        free(packed_offsets);
-                        goto fail;
-                    }
+                    if (err != CL_SUCCESS) goto fail;
                     grow_buffer(ctx, &ws->d_packed_out, &ws->packed_out_cap,
                                 packed_total, CL_MEM_WRITE_ONLY, &err);
-                    if (err != CL_SUCCESS) {
-                        free(packed_offsets);
-                        goto fail;
-                    }
+                    if (err != CL_SUCCESS) goto fail;
 
-                    err = clEnqueueWriteBuffer(queue, ws->d_packed_off, CL_TRUE, 0,
-                                               gpu_count * sizeof(cl_uint), packed_offsets,
-                                               0, NULL, NULL);
-                    if (err != CL_SUCCESS) {
-                        free(packed_offsets);
-                        goto fail;
+                    {
+                        void* mapped_off = clEnqueueMapBuffer(queue, ws->d_packed_off, CL_TRUE, CL_MAP_WRITE,
+                                                              0, gpu_count * sizeof(cl_uint), 0, NULL, NULL, &err);
+                        if (err != CL_SUCCESS) goto fail;
+                        size_t packed_offset = 0;
+                        for (size_t i = 0; i < gpu_count; i++) {
+                            ((cl_uint*)mapped_off)[i] = (cl_uint)packed_offset;
+                            packed_offset += (size_t)lengths[gpu_idx[i]];
+                        }
+                        err = clEnqueueUnmapMemObject(queue, ws->d_packed_off, mapped_off, 0, NULL, NULL);
+                        if (err != CL_SUCCESS) goto fail;
                     }
                     timing.upload_us += (unsigned long)((hybrid_now_ns() - t_pack_up0) / 1000);
                 }
@@ -952,15 +1090,9 @@ static int hybrid_compress_buf(
                     err |= clSetKernelArg(pack_kernel, 3, sizeof(cl_mem), &ws->d_packed_off);
                     err |= clSetKernelArg(pack_kernel, 4, sizeof(cl_uint), &worst_blk_cl);
                     err |= clSetKernelArg(pack_kernel, 5, sizeof(cl_uint), &gpu_count_cl);
-                    if (err != CL_SUCCESS) {
-                        free(packed_offsets);
-                        goto fail;
-                    }
+                    if (err != CL_SUCCESS) goto fail;
                     err = clEnqueueNDRangeKernel(queue, pack_kernel, 1, NULL, &pack_global, NULL, 0, NULL, NULL);
-                    if (err != CL_SUCCESS) {
-                        free(packed_offsets);
-                        goto fail;
-                    }
+                    if (err != CL_SUCCESS) goto fail;
                     clFinish(queue);
                     pack_kernel_us = (unsigned long)((hybrid_now_ns() - t_pack_k0) / 1000);
                 }
@@ -968,19 +1100,17 @@ static int hybrid_compress_buf(
                 {
                     void* mapped_packed = clEnqueueMapBuffer(queue, ws->d_packed_out, CL_TRUE, CL_MAP_READ,
                                                              0, packed_total, 0, NULL, NULL, &err);
-                    if (err != CL_SUCCESS) {
-                        free(packed_offsets);
-                        goto fail;
-                    }
+                    if (err != CL_SUCCESS) goto fail;
+                    size_t packed_offset = 0;
                     for (size_t i = 0; i < gpu_count; i++) {
                         size_t blk_idx = gpu_idx[i];
                         memcpy(out_buf + blk_idx * worst_blk,
-                               (unsigned char*)mapped_packed + packed_offsets[i],
-                               (size_t)gpu_lengths[i]);
+                               (unsigned char*)mapped_packed + packed_offset,
+                               (size_t)lengths[blk_idx]);
+                        packed_offset += (size_t)lengths[blk_idx];
                     }
                     clEnqueueUnmapMemObject(queue, ws->d_packed_out, mapped_packed, 0, NULL, NULL);
                 }
-                free(packed_offsets);
             } else {
                 void* mapped_out = clEnqueueMapBuffer(queue, ws->d_out, CL_TRUE, CL_MAP_READ,
                                                        0, gpu_count * worst_blk, 0, NULL, NULL, &err);
@@ -989,15 +1119,13 @@ static int hybrid_compress_buf(
                     size_t blk_idx = gpu_idx[i];
                     memcpy(out_buf + blk_idx * worst_blk,
                            (unsigned char*)mapped_out + i * worst_blk,
-                           (size_t)gpu_lengths[i]);
+                           (size_t)lengths[blk_idx]);
                 }
                 clEnqueueUnmapMemObject(queue, ws->d_out, mapped_out, 0, NULL, NULL);
             }
         }
         uint64_t t_dl1 = hybrid_now_ns();
         timing.download_us = (unsigned long)((t_dl1 - t_dl0) / 1000);
-        free(gpu_lengths);
-        gpu_lengths = NULL;
     }
 
     /* Wait for CPU workers */
@@ -1028,7 +1156,6 @@ static int hybrid_compress_buf(
 
 fail:
     free(gpu_idx); free(cpu_idx);
-    free(gpu_lengths);
     if (cpu_tids) {
         for (int i = 0; i < n_cpu_threads; i++) pthread_join(cpu_tids[i], NULL);
         free(cpu_tids);
@@ -1060,11 +1187,45 @@ static int hybrid_decompress_buf(
     size_t* cpu_idx = NULL;
     size_t gpu_count = 0, cpu_count = 0;
     double gpu_ratio = params->gpu_ratio;
+    int n_cpu_threads = 0;
+    pthread_t* cpu_tids = NULL;
+    int force_cpu_only = 0;
+    int force_gpu_only = 0;
     if (params->cpu_threads <= 0) gpu_ratio = 1.0;
     if (params->split_mode == HYBRID_SPLIT_ADAPTIVE) {
-        gpu_ratio = choose_adaptive_gpu_ratio(ctx, queue, 0, NULL, NULL, orig_sz, blk_sz, nblk, params, ws);
+        gpu_ratio = choose_adaptive_gpu_ratio(ctx, queue, 0, gpu_kernel, NULL, orig_sz, blk_sz, nblk, params, ws);
     }
-    partition_blocks(nblk, gpu_ratio, &gpu_idx, &gpu_count, &cpu_idx, &cpu_count);
+
+    if (gpu_kernel == NULL) gpu_ratio = 0.0;
+    if (gpu_ratio <= 0.0) {
+        force_cpu_only = 1;
+    } else if (gpu_ratio >= 1.0 || params->cpu_threads <= 0) {
+        force_gpu_only = 1;
+    }
+
+    if (force_cpu_only) {
+        gpu_count = 0;
+        cpu_count = nblk;
+        if (cpu_count > 0) {
+            cpu_idx = (size_t*)malloc(cpu_count * sizeof(size_t));
+            if (!cpu_idx) goto dfail;
+            for (size_t i = 0; i < cpu_count; ++i) cpu_idx[i] = i;
+        }
+    } else if (force_gpu_only) {
+        gpu_count = nblk;
+        cpu_count = 0;
+        if (gpu_count > 0) {
+            gpu_idx = (size_t*)malloc(gpu_count * sizeof(size_t));
+            if (!gpu_idx) goto dfail;
+            for (size_t i = 0; i < gpu_count; ++i) gpu_idx[i] = i;
+        }
+    } else {
+        partition_blocks(nblk, gpu_ratio, &gpu_idx, &gpu_count, &cpu_idx, &cpu_count);
+    }
+
+    if (gpu_count > 0 && (gpu_kernel == NULL || ctx == NULL || queue == NULL || ws == NULL)) {
+        goto dfail;
+    }
     timing.gpu_blocks = gpu_count;
     timing.cpu_blocks = cpu_count;
 
@@ -1090,9 +1251,8 @@ static int hybrid_decompress_buf(
         .next_idx = 0,
     };
 
-    int n_cpu_threads = (cpu_count > 0) ? params->cpu_threads : 0;
+    n_cpu_threads = (cpu_count > 0) ? params->cpu_threads : 0;
     if (n_cpu_threads > (int)cpu_count) n_cpu_threads = (int)cpu_count;
-    pthread_t* cpu_tids = NULL;
     uint64_t t_cpu_start = hybrid_now_ns();
     if (n_cpu_threads > 0) {
         if (n_cpu_threads == 1) {
@@ -1267,7 +1427,7 @@ int hybrid_compress(
     /* Block calculation */
     size_t blk = 0, nblk = 0;
     size_t blk_bytes = (params->block_size > 0) ? params->block_size : 0;
-    lzo_choose_blocking_adaptive(input_buf, in_sz, device, blk_bytes, 0, &blk, &nblk, params->debug);
+    hybrid_choose_blocking(input_buf, in_sz, device, gpu_kernel, blk_bytes, params->debug, &blk, &nblk);
     size_t worst_blk = lzo_worst_size(blk);
 
     /* Allocate output arrays */
@@ -1282,7 +1442,7 @@ int hybrid_compress(
     hybrid_timing_t timing = {0};
     int rc = hybrid_compress_buf(ctx, queue, device, gpu_kernel, pack_kernel,
                                   input_buf, in_sz, out_buf, lengths,
-                                  blk, nblk, worst_blk, params, ws, &timing);
+                                  blk, nblk, worst_blk, params, ws, 0, &timing);
     if (rc != 0) {
         lzo_aligned_free_portable(input_buf); free(lengths); free(out_buf);
         return -1;
@@ -1446,6 +1606,18 @@ int hybrid_bench(
     ensure_lzo_init();
     if (bench_seconds <= 0.0) bench_seconds = 3.0;
 
+    if (!comp_kernel) {
+        pack_kernel = NULL;
+    }
+    if (params->cpu_threads <= 0 && !comp_kernel) {
+        fprintf(stderr, "bench error: both CPU and GPU compression paths are unavailable\n");
+        return 1;
+    }
+    if (params->cpu_threads <= 0 && !dec_kernel) {
+        fprintf(stderr, "bench error: both CPU and GPU decompression paths are unavailable\n");
+        return 1;
+    }
+
     struct stat st;
     if (stat(input_path, &st) != 0 || st.st_size <= 0) return 1;
     size_t in_size = (size_t)st.st_size;
@@ -1458,7 +1630,7 @@ int hybrid_bench(
     /* Block calculation (done once) */
     size_t blk = 0, nblk = 0;
     size_t blk_bytes = (params->block_size > 0) ? params->block_size : 0;
-    lzo_choose_blocking_adaptive(input_ref, in_size, device, blk_bytes, 0, &blk, &nblk, params->debug);
+    hybrid_choose_blocking(input_ref, in_size, device, comp_kernel, blk_bytes, params->debug, &blk, &nblk);
     size_t worst_blk = lzo_worst_size(blk);
 
     /* Pre-allocate reusable buffers */
@@ -1544,10 +1716,11 @@ int hybrid_bench(
             remove(tmp_dec_path);
         } else {
             /* ---- COMPRESS (in-memory) ---- */
+            int skip_upload = (params->gpu_ratio >= 1.0 && n > 0) ? 1 : 0;
             memset(lengths, 0, nblk * sizeof(uint32_t));
             rc = hybrid_compress_buf(ctx, queue, device, comp_kernel, pack_kernel,
                                      input_ref, in_size, out_buf, lengths,
-                                     blk, nblk, worst_blk, params, ws, &tc);
+                                     blk, nblk, worst_blk, params, ws, skip_upload, &tc);
             if (rc != 0) { verify_ok = 0; break; }
 
             comp_total = tc.out_size;

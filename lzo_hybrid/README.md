@@ -1,11 +1,12 @@
 # lzo_hybrid
 
-`lzo_hybrid` is the CPU+GPU collaborative LZO execution path in this repo. It uses:
+`lzo_hybrid` is the primary CPU+GPU collaborative LZO execution path. It is the default mode for comprehensive benchmarking, replacing separate GPU and CPU runs. It features:
 
 - CPU compression/decompression from `lzo_cpu`
 - GPU compression/decompression from `lzo_gpu`
-- fixed or adaptive CPU/GPU split policies
-- in-memory and file-backed warmed benchmark modes
+- Adaptive and fixed split policies for workload partitioning
+- In-memory and file-backed warmed benchmark modes
+- Pure CPU (R=0.0) and Pure GPU (R=1.0) optimized execution paths
 
 ## Build
 
@@ -53,13 +54,14 @@ Notes:
 ### Common options
 
 - `-a`, `--alg`: `lzo1x` or `lzo1y`
-- `-L`, `--level`: dictionary bits / compression level
-- `-B`, `--block-size`: fixed block size
-- `--cpu-threads`: CPU worker threads
-- `--gpu-ratio`: fixed GPU fraction
-- `--adaptive`: adaptive split mode
-- `--sample-blocks`: adaptive sample count
-- `--local`: OpenCL local size
+- `-L`, `--level`: Dictionary bits (11-16, 99=enhanced greedy, 999=optimal SWD)
+- `-B`, `--block-size`: Fixed block size
+- `--cpu-threads`: CPU worker threads (default: auto = all cores via `sysconf`)
+- `--gpu-ratio`: Fixed GPU fraction (0.0 for pure CPU, 1.0 for pure GPU)
+- `--adaptive`: Enable adaptive per-file CPU/GPU split
+- `--sample-blocks`: Adaptive sample count
+- `--local`: OpenCL work-group size
+- `--bench`: Benchmark mode (e.g. `--bench 3`)
 
 ### Benchmarks
 
@@ -70,22 +72,23 @@ Notes:
 
 ## Current implementation notes
 
-- Recent scheduler work changed the hybrid split from a simple GPU-prefix policy to distributed block assignment with explicit gather/scatter around GPU kernels.
-- Bench path temp-file handling was updated to avoid fixed-path collisions.
-- The current verified subset results still rank `lzo_gpu` as the default fastest engine, while `lzo_hybrid` remains a workload-specific compromise.
+- Hybrid mode partitions input blocks between CPU and GPU workers using either fixed or adaptive split policies.
+- R=0.0 optimization: When `--gpu-ratio` is 0.0, OpenCL initialization is skipped entirely for maximum CPU performance.
+- R=1.0 path: Pure GPU execution bypasses host-side gather overhead when no CPU workers are active.
+- Compression levels 99 (enhanced greedy) and 999 (optimal SWD) are supported across both CPU and GPU execution paths.
+- Benchmarking includes per-block distribution logic with explicit gather/scatter around GPU kernels.
+- Bench loop optimization: GPU kernel args are cached across iterations; input buffer upload and file re-read are skipped on repeated iterations (skip_input_upload).
+- Thread auto-detection: defaults to all available cores, overridable via `--cpu-threads`.
 
-## 2026-03 stitched full-corpus results
+## Adaptive scheduling model
 
-The current full-corpus hybrid analysis is derived from the stitched 83-file artifact:
+The adaptive split model (`--adaptive`) is energy-aware, load-aware, and compute-resource-aware.
 
-- `../exp_results/runs/20260309_merged_full_83/lzo_param_sweep_merged.csv`
-- analysis bundle: `/root/analysis/20260309_full_refresh/`
-
-Current matched-corpus best-per-file medians:
-
-- `lzo1x fixed`: `925.46 / 821.24 MB/s`
-- `lzo1x adaptive`: `927.49 / 897.38 MB/s`
-- `lzo1y fixed`: `926.01 / 812.25 MB/s`
-- `lzo1y adaptive`: `942.86 / 900.74 MB/s`
-
-Updated interpretation: on the refreshed 83-file corpus, adaptive hybrid is no longer weaker than fixed. GPU remains the default compression leader, while adaptive hybrid is currently the stronger decompression-oriented cooperative mode.
+- **Throughput model**: Calibrates per-byte CPU throughput (Pc0) and GPU throughput (Pg0) at startup.
+- **Compression-ratio gain** (gC/gG): Adjusts for actual vs reference compression ratio.
+- **Load awareness**: Reads `/proc/stat` for CPU idle fraction, scales by thread count vs total cores.
+- **GPU availability**: Monitors GPU utilization for scheduling.
+- **Compute-resource awareness**: CPU capacity is measured as `Pc0 * threads * cpu_availability`, treating the thread count parameter as the CPU capacity bound.
+- **Energy-aware correction**: During calibration, measures per-byte energy consumption for CPU (RAPL core domain `intel-rapl:0:0`) and GPU (RAPL uncore domain `intel-rapl:0:1`). The final ratio uses a 70% throughput-optimal + 30% energy-optimal blend.
+- **Small-input guard**: If total input is smaller than GPU overhead (t0), routes everything to CPU.
+- **Degenerate fallback**: Returns 0.5 when both effective throughputs are zero (decoupled from user-specified gpu_ratio).

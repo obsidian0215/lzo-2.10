@@ -113,17 +113,6 @@ int lzo_write_compressed_file(const char* path,
                               const void* sparse_data, size_t worst_blk,
                               int alg_id, int debug);
 
-/* Apply autotune configuration to a request if corresponding fields are
- * unspecified. Search order (priority):
- *  1) LZO_GPU_AUTOTUNE_CONF (env) -> exact path
- *  2) <exe_dir>/lzo_gpu.autotune.conf or <exe_dir>/../lzo_gpu/lzo_gpu.autotune.conf
- *
- * eturns 0 on success
- * (config file found and applied, or defaults set after applying file);
- * returns -1 if no configuration file was found.
- */
-int lzo_apply_autotune_config(request_t* req);
-
 void lzo_print_response_stats(const response_t* resp, const char* input_path, int operation, int alg);
 
 #ifdef __cplusplus

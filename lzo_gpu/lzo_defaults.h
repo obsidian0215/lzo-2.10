@@ -14,17 +14,17 @@
 
 /* Compression configuration */
 /* Default compression level (bits). */
-#define LZO_DEFAULT_COMP_LEVEL 12
+#define LZO_DEFAULT_COMP_LEVEL 14
 
 /* Default block size (in KB) when no adaptive/training result is available */
-#define LZO_DEFAULT_BLOCK_KB 16
+#define LZO_DEFAULT_BLOCK_KB 64
 
 /* Block size and GPU parallelism configuration */
 #define LZO_OCC_FACTOR_DEFAULT 256
 #define LZO_ALIGN_BYTES_DEFAULT 4096  /* 4KB alignment for block sizes for memory efficiency */
 #define LZO_MIN_BLOCK_BYTES_DEFAULT (4 * 1024)   /* 1KB minimum */
-#define LZO_MAX_BLOCK_BYTES_DEFAULT (128 * 1024)  /* 128KB maximum (increased from 64KB) */
-#define LZO_MAX_NBLOCKS_DEFAULT (8 * 1024)  /* Maximum blocks per job */
+#define LZO_MAX_BLOCK_BYTES_DEFAULT (256 * 1024)  /* 256KB maximum */
+#define LZO_MAX_NBLOCKS_DEFAULT (64 * 1024)  /* Maximum blocks per job */
 /* Entropy calculation configuration */
 #define LZO_ADAPTIVE_SAMPLE_SIZE (64 * 1024)  /* 64KB sample for entropy */
 #define LZO_ADAPTIVE_LOW_ENTROPY 4.0
