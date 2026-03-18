@@ -50,6 +50,7 @@ CPU_THREADS = [1, 4, 0]
 GPU_LEVELS = [14, 15]
 GPU_LOCAL_SIZES = [1]
 HYBRID_BLOCK_SIZES = ["64K", "128K", "256K"]
+HYBRID_LEVELS = [14, 15]
 HYBRID_LOCAL_SIZES = [1]
 HYBRID_GPU_RATIOS = [0.0, 0.3, 0.5, 0.7, 1.0]
 HYBRID_CPU_THREADS = [1, 4, 0]
@@ -915,6 +916,8 @@ def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=No
             stats['ratio'] = stable['ratio']
             stats['comp_mbs'] = stable['comp_kernel_tp']
             stats['dec_mbs'] = stable['dec_kernel_tp']
+            stats['comp_total_mbs'] = stable.get('comp_total_tp', stable['comp_kernel_tp'])
+            stats['dec_total_mbs'] = stable.get('dec_total_tp', stable['dec_kernel_tp'])
 
             tmp_comp = make_temp_file_path("lzo_cpu_total", ".lzo")
             tmp_dec = f"{tmp_comp}.dec"
@@ -955,17 +958,13 @@ def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=No
                     and file_matches_hash(tmp_dec, expected_hash)
                 )
 
-                if in_sz > 0 and comp_elapsed_s > 0.0:
-                    stats['comp_total_mbs'] = in_sz / (comp_elapsed_s * 1024.0 * 1024.0)
-                if in_sz > 0 and dec_elapsed_s > 0.0:
-                    stats['dec_total_mbs'] = in_sz / (dec_elapsed_s * 1024.0 * 1024.0)
             finally:
                 safe_remove(tmp_comp)
                 safe_remove(tmp_dec)
 
-            stats['comp_time_s'] = (in_sz / (stats['comp_mbs'] * 1024.0 * 1024.0)) if in_sz > 0 and stats['comp_mbs'] > 0 else 0.0
-            stats['dec_time_s'] = (in_sz / (stats['dec_mbs'] * 1024.0 * 1024.0)) if in_sz > 0 and stats['dec_mbs'] > 0 else 0.0
-            stats['throughput_semantics'] = 'stable_kernel_bench_with_file_io_total'
+            stats['comp_time_s'] = (in_sz / (float(stats.get('comp_mbs', 0.0) or 0.0) * 1024.0 * 1024.0)) if in_sz > 0 and float(stats.get('comp_mbs', 0.0) or 0.0) > 0 else 0.0
+            stats['dec_time_s'] = (in_sz / (float(stats.get('dec_mbs', 0.0) or 0.0) * 1024.0 * 1024.0)) if in_sz > 0 and float(stats.get('dec_mbs', 0.0) or 0.0) > 0 else 0.0
+            stats['throughput_semantics'] = 'stable_kernel_bench_with_op_total'
             stats['roundtrip_verified'] = bool(stable['verify_ok']) and (res.returncode == 0) and total_ok
         else:
             stats['throughput_semantics'] = 'stable_kernel_bench_parse_failed'
@@ -1043,14 +1042,8 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
             stats['ratio'] = stable['ratio']
             stats['comp_mbs'] = stable['comp_kernel_tp']
             stats['dec_mbs'] = stable['dec_kernel_tp']
-            if stable.get('comp_total_tp', 0.0):
-                stats['comp_total_mbs'] = float(stable.get('comp_total_tp', 0.0) or 0.0)
-            if stable.get('dec_total_tp', 0.0):
-                stats['dec_total_mbs'] = float(stable.get('dec_total_tp', 0.0) or 0.0)
-            if in_sz > 0 and stats['comp_total_mbs'] > 0.0:
-                stats['comp_time_s'] = in_sz / (stats['comp_total_mbs'] * 1024.0 * 1024.0)
-            if in_sz > 0 and stats['dec_total_mbs'] > 0.0:
-                stats['dec_time_s'] = in_sz / (stats['dec_total_mbs'] * 1024.0 * 1024.0)
+            stats['comp_total_mbs'] = stable.get('comp_total_tp', 0.0)
+            stats['dec_total_mbs'] = stable.get('dec_total_tp', 0.0)
 
             tmp_comp = make_temp_file_path("lzo_gpu_total", ".lzo")
             tmp_dec = f"{tmp_comp}.dec"
@@ -1121,14 +1114,14 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                     and file_matches_hash(tmp_dec, orig_hash)
                 )
 
-                if comp_total_parsed.get('inclusive_tp') and stats['comp_total_mbs'] <= 0.0:
-                    stats['comp_total_mbs'] = comp_total_parsed['inclusive_tp']
-                if dec_total_parsed.get('inclusive_tp') and stats['dec_total_mbs'] <= 0.0:
-                    stats['dec_total_mbs'] = dec_total_parsed['inclusive_tp']
-                if comp_elapsed_s > 0.0 and stats['comp_time_s'] <= 0.0:
+                if comp_elapsed_s > 0.0:
                     stats['comp_time_s'] = comp_elapsed_s
-                if dec_elapsed_s > 0.0 and stats['dec_time_s'] <= 0.0:
+                elif comp_total_parsed.get('inclusive_tp'):
+                    stats['comp_total_mbs'] = comp_total_parsed['inclusive_tp']
+                if dec_elapsed_s > 0.0:
                     stats['dec_time_s'] = dec_elapsed_s
+                elif dec_total_parsed.get('inclusive_tp'):
+                    stats['dec_total_mbs'] = dec_total_parsed['inclusive_tp']
             finally:
                 if local_tmp_comp:
                     safe_remove(local_tmp_comp)
@@ -1137,7 +1130,7 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                 safe_remove(tmp_comp)
                 safe_remove(tmp_dec)
 
-            stats['throughput_semantics'] = 'stable_kernel_bench_with_inclusive_total'
+            stats['throughput_semantics'] = 'stable_kernel_bench_with_op_total'
             stats['roundtrip_verified'] = bool(stable['verify_ok']) and (bench_res.returncode == 0) and total_ok
 
             if telemetry:
@@ -1232,10 +1225,8 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_
             stats['ratio'] = stable['ratio']
             stats['comp_mbs'] = stable['comp_kernel_tp']
             stats['dec_mbs'] = stable['dec_kernel_tp']
-            if 'comp_total_tp' in stable:
-                stats['comp_total_mbs'] = stable['comp_total_tp']
-            if 'dec_total_tp' in stable:
-                stats['dec_total_mbs'] = stable['dec_total_tp']
+            stats['comp_total_mbs'] = stable.get('comp_total_tp', 0.0)
+            stats['dec_total_mbs'] = stable.get('dec_total_tp', 0.0)
             total_ok = False
             total_tel = {}
             tmp_comp = make_temp_file_path("lzo_hybrid_verify_tmp", ".lzo")
@@ -1269,16 +1260,12 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_
                     cmd_dec_total[1:1] = ["--gpu-ratio", str(gpu_ratio), "--cpu-threads", str(cpu_threads)]
                 dec_total_res, dec_total_tel = run_command_with_telemetry_cwd(cmd_dec_total, cwd=hybrid_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
 
-                comp_total_mbs = float(stats.get('comp_total_mbs', 0.0) or 0.0)
-                if comp_total_mbs > 0.0:
-                    stats['comp_time_s'] = in_sz / (comp_total_mbs * 1024.0 * 1024.0)
-                else:
-                    stats['comp_time_s'] = float(comp_total_tel.get('elapsed_s', 0.0) or 0.0)
-                dec_total_mbs = float(stats.get('dec_total_mbs', 0.0) or 0.0)
-                if dec_total_mbs > 0.0:
-                    stats['dec_time_s'] = in_sz / (dec_total_mbs * 1024.0 * 1024.0)
-                else:
-                    stats['dec_time_s'] = float(dec_total_tel.get('elapsed_s', 0.0) or 0.0)
+                comp_elapsed_s = float(comp_total_tel.get('elapsed_s', 0.0) or 0.0)
+                dec_elapsed_s = float(dec_total_tel.get('elapsed_s', 0.0) or 0.0)
+                if comp_elapsed_s > 0.0:
+                    stats['comp_time_s'] = comp_elapsed_s
+                if dec_elapsed_s > 0.0:
+                    stats['dec_time_s'] = dec_elapsed_s
                 total_ok = (
                     comp_total_res.returncode == 0
                     and dec_total_res.returncode == 0
@@ -1298,7 +1285,7 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_
             finally:
                 safe_remove(tmp_comp)
                 safe_remove(tmp_dec)
-            stats['throughput_semantics'] = 'stable_kernel_bench_inprocess_total_with_filebacked_verify'
+            stats['throughput_semantics'] = 'stable_kernel_bench_inprocess_op_total'
             stats['roundtrip_verified'] = bool(stable['verify_ok']) and (bench_res.returncode == 0)
             if total_ok:
                 stats['roundtrip_verified'] = True
@@ -1340,6 +1327,7 @@ def main():
     parser.add_argument('--gpu-levels', default=','.join(str(x) for x in GPU_LEVELS), help='GPU levels, comma-separated')
     parser.add_argument('--gpu-local-sizes', default=','.join(str(x) for x in GPU_LOCAL_SIZES), help='GPU local sizes, comma-separated')
     parser.add_argument('--hybrid-block-sizes', default=','.join(HYBRID_BLOCK_SIZES), help='Hybrid block sizes, comma-separated')
+    parser.add_argument('--hybrid-levels', default=','.join(str(x) for x in HYBRID_LEVELS), help='Hybrid levels, comma-separated')
     parser.add_argument('--hybrid-local-sizes', default=','.join(str(x) for x in HYBRID_LOCAL_SIZES), help='Hybrid local sizes, comma-separated')
     parser.add_argument('--hybrid-gpu-ratios', default=','.join(str(x) for x in HYBRID_GPU_RATIOS), help='Hybrid GPU ratios, comma-separated')
     parser.add_argument('--hybrid-cpu-threads', default=','.join(str(x) for x in HYBRID_CPU_THREADS), help='Hybrid CPU threads, comma-separated')
@@ -1363,8 +1351,37 @@ def main():
         raise SystemExit('Cannot combine --cpu-only, --gpu-only, --hybrid-only')
 
     run_cpu = not args.gpu_only and not args.hybrid_only
-    run_gpu = not args.cpu_only and not args.hybrid_only
+    run_gpu = args.gpu_only
     run_hybrid = (not args.cpu_only and not args.gpu_only) or args.hybrid_only
+
+    def emit_gpu_row_from_hybrid(sample, point_idx, cpu_freq_target, gpu_freq_target, alg, level, bs, lsz, hybrid_stats):
+        writer.writerow([
+            sample.name,
+            point_idx,
+            "" if cpu_freq_target is None else cpu_freq_target,
+            "" if gpu_freq_target is None else gpu_freq_target,
+            "GPU", alg, level, bs, lsz,
+            fmtf(hybrid_stats['ratio'], 2),
+            fmtf(hybrid_stats['comp_mbs'], 2),
+            fmtf(hybrid_stats['dec_mbs'], 2),
+            fmtf(hybrid_stats.get('comp_total_mbs', 0), 2),
+            fmtf(hybrid_stats.get('dec_total_mbs', 0), 2),
+            fmtf(hybrid_stats['comp_time_s'], 6),
+            fmtf(hybrid_stats['dec_time_s'], 6),
+            fmtf(hybrid_stats['cpu_freq_avg_mhz'], 2),
+            fmtf(hybrid_stats['gpu_freq_avg_mhz'], 2),
+            fmtf(hybrid_stats['cpu_energy_j'], 6),
+            fmtf(hybrid_stats['gpu_energy_j'], 6),
+            fmtf(hybrid_stats['comp_cpu_power_w'], 6),
+            fmtf(hybrid_stats['comp_gpu_power_w'], 6),
+            "yes" if hybrid_stats.get('roundtrip_verified') else "no",
+        ])
+        f.flush()
+
+        gpu_cfg_label = f"FP={point_idx};A={alg};L={level};BS={bs};LSZ={lsz}"
+        emit_case_average(sample.name, "GPU", gpu_cfg_label, hybrid_stats)
+        if hybrid_stats.get("roundtrip_verified", False):
+            summary_records.append(build_summary_record("GPU", gpu_cfg_label, hybrid_stats))
 
     if run_cpu:
         globals()["LZO_CPU_BIN"] = resolve_lzo_cpu_binary()
@@ -1378,6 +1395,7 @@ def main():
     gpu_levels = parse_int_list(args.gpu_levels, GPU_LEVELS)
     gpu_local_sizes = parse_int_list(args.gpu_local_sizes, GPU_LOCAL_SIZES)
     hybrid_block_sizes = parse_str_list(args.hybrid_block_sizes, HYBRID_BLOCK_SIZES)
+    hybrid_levels = parse_int_list(args.hybrid_levels, HYBRID_LEVELS)
     hybrid_local_sizes = parse_int_list(args.hybrid_local_sizes, HYBRID_LOCAL_SIZES)
     hybrid_gpu_ratios = parse_float_list(args.hybrid_gpu_ratios, HYBRID_GPU_RATIOS)
     hybrid_cpu_threads = parse_int_list(args.hybrid_cpu_threads, HYBRID_CPU_THREADS)
@@ -1577,7 +1595,7 @@ def main():
                             orig_hash = hash_cache[sample_key]
 
                             for alg in algs:
-                                for level in gpu_levels:
+                                for level in hybrid_levels:
                                     for bs in hybrid_block_sizes:
                                         for hlsz in hybrid_local_sizes:
                                             for split_mode in hybrid_split_modes:
@@ -1621,6 +1639,8 @@ def main():
                                                         emit_case_average(sample.name, "HYBRID", hybrid_cfg_label, hybrid_stats)
                                                         if hybrid_stats.get("roundtrip_verified", False):
                                                             summary_records.append(build_summary_record("HYBRID", hybrid_cfg_label, hybrid_stats))
+                                                        if (not run_gpu and split_mode == "fixed" and abs(float(ratio) - 1.0) < 1e-9):
+                                                            emit_gpu_row_from_hybrid(sample, point_idx, cpu_freq_target, gpu_freq_target, alg, level, bs, hlsz, hybrid_stats)
             else:
                 freq_combos = [(fp, fp) for fp in freq_points]
 
@@ -1712,7 +1732,7 @@ def main():
                         # Hybrid Sweep
                         if run_hybrid:
                             for alg in algs:
-                                for level in gpu_levels:
+                                for level in hybrid_levels:
                                     for bs in hybrid_block_sizes:
                                         for hlsz in hybrid_local_sizes:
                                             for split_mode in hybrid_split_modes:
@@ -1756,6 +1776,8 @@ def main():
                                                         emit_case_average(sample.name, "HYBRID", hybrid_cfg_label, hybrid_stats)
                                                         if hybrid_stats.get("roundtrip_verified", False):
                                                             summary_records.append(build_summary_record("HYBRID", hybrid_cfg_label, hybrid_stats))
+                                                        if (not run_gpu and split_mode == "fixed" and abs(float(ratio) - 1.0) < 1e-9):
+                                                            emit_gpu_row_from_hybrid(sample, point_idx, cpu_freq_target, gpu_freq_target, alg, level, bs, hlsz, hybrid_stats)
 
         print_and_save_config_summary(summary_records, results_summary_csv)
     finally:

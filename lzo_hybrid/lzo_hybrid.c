@@ -106,7 +106,6 @@ static void show_help(const char* prog) {
     fprintf(stderr, "  --adaptive           Enable adaptive per-file CPU/GPU split\n");
     fprintf(stderr, "  --sample-blocks N    Adaptive sample block count (default: 8)\n");
     fprintf(stderr, "  --bench [SECONDS]    Benchmark mode (compress+decompress+verify)\n");
-    fprintf(stderr, "  --bench-io           Include file write/read in bench total throughput\n");
     fprintf(stderr, "  -v, --verbose        Verbose output\n");
     fprintf(stderr, "  -h, --help           Show this help\n");
 }
@@ -115,7 +114,6 @@ int main(int argc, char** argv) {
     cl_int err;
     int decompress_mode = 0;
     int bench_mode = 0;
-    int bench_include_io = 0;
     int verbose = 0;
     double bench_seconds = 3.0;
     const char* in_path = NULL;
@@ -145,10 +143,6 @@ int main(int argc, char** argv) {
         if (strcmp(arg, "--bench") == 0) {
             bench_mode = 1;
             if (i + 1 < argc && argv[i+1][0] != '-') bench_seconds = atof(argv[++i]);
-            continue;
-        }
-        if (strcmp(arg, "--bench-io") == 0) {
-            bench_include_io = 1;
             continue;
         }
         if (strcmp(arg, "-o") == 0 || strcmp(arg, "--output") == 0) {
@@ -304,7 +298,7 @@ int main(int argc, char** argv) {
                           use_opencl ? g_queue : NULL,
                           use_opencl ? g_dev : NULL,
                           comp_krn, pack_krn, dec_krn,
-                          in_path, &params, &ws, bench_seconds, bench_include_io);
+                          in_path, &params, &ws, bench_seconds);
     } else if (decompress_mode) {
         char default_out[512];
         if (!output_path) {

@@ -82,6 +82,7 @@ typedef struct {
     size_t comp_lens_cap;
     size_t decomp_out_cap;
     size_t out_lens_cap;
+
 } hybrid_workspace_t;
 
 void hybrid_workspace_init(hybrid_workspace_t* ws);
@@ -139,8 +140,7 @@ int hybrid_bench(
     const char* input_path,
     const hybrid_params_t* params,
     hybrid_workspace_t* ws,
-    double bench_seconds,
-    int include_file_io
+    double bench_seconds
 );
 
 #ifdef __cplusplus

@@ -415,6 +415,18 @@ static int zero_buffer(cl_command_queue q, cl_mem buf, size_t sz) {
     return 0;
 }
 
+static int zero_buffer_range(cl_command_queue q, cl_mem buf, size_t offset, size_t sz) {
+    cl_uchar zero = 0;
+    cl_int err;
+    if (!buf || sz == 0) return 0;
+    err = clEnqueueFillBuffer(q, buf, &zero, 1, offset, sz, 0, NULL, NULL);
+    if (err == CL_SUCCESS) {
+        clFinish(q);
+        return 0;
+    }
+    return -1;
+}
+
 static int hybrid_env_flag_value(const char* name, int* is_set) {
     const char* env = getenv(name);
     if (is_set) *is_set = 0;
@@ -996,8 +1008,10 @@ static int hybrid_compress_buf(
         size_t prev_dict = ws->dict_cap;
         grow_buffer(ctx, &ws->d_dict, &ws->dict_cap, total_dict, CL_MEM_READ_WRITE, &err);
         if (err != CL_SUCCESS) goto fail;
-        if (is_999 || ws->dict_cap != prev_dict) {
+        if (is_999) {
             zero_buffer(queue, ws->d_dict, ws->dict_cap);
+        } else if (ws->dict_cap > prev_dict) {
+            zero_buffer_range(queue, ws->d_dict, prev_dict, ws->dict_cap - prev_dict);
         }
 
         uint32_t epoch_base = 0;
@@ -1072,14 +1086,17 @@ static int hybrid_compress_buf(
                                                0, gpu_count * sizeof(cl_uint), 0, NULL, NULL, &err);
         if (err != CL_SUCCESS) goto fail;
         for (size_t i = 0; i < gpu_count; i++) {
-            lengths[gpu_idx[i]] = ((cl_uint*)mapped_len)[i];
+            size_t blk_idx = gpu_idx ? gpu_idx[i] : i;
+            lengths[blk_idx] = ((cl_uint*)mapped_len)[i];
         }
         clEnqueueUnmapMemObject(queue, ws->d_len, mapped_len, 0, NULL, NULL);
 
         {
             size_t packed_total = 0;
             int use_compaction;
-            for (size_t i = 0; i < gpu_count; i++) packed_total += (size_t)lengths[gpu_idx[i]];
+            for (size_t i = 0; i < gpu_count; i++) {
+                packed_total += (size_t)lengths[gpu_idx[i]];
+            }
 
             use_compaction = hybrid_should_use_device_compaction(
                 packed_total,
@@ -1138,10 +1155,10 @@ static int hybrid_compress_buf(
                     if (err != CL_SUCCESS) goto fail;
                     size_t packed_offset = 0;
                     for (size_t i = 0; i < gpu_count; i++) {
-                        size_t blk_idx = gpu_idx[i];
-                        memcpy(out_buf + blk_idx * worst_blk,
-                               (unsigned char*)mapped_packed + packed_offset,
-                               (size_t)lengths[blk_idx]);
+                    size_t blk_idx = gpu_idx[i];
+                    memcpy(out_buf + blk_idx * worst_blk,
+                           (unsigned char*)mapped_packed + packed_offset,
+                           (size_t)lengths[blk_idx]);
                         packed_offset += (size_t)lengths[blk_idx];
                     }
                     clEnqueueUnmapMemObject(queue, ws->d_packed_out, mapped_packed, 0, NULL, NULL);
@@ -1383,7 +1400,7 @@ static int hybrid_decompress_buf(
                                             0, gpu_out_sz, 0, NULL, NULL, &err);
         if (err != CL_SUCCESS) goto dfail;
         for (size_t i = 0; i < gpu_count; i++) {
-            size_t bi = gpu_idx[i];
+            size_t bi = gpu_idx ? gpu_idx[i] : i;
             size_t off = bi * blk_sz;
             size_t this_blk = blk_sz;
             if (off + this_blk > orig_sz) this_blk = orig_sz - off;
@@ -1636,8 +1653,7 @@ int hybrid_bench(
     const char* input_path,
     const hybrid_params_t* params,
     hybrid_workspace_t* ws,
-    double bench_seconds,
-    int include_file_io
+    double bench_seconds
 ) {
     ensure_lzo_init();
     if (bench_seconds <= 0.0) bench_seconds = 3.0;
@@ -1690,19 +1706,6 @@ int hybrid_bench(
     double* dec_ttp = (double*)malloc(cap * sizeof(double));
     double* ratio_pct = (double*)malloc(cap * sizeof(double));
     int verify_ok = 1;
-    char tmp_comp_path[4096] = {0};
-    char tmp_dec_path[4096] = {0};
-
-    if (include_file_io) {
-        if (create_temp_path(tmp_comp_path, sizeof(tmp_comp_path), "/tmp/lzo_hybrid_bench_io_comp_XXXXXX") != 0 ||
-            create_temp_path(tmp_dec_path, sizeof(tmp_dec_path), "/tmp/lzo_hybrid_bench_io_dec_XXXXXX") != 0) {
-            free(comp_ktp); free(dec_ktp); free(comp_ttp); free(dec_ttp); free(ratio_pct);
-            free(input_ref); free(lengths); free(out_buf);
-            free(packed); free(offsets); free(dec_buf); free(out_lengths);
-            return 1;
-        }
-    }
-
     struct timespec ts0, ts1;
     clock_gettime(CLOCK_MONOTONIC, &ts0);
 
@@ -1715,42 +1718,7 @@ int hybrid_bench(
         unsigned long dec_kernel_us = 0;
         double dec_total_us = 0.0;
 
-        if (include_file_io) {
-            size_t dec_ref_sz = 0;
-            unsigned char* dec_ref = NULL;
-
-            rc = hybrid_compress(ctx, queue, device, comp_kernel,
-                                 pack_kernel,
-                                 input_path, tmp_comp_path, params, ws, &tc);
-            if (rc != 0) { verify_ok = 0; break; }
-            comp_total = tc.out_size;
-            comp_kernel_us = tc.gpu_kernel_us;
-            if (tc.cpu_kernel_us > comp_kernel_us) comp_kernel_us = tc.cpu_kernel_us;
-
-            rc = hybrid_decompress(ctx, queue, device, dec_kernel,
-                                   tmp_comp_path, tmp_dec_path, params, ws, &td);
-            if (rc != 0) {
-                remove(tmp_comp_path);
-                remove(tmp_dec_path);
-                verify_ok = 0;
-                break;
-            }
-            dec_kernel_us = td.gpu_kernel_us;
-            if (td.cpu_kernel_us > dec_kernel_us) dec_kernel_us = td.cpu_kernel_us;
-            dec_total_us = (double)td.total_us;
-
-            dec_ref = (unsigned char*)lzo_read_file(tmp_dec_path, &dec_ref_sz);
-            if (!dec_ref || dec_ref_sz != in_size || memcmp(dec_ref, input_ref, in_size) != 0) {
-                free(dec_ref);
-                remove(tmp_comp_path);
-                remove(tmp_dec_path);
-                verify_ok = 0;
-                break;
-            }
-            free(dec_ref);
-            remove(tmp_comp_path);
-            remove(tmp_dec_path);
-        } else {
+        {
             /* ---- COMPRESS (in-memory) ---- */
             int skip_upload = (params->gpu_ratio >= 1.0 && n > 0) ? 1 : 0;
             memset(lengths, 0, nblk * sizeof(uint32_t));
@@ -1842,9 +1810,5 @@ int hybrid_bench(
     free(comp_ktp); free(dec_ktp); free(comp_ttp); free(dec_ttp); free(ratio_pct);
     free(input_ref); free(lengths); free(out_buf);
     free(packed); free(offsets); free(dec_buf); free(out_lengths);
-    if (include_file_io) {
-        remove(tmp_comp_path);
-        remove(tmp_dec_path);
-    }
     return verify_ok ? 0 : 1;
 }

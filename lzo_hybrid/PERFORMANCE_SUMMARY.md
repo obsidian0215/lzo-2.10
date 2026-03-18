@@ -1,10 +1,20 @@
 # LZO Hybrid 实现：设计、优化与三引擎全量性能对比
 
-更新时间：2026-03-15（自适应调度与 Zero-copy 优化定版）
+更新时间：2026-03-18（bench 语义修正、实现保留项复核、全量重跑中）
 
 ## Intel 平台（保留原文）
 
 以下现有内容保留为 Intel Core + Iris Xe 平台的历史总结；Windows + NVIDIA 的新增章节见文末。
+
+### 2026-03-18 状态修正（当前有效上下文）
+
+在继续保留下文历史分析的同时，需要先明确当前 Intel 版本的有效实现状态：
+
+1. **bench 默认流程已变更**：默认不再单独运行 standalone GPU sweep，而是使用 hybrid `R=1.0` 的结果复制出 GPU 行。
+2. **total throughput 语义已修正**：当前正式口径是 operation-total / in-memory timed bench semantics，不再把一次完整文件读写 I/O 重新计入 total throughput。
+3. **`--bench-io` 已从程序与脚本侧移除**：因此本文凡是仍把 `--bench-io` 当作正式结论依据的段落，都应理解为历史背景，而非当前版本的方法学定义。
+4. **当前保留的 LZO 实现级优化只有一项**：`dict-tail-zero-on-growth`，分别落在 `lzo_gpu_core.c` 与 `lzo_hybrid_core.c`；此前尝试过的 host-array reuse、pure-path fast-path 均已撤销。
+5. **新的 Intel full validation 已于 2026-03-18 按正确方式重启**：包含默认 CPU/GPU 频率扫描，并且在同步代码后重新构建了二进制。实验结果章节必须等待本轮 artifact 结束后再落定最终统计值。
 
 ---
 
@@ -432,4 +442,3 @@ flowchart LR
   1. 对回退文件做分层画像（高熵/低熵/页镜像）；
   2. 单独优化解压路径的 gather/scatter 与同步；
   3. 追加 fixed 与 adaptive 的 matched rerun，确认最终默认策略。
-

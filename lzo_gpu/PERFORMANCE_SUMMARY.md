@@ -1,10 +1,19 @@
 # LZO GPU 实现：设计、优化与性能分析
 
-更新时间：2026-03-15
+更新时间：2026-03-18
 
 ## Intel 平台（保留原文）
 
 以下原有内容作为 Intel Core + Iris Xe 平台的保留章节；Windows + NVIDIA 的结果在文末单独补充。
+
+### 2026-03-18 状态修正（当前 live implementation）
+
+当前 Intel 版 `lzo_gpu` 的正式描述需要基于已经重新验证并保留的 live code，而不是把中间试验态实现混入主叙述：
+
+1. **OpenCL 平台选择逻辑已修正**：默认优先选中 Intel Graphics 平台，避免错误落到 Intel CPU OpenCL，且支持 `FORCE_OPENCL_PLATFORM` 覆盖。
+2. **GPU verify / parity 路径已恢复稳定**：此前出现过 verify failed 的阶段性问题，当前已修复，不应再把它写成设计特征。
+3. **当前唯一继续保留的新增实现改动是 `dict-tail-zero-on-growth`**；其价值在于保证 grow-only 工作区在多轮运行中的稳定性和可重复性。
+4. **新的全量验证正在后台重跑**，包含默认 CPU/GPU 频率扫描；实验统计必须等待新 artifact 完成后再最终写入结果章节。
 
 ---
 

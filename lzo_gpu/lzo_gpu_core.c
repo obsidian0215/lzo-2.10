@@ -216,6 +216,30 @@ static int lzo_zero_buffer(cl_command_queue queue, cl_mem buf, size_t bytes) {
     return 0;
 }
 
+static int lzo_zero_buffer_range(cl_command_queue queue, cl_mem buf, size_t offset, size_t bytes) {
+    if (!buf || bytes == 0) return 0;
+#if defined(CL_VERSION_1_2)
+    {
+        static const cl_uint zero = 0;
+        cl_int ferr = clEnqueueFillBuffer(queue, buf, &zero, sizeof(zero), offset, bytes, 0, NULL, NULL);
+        if (ferr == CL_SUCCESS) {
+            (void)clFinish(queue);
+            return 0;
+        }
+    }
+#endif
+    {
+        cl_int err;
+        void* mapped = clEnqueueMapBuffer(queue, buf, CL_TRUE, CL_MAP_WRITE, offset, bytes, 0, NULL, NULL, &err);
+        if (err != CL_SUCCESS || mapped == NULL) return -1;
+        memset(mapped, 0, bytes);
+        err = clEnqueueUnmapMemObject(queue, buf, mapped, 0, NULL, NULL);
+        if (err != CL_SUCCESS) return -1;
+        (void)clFinish(queue);
+    }
+    return 0;
+}
+
 static inline size_t core_lzo_worst(size_t sz) {
     return sz + sz / 16 + 64 + 3;
 }
@@ -1461,8 +1485,8 @@ int lzo_compress_core(
             fprintf(stderr, "[CORE] failed to create dictionary buffer: %d\n", err);
             return -1;
         }
-        if (ws->dict_size != prev_dict_size) {
-            (void)lzo_zero_buffer(queue, d_dict, ws->dict_size);
+        if (ws->dict_size > prev_dict_size) {
+            (void)lzo_zero_buffer_range(queue, d_dict, prev_dict_size, ws->dict_size - prev_dict_size);
         }
 
         if (is_999) {
