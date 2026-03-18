@@ -45,6 +45,16 @@ static unsigned lzo_env_u32(const char* name, unsigned defv) {
     return (unsigned)n;
 }
 
+static unsigned lzo_choose_comp_wi_per_cu(unsigned default_value) {
+    unsigned wi_per_cu = lzo_env_u32("LZO_GPU_COMP_WI_PER_CU", 0U);
+    if (wi_per_cu == 0U) {
+        wi_per_cu = lzo_env_u32("LZO_GPU_WI_PER_CU", default_value);
+    }
+    if (wi_per_cu < 32U) wi_per_cu = 32U;
+    if (wi_per_cu > 1024U) wi_per_cu = 1024U;
+    return wi_per_cu;
+}
+
 static double lzo_env_f64(const char* name, double defv) {
     const char* v = getenv(name);
     char* endp = NULL;
@@ -841,9 +851,7 @@ static int lzo_compress_core_pipeline(
         (void)clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, NULL);
 
         {
-            unsigned sched_wi_per_cu = lzo_env_u32("LZO_GPU_WI_PER_CU", 384U);
-            if (sched_wi_per_cu < 32U) sched_wi_per_cu = 32U;
-            if (sched_wi_per_cu > 1024U) sched_wi_per_cu = 1024U;
+            unsigned sched_wi_per_cu = lzo_choose_comp_wi_per_cu(256U);
             occ_cap = (cus > 0) ? ((size_t)cus * (size_t)sched_wi_per_cu) : 4096U;
             if (occ_cap < 1024U) occ_cap = 1024U;
         }
@@ -1403,9 +1411,7 @@ int lzo_compress_core(
         (void)clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, NULL);
         if (local_size == 0) local_size = 1;
 
-        sched_wi_per_cu = lzo_env_u32("LZO_GPU_WI_PER_CU", 384U);
-        if (sched_wi_per_cu < 32U) sched_wi_per_cu = 32U;
-        if (sched_wi_per_cu > 1024U) sched_wi_per_cu = 1024U;
+        sched_wi_per_cu = lzo_choose_comp_wi_per_cu(256U);
         occ_cap = (cus > 0) ? ((size_t)cus * (size_t)sched_wi_per_cu) : 4096U;
         if (occ_cap < 1024U) occ_cap = 1024U;
         if (is_999) {

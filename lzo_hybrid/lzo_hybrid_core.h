@@ -43,6 +43,7 @@ typedef struct {
     /* Hybrid split */
     hybrid_split_mode_t split_mode;
     double gpu_ratio;        /* GPU fraction [0.0, 1.0], default 0.8 */
+    int striped_split;       /* 0=prefix contiguous split (default), 1=distributed striped split */
     size_t adaptive_sample_blocks;
 
     /* CPU worker */

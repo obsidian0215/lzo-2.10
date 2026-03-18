@@ -624,9 +624,35 @@ static void* cpu_decompress_worker(void* arg) {
 
 /* ---- block index partitioning ---- */
 
-static void partition_blocks(size_t nblk, double gpu_ratio,
-                             size_t** gpu_indices, size_t* gpu_count,
-                             size_t** cpu_indices, size_t* cpu_count) {
+static void partition_blocks_prefix(size_t nblk, double gpu_ratio,
+                                    size_t** gpu_indices, size_t* gpu_count,
+                                    size_t** cpu_indices, size_t* cpu_count) {
+    size_t gn = (size_t)(nblk * gpu_ratio + 0.5);
+    if (gn > nblk) gn = nblk;
+    size_t cn = nblk - gn;
+
+    *gpu_count = gn;
+    *cpu_count = cn;
+
+    *gpu_indices = (size_t*)malloc(gn * sizeof(size_t));
+    *cpu_indices = (size_t*)malloc(cn * sizeof(size_t));
+    if ((gn > 0 && !*gpu_indices) || (cn > 0 && !*cpu_indices)) {
+        free(*gpu_indices);
+        free(*cpu_indices);
+        *gpu_indices = NULL;
+        *cpu_indices = NULL;
+        *gpu_count = 0;
+        *cpu_count = 0;
+        return;
+    }
+
+    for (size_t i = 0; i < gn; ++i) (*gpu_indices)[i] = i;
+    for (size_t i = 0; i < cn; ++i) (*cpu_indices)[i] = gn + i;
+}
+
+static void partition_blocks_distributed(size_t nblk, double gpu_ratio,
+                                         size_t** gpu_indices, size_t* gpu_count,
+                                         size_t** cpu_indices, size_t* cpu_count) {
     size_t gn = (size_t)(nblk * gpu_ratio + 0.5);
     if (gn > nblk) gn = nblk;
     size_t cn = nblk - gn;
@@ -658,6 +684,17 @@ static void partition_blocks(size_t nblk, double gpu_ratio,
         }
         *gpu_count = gpu_written;
         *cpu_count = cpu_written;
+    }
+}
+
+static void partition_blocks(size_t nblk, double gpu_ratio,
+                             size_t** gpu_indices, size_t* gpu_count,
+                             size_t** cpu_indices, size_t* cpu_count,
+                             int striped_split) {
+    if (striped_split) {
+        partition_blocks_distributed(nblk, gpu_ratio, gpu_indices, gpu_count, cpu_indices, cpu_count);
+    } else {
+        partition_blocks_prefix(nblk, gpu_ratio, gpu_indices, gpu_count, cpu_indices, cpu_count);
     }
 }
 
@@ -879,6 +916,7 @@ static int hybrid_compress_buf(
     pthread_t* cpu_tids = NULL;
     int force_cpu_only = 0;
     int force_gpu_only = 0;
+    int use_prefix_split = 0;
     if (params->cpu_threads <= 0) gpu_ratio = 1.0;
     if (params->split_mode == HYBRID_SPLIT_ADAPTIVE) {
         gpu_ratio = choose_adaptive_gpu_ratio(ctx, queue, device, gpu_kernel, input_buf, in_sz, blk, nblk, params, ws);
@@ -908,8 +946,10 @@ static int hybrid_compress_buf(
             for (size_t i = 0; i < gpu_count; ++i) gpu_idx[i] = i;
         }
     } else {
-        partition_blocks(nblk, gpu_ratio, &gpu_idx, &gpu_count, &cpu_idx, &cpu_count);
+        partition_blocks(nblk, gpu_ratio, &gpu_idx, &gpu_count, &cpu_idx, &cpu_count, params->striped_split);
     }
+
+    use_prefix_split = (params->striped_split == 0);
 
     if (gpu_count > 0 && (gpu_kernel == NULL || ctx == NULL || queue == NULL || ws == NULL)) {
         goto fail;
@@ -959,15 +999,22 @@ static int hybrid_compress_buf(
         uint64_t t_up0 = hybrid_now_ns();
         const unsigned char* gpu_upload_ptr;
         size_t gpu_input_sz;
+        int gpu_upload_owned = 0;
         int can_skip_upload = (skip_upload && force_gpu_only && cpu_count == 0);
 
         if (cpu_count == 0) {
             gpu_upload_ptr = input_buf;
             gpu_input_sz = in_sz;
+            gpu_upload_owned = 0;
+        } else if (use_prefix_split) {
+            gpu_upload_ptr = input_buf;
+            gpu_input_sz = gpu_count * blk;
+            gpu_upload_owned = 0;
         } else {
             unsigned char* gpu_input = (unsigned char*)calloc(gpu_count, blk);
             if (!gpu_input) goto fail;
             gpu_input_sz = gpu_count * blk;
+            gpu_upload_owned = 1;
             for (size_t i = 0; i < gpu_count; ++i) {
                 size_t blk_idx = gpu_idx[i];
                 size_t this_blk = block_input_size(in_sz, blk, blk_idx);
@@ -979,12 +1026,12 @@ static int hybrid_compress_buf(
 
         if (!can_skip_upload) {
             grow_buffer(ctx, &ws->d_in, &ws->in_cap, gpu_input_sz, CL_MEM_READ_ONLY, &err);
-            if (err != CL_SUCCESS) { if (cpu_count != 0) free((void*)(uintptr_t)gpu_upload_ptr); goto fail; }
+            if (err != CL_SUCCESS) { if (gpu_upload_owned) free((void*)(uintptr_t)gpu_upload_ptr); goto fail; }
             err = clEnqueueWriteBuffer(queue, ws->d_in, CL_TRUE, 0, gpu_input_sz, gpu_upload_ptr, 0, NULL, NULL);
         } else {
             err = CL_SUCCESS;
         }
-        if (cpu_count != 0) free((void*)(uintptr_t)gpu_upload_ptr);
+        if (gpu_upload_owned) free((void*)(uintptr_t)gpu_upload_ptr);
         if (err != CL_SUCCESS) goto fail;
 
         size_t out_needed = gpu_count * worst_blk;
@@ -1243,6 +1290,7 @@ static int hybrid_decompress_buf(
     pthread_t* cpu_tids = NULL;
     int force_cpu_only = 0;
     int force_gpu_only = 0;
+    int use_prefix_split = 0;
     if (params->cpu_threads <= 0) gpu_ratio = 1.0;
     if (params->split_mode == HYBRID_SPLIT_ADAPTIVE) {
         gpu_ratio = choose_adaptive_gpu_ratio(ctx, queue, 0, gpu_kernel, NULL, orig_sz, blk_sz, nblk, params, ws);
@@ -1272,8 +1320,10 @@ static int hybrid_decompress_buf(
             for (size_t i = 0; i < gpu_count; ++i) gpu_idx[i] = i;
         }
     } else {
-        partition_blocks(nblk, gpu_ratio, &gpu_idx, &gpu_count, &cpu_idx, &cpu_count);
+        partition_blocks(nblk, gpu_ratio, &gpu_idx, &gpu_count, &cpu_idx, &cpu_count, params->striped_split);
     }
+
+    use_prefix_split = (params->striped_split == 0);
 
     if (gpu_count > 0 && (gpu_kernel == NULL || ctx == NULL || queue == NULL || ws == NULL)) {
         goto dfail;
@@ -1324,25 +1374,39 @@ static int hybrid_decompress_buf(
         uint64_t t_up0 = hybrid_now_ns();
         uint32_t* gpu_offsets = NULL;
         uint32_t* gpu_comp_lens = NULL;
+        const uint32_t* gpu_offsets_src = NULL;
+        const uint32_t* gpu_comp_lens_src = NULL;
+        const unsigned char* gpu_comp_src = packed;
+        size_t gpu_packed_sz = packed_sz;
         size_t gpu_orig_sz = gpu_count * blk_sz;
         for (size_t i = 0; i < gpu_count; ++i) {
             size_t blk_idx = gpu_idx[i];
             if (blk_idx == nblk - 1) gpu_orig_sz = i * blk_sz + block_input_size(orig_sz, blk_sz, blk_idx);
         }
-        gpu_offsets = (uint32_t*)malloc(gpu_count * sizeof(uint32_t));
-        gpu_comp_lens = (uint32_t*)malloc(gpu_count * sizeof(uint32_t));
-        if (!gpu_offsets || !gpu_comp_lens) {
-            free(gpu_offsets);
-            free(gpu_comp_lens);
-            goto dfail;
-        }
-        for (size_t i = 0; i < gpu_count; ++i) {
-            size_t blk_idx = gpu_idx[i];
-            gpu_offsets[i] = offsets[blk_idx];
-            gpu_comp_lens[i] = comp_lengths[blk_idx];
+        if (use_prefix_split) {
+            gpu_offsets_src = offsets;
+            gpu_comp_lens_src = comp_lengths;
+            if (gpu_count < nblk) {
+                gpu_packed_sz = (size_t)offsets[gpu_count];
+            }
+        } else {
+            gpu_offsets = (uint32_t*)malloc(gpu_count * sizeof(uint32_t));
+            gpu_comp_lens = (uint32_t*)malloc(gpu_count * sizeof(uint32_t));
+            if (!gpu_offsets || !gpu_comp_lens) {
+                free(gpu_offsets);
+                free(gpu_comp_lens);
+                goto dfail;
+            }
+            for (size_t i = 0; i < gpu_count; ++i) {
+                size_t blk_idx = gpu_idx[i];
+                gpu_offsets[i] = offsets[blk_idx];
+                gpu_comp_lens[i] = comp_lengths[blk_idx];
+            }
+            gpu_offsets_src = gpu_offsets;
+            gpu_comp_lens_src = gpu_comp_lens;
         }
 
-        grow_buffer(ctx, &ws->d_comp, &ws->comp_cap, packed_sz ? packed_sz : 1, CL_MEM_READ_ONLY, &err);
+        grow_buffer(ctx, &ws->d_comp, &ws->comp_cap, gpu_packed_sz ? gpu_packed_sz : 1, CL_MEM_READ_ONLY, &err);
         if (err != CL_SUCCESS) { free(gpu_offsets); free(gpu_comp_lens); goto dfail; }
         grow_buffer(ctx, &ws->d_off, &ws->off_cap, gpu_count * sizeof(cl_uint), CL_MEM_READ_ONLY, &err);
         if (err != CL_SUCCESS) { free(gpu_offsets); free(gpu_comp_lens); goto dfail; }
@@ -1353,9 +1417,9 @@ static int hybrid_decompress_buf(
         grow_buffer(ctx, &ws->d_out_lens, &ws->out_lens_cap, gpu_count * sizeof(cl_uint), CL_MEM_WRITE_ONLY, &err);
         if (err != CL_SUCCESS) { free(gpu_offsets); free(gpu_comp_lens); goto dfail; }
 
-        err = clEnqueueWriteBuffer(queue, ws->d_comp, CL_TRUE, 0, packed_sz ? packed_sz : 1, packed, 0, NULL, NULL);
-        err |= clEnqueueWriteBuffer(queue, ws->d_off, CL_TRUE, 0, gpu_count * sizeof(cl_uint), gpu_offsets, 0, NULL, NULL);
-        err |= clEnqueueWriteBuffer(queue, ws->d_comp_lens, CL_TRUE, 0, gpu_count * sizeof(cl_uint), gpu_comp_lens, 0, NULL, NULL);
+        err = clEnqueueWriteBuffer(queue, ws->d_comp, CL_TRUE, 0, gpu_packed_sz ? gpu_packed_sz : 1, gpu_comp_src, 0, NULL, NULL);
+        err |= clEnqueueWriteBuffer(queue, ws->d_off, CL_TRUE, 0, gpu_count * sizeof(cl_uint), gpu_offsets_src, 0, NULL, NULL);
+        err |= clEnqueueWriteBuffer(queue, ws->d_comp_lens, CL_TRUE, 0, gpu_count * sizeof(cl_uint), gpu_comp_lens_src, 0, NULL, NULL);
         free(gpu_offsets);
         free(gpu_comp_lens);
         if (err != CL_SUCCESS) goto dfail;
@@ -1399,13 +1463,23 @@ static int hybrid_decompress_buf(
         void* mapped = clEnqueueMapBuffer(queue, ws->d_decomp_out, CL_TRUE, CL_MAP_READ,
                                             0, gpu_out_sz, 0, NULL, NULL, &err);
         if (err != CL_SUCCESS) goto dfail;
-        for (size_t i = 0; i < gpu_count; i++) {
-            size_t bi = gpu_idx ? gpu_idx[i] : i;
-            size_t off = bi * blk_sz;
-            size_t this_blk = blk_sz;
-            if (off + this_blk > orig_sz) this_blk = orig_sz - off;
-            memcpy(output_buf + off, (unsigned char*)mapped + i * blk_sz, this_blk);
-            out_lengths[bi] = (uint32_t)this_blk;
+        if (use_prefix_split) {
+            memcpy(output_buf, mapped, gpu_out_sz);
+            for (size_t i = 0; i < gpu_count; i++) {
+                size_t off = i * blk_sz;
+                size_t this_blk = blk_sz;
+                if (off + this_blk > orig_sz) this_blk = orig_sz - off;
+                out_lengths[i] = (uint32_t)this_blk;
+            }
+        } else {
+            for (size_t i = 0; i < gpu_count; i++) {
+                size_t bi = gpu_idx ? gpu_idx[i] : i;
+                size_t off = bi * blk_sz;
+                size_t this_blk = blk_sz;
+                if (off + this_blk > orig_sz) this_blk = orig_sz - off;
+                memcpy(output_buf + off, (unsigned char*)mapped + i * blk_sz, this_blk);
+                out_lengths[bi] = (uint32_t)this_blk;
+            }
         }
         clEnqueueUnmapMemObject(queue, ws->d_decomp_out, mapped, 0, NULL, NULL);
         clFinish(queue);

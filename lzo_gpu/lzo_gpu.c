@@ -842,7 +842,18 @@ static int run_lzo_bench(const char *in_path,
         double in_mb = (double)tc.in_size / (1024.0 * 1024.0);
         comp_tp[n] = (tc.kernel_exec_us > 0) ? (in_mb * 1000000.0 / (double)tc.kernel_exec_us) : 0.0;
         dec_tp[n] = (dec_kernel_us > 0.0) ? (in_mb * 1000000.0 / dec_kernel_us) : 0.0;
-        comp_total_tp[n] = (time_us > 0) ? (in_mb * 1000000.0 / (double)time_us) : 0.0;
+        {
+            /* Exclude host file I/O from total throughput (keep device transfer + compute path). */
+            double comp_total_us = (double)time_us;
+            double io_read_us = (double)tc.file_read_us;
+            double io_write_us = (double)tc.file_write_us;
+            if (comp_total_us > io_read_us + io_write_us) {
+                comp_total_us -= (io_read_us + io_write_us);
+            } else {
+                comp_total_us = 0.0;
+            }
+            comp_total_tp[n] = (comp_total_us > 0.0) ? (in_mb * 1000000.0 / comp_total_us) : 0.0;
+        }
         dec_total_tp[n] = (dec_total_us > 0.0) ? (in_mb * 1000000.0 / dec_total_us) : 0.0;
         ratio_pct[n] = (tc.in_size > 0) ? (100.0 * (double)tc.out_size / (double)tc.in_size) : 0.0;
         n++;

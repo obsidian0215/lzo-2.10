@@ -43,6 +43,7 @@ lzo_hybrid: $(HYBRID_SRCS) $(GPU_UTILS_SRC) $(CPU_SRCS)
 
 symlinks:
 	@for f in $(GPU_DIR)/*.cl $(GPU_DIR)/*.clbin; do \
+		[ -e "$$f" ] || continue; \
 		bn=$$(basename "$$f"); \
 		if [ ! -e "$$bn" ]; then ln -sf "$$f" "$$bn"; fi; \
 	done

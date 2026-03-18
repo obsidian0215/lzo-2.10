@@ -105,6 +105,8 @@ static void show_help(const char* prog) {
     fprintf(stderr, "  --gpu-ratio F        GPU block fraction 0.0-1.0 (default: 0.8)\n");
     fprintf(stderr, "  --adaptive           Enable adaptive per-file CPU/GPU split\n");
     fprintf(stderr, "  --sample-blocks N    Adaptive sample block count (default: 8)\n");
+    fprintf(stderr, "  --split-prefix       Use contiguous prefix split (default, low host overhead)\n");
+    fprintf(stderr, "  --split-striped      Use distributed striped split (legacy behavior)\n");
     fprintf(stderr, "  --bench [SECONDS]    Benchmark mode (compress+decompress+verify)\n");
     fprintf(stderr, "  -v, --verbose        Verbose output\n");
     fprintf(stderr, "  -h, --help           Show this help\n");
@@ -124,6 +126,7 @@ int main(int argc, char** argv) {
     int local_size = 0;
     int cpu_threads = 0;  /* 0 = auto-detect */
     double gpu_ratio = 0.8;
+    int striped_split = 0;
     int adaptive_mode = 0;
     size_t adaptive_sample_blocks = 8;
     int debug = 0;
@@ -188,6 +191,14 @@ int main(int argc, char** argv) {
             adaptive_mode = 1;
             continue;
         }
+        if (strcmp(arg, "--split-prefix") == 0) {
+            striped_split = 0;
+            continue;
+        }
+        if (strcmp(arg, "--split-striped") == 0) {
+            striped_split = 1;
+            continue;
+        }
         if (strcmp(arg, "--sample-blocks") == 0) {
             if (++i >= argc) { fprintf(stderr, "Error: --sample-blocks requires argument\n"); return 1; }
             adaptive_sample_blocks = (size_t)strtoull(argv[i], NULL, 10);
@@ -225,6 +236,7 @@ int main(int argc, char** argv) {
         .block_size = block_size,
         .split_mode = adaptive_mode ? HYBRID_SPLIT_ADAPTIVE : HYBRID_SPLIT_FIXED,
         .gpu_ratio = gpu_ratio,
+        .striped_split = striped_split,
         .adaptive_sample_blocks = adaptive_sample_blocks,
         .cpu_threads = cpu_threads,
         .local_size = local_size,
