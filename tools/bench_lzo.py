@@ -531,19 +531,18 @@ def run_command_with_telemetry(cmd, telemetry=None, env=None, sample_interval_s=
 
     end_snap = telemetry.snapshot()
     samples.append(end_snap)
-    delta = telemetry.diff(start_snap, end_snap)
-
-    cpu_avg = safe_mean([s.get("cpu_freq_mhz") for s in samples])
-    gpu_nonzero = [s.get("gpu_freq_mhz") for s in samples if (s.get("gpu_freq_mhz") or 0) > 0]
-    gpu_avg = safe_mean(gpu_nonzero) if gpu_nonzero else 0.0
+    summary = telemetry.summarize_samples(samples)
 
     tel = {
-        "elapsed_s": float(delta.get("elapsed_s", 0.0) or 0.0),
-        "cpu_freq_avg_mhz": float(cpu_avg),
-        "gpu_freq_avg_mhz": float(gpu_avg),
-        "cpu_energy_j": float(delta.get("cpu_energy_j", 0.0) or 0.0),
-        "core_energy_j": float(delta.get("core_energy_j", 0.0) or 0.0),
-        "gpu_energy_j": float(delta.get("gpu_energy_j", 0.0) or 0.0),
+        "elapsed_s": float(summary.get("elapsed_s", 0.0) or 0.0),
+        "cpu_freq_avg_mhz": float(summary.get("cpu_freq_avg_mhz", 0.0) or 0.0),
+        "gpu_freq_avg_mhz": float(summary.get("gpu_freq_avg_mhz", 0.0) or 0.0),
+        "cpu_energy_j": float(summary.get("cpu_energy_j", 0.0) or 0.0),
+        "core_energy_j": float(summary.get("core_energy_j", 0.0) or 0.0),
+        "gpu_energy_j": float(summary.get("gpu_energy_j", 0.0) or 0.0),
+        "cpu_pkg_peak_power_w": float(summary.get("cpu_pkg_peak_power_w", 0.0) or 0.0),
+        "cpu_core_peak_power_w": float(summary.get("cpu_core_peak_power_w", 0.0) or 0.0),
+        "gpu_peak_power_w": float(summary.get("gpu_peak_power_w", 0.0) or 0.0),
     }
     completed = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
     return completed, tel
@@ -568,38 +567,77 @@ def run_command_with_telemetry_cwd(cmd, cwd=None, telemetry=None, env=None, samp
 
     end_snap = telemetry.snapshot()
     samples.append(end_snap)
-    delta = telemetry.diff(start_snap, end_snap)
-
-    cpu_avg = safe_mean([s.get("cpu_freq_mhz") for s in samples])
-    gpu_nonzero = [s.get("gpu_freq_mhz") for s in samples if (s.get("gpu_freq_mhz") or 0) > 0]
-    gpu_avg = safe_mean(gpu_nonzero) if gpu_nonzero else 0.0
+    summary = telemetry.summarize_samples(samples)
 
     tel = {
-        "elapsed_s": float(delta.get("elapsed_s", 0.0) or 0.0),
-        "cpu_freq_avg_mhz": float(cpu_avg),
-        "gpu_freq_avg_mhz": float(gpu_avg),
-        "cpu_energy_j": float(delta.get("cpu_energy_j", 0.0) or 0.0),
-        "core_energy_j": float(delta.get("core_energy_j", 0.0) or 0.0),
-        "gpu_energy_j": float(delta.get("gpu_energy_j", 0.0) or 0.0),
+        "elapsed_s": float(summary.get("elapsed_s", 0.0) or 0.0),
+        "cpu_freq_avg_mhz": float(summary.get("cpu_freq_avg_mhz", 0.0) or 0.0),
+        "gpu_freq_avg_mhz": float(summary.get("gpu_freq_avg_mhz", 0.0) or 0.0),
+        "cpu_energy_j": float(summary.get("cpu_energy_j", 0.0) or 0.0),
+        "core_energy_j": float(summary.get("core_energy_j", 0.0) or 0.0),
+        "gpu_energy_j": float(summary.get("gpu_energy_j", 0.0) or 0.0),
+        "cpu_pkg_peak_power_w": float(summary.get("cpu_pkg_peak_power_w", 0.0) or 0.0),
+        "cpu_core_peak_power_w": float(summary.get("cpu_core_peak_power_w", 0.0) or 0.0),
+        "gpu_peak_power_w": float(summary.get("gpu_peak_power_w", 0.0) or 0.0),
     }
     completed = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
     return completed, tel
 
 
+def _clamp01(v):
+    try:
+        x = float(v)
+    except Exception:
+        return 0.0
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
+
+
 def apply_wall_energy(stats, tel_window, comp_elapsed_s, dec_elapsed_s, energy_source,
-                      file_size_mb=0.0, idle_pkg_power_w=0.0):
+                      file_size_mb=0.0, idle_pkg_power_w=0.0, idle_core_power_w=0.0,
+                      idle_gpu_power_w=0.0, gpu_share_hint=0.0):
     stats['cpu_freq_avg_mhz'] = float(tel_window.get('cpu_freq_avg_mhz', 0.0) or 0.0)
     stats['gpu_freq_avg_mhz'] = float(tel_window.get('gpu_freq_avg_mhz', 0.0) or 0.0)
+    elapsed_s = float(tel_window.get('elapsed_s', 0.0) or 0.0)
     pkg_energy_j = float(tel_window.get('cpu_energy_j', 0.0) or 0.0)
     core_energy_j = float(tel_window.get('core_energy_j', 0.0) or 0.0)
-    elapsed_s = float(tel_window.get('elapsed_s', 0.0) or 0.0)
+    gpu_energy_j = float(tel_window.get('gpu_energy_j', 0.0) or 0.0)
 
-    if elapsed_s > 0.0:
-        pkg_power_w = pkg_energy_j / elapsed_s
+    if elapsed_s <= 0.0:
+        stats['cpu_energy_j'] = 0.0
+        stats['gpu_energy_j'] = 0.0
+        stats['comp_cpu_power_w'] = 0.0
+        stats['comp_gpu_power_w'] = 0.0
+        stats['energy_source'] = energy_source
+        return
+
+    pkg_peak_power_w = float(tel_window.get('cpu_pkg_peak_power_w', 0.0) or 0.0)
+    core_peak_power_w = float(tel_window.get('cpu_core_peak_power_w', 0.0) or 0.0)
+    gpu_peak_power_w = float(tel_window.get('gpu_peak_power_w', 0.0) or 0.0)
+
+    if pkg_peak_power_w <= 0.0 and pkg_energy_j > 0.0:
+        pkg_peak_power_w = pkg_energy_j / elapsed_s
+    if core_peak_power_w <= 0.0 and core_energy_j > 0.0:
+        core_peak_power_w = core_energy_j / elapsed_s
+    if gpu_peak_power_w <= 0.0 and gpu_energy_j > 0.0:
+        gpu_peak_power_w = gpu_energy_j / elapsed_s
+
+    cpu_peak_power_w = core_peak_power_w if core_peak_power_w > 0.0 else pkg_peak_power_w
+    cpu_idle_power_w = float(idle_core_power_w or 0.0) if core_peak_power_w > 0.0 else float(idle_pkg_power_w or 0.0)
+    cpu_inc_power_w = max(0.0, cpu_peak_power_w - max(0.0, cpu_idle_power_w))
+
+    gpu_inc_power_direct = None
+    if gpu_peak_power_w > 0.0:
+        gpu_inc_power_direct = max(0.0, gpu_peak_power_w - max(0.0, float(idle_gpu_power_w or 0.0)))
+
+    gpu_hint = _clamp01(gpu_share_hint)
+    if gpu_inc_power_direct is not None:
+        gpu_inc_power_w = gpu_inc_power_direct
     else:
-        pkg_power_w = 0.0
-
-    gpu_est_power_w = max(0.0, pkg_power_w - idle_pkg_power_w)
+        gpu_inc_power_w = cpu_inc_power_w * gpu_hint
 
     comp_kernel_mbs = float(stats.get('comp_mbs', 0.0) or 0.0)
     dec_kernel_mbs = float(stats.get('dec_mbs', 0.0) or 0.0)
@@ -609,11 +647,20 @@ def apply_wall_energy(stats, tel_window, comp_elapsed_s, dec_elapsed_s, energy_s
         stats['dec_time_s'] = file_size_mb / dec_kernel_mbs
 
     comp_time = float(stats.get('comp_time_s', 0.0) or 0.0)
-    stats['cpu_energy_j'] = core_energy_j if core_energy_j > 0.0 else pkg_energy_j
-    stats['gpu_energy_j'] = gpu_est_power_w * comp_time if comp_time > 0 else 0.0
-    cpu_e = stats['cpu_energy_j']
-    stats['comp_cpu_power_w'] = (cpu_e / elapsed_s) if elapsed_s > 0.0 else 0.0
-    stats['comp_gpu_power_w'] = gpu_est_power_w
+    dec_time = float(stats.get('dec_time_s', 0.0) or 0.0)
+    if comp_time <= 0.0 and dec_time <= 0.0:
+        comp_time = elapsed_s
+
+    stats['cpu_energy_j'] = cpu_inc_power_w * comp_time
+    stats['gpu_energy_j'] = gpu_inc_power_w * comp_time
+    stats['dec_cpu_energy_j'] = cpu_inc_power_w * dec_time
+    stats['dec_gpu_energy_j'] = gpu_inc_power_w * dec_time
+    stats['comp_cpu_power_w'] = cpu_inc_power_w
+    stats['comp_gpu_power_w'] = gpu_inc_power_w
+    stats['cpu_peak_power_w'] = cpu_peak_power_w
+    stats['gpu_peak_power_w'] = gpu_peak_power_w
+    stats['cpu_idle_power_w'] = cpu_idle_power_w
+    stats['gpu_idle_power_w'] = float(idle_gpu_power_w or 0.0)
     stats['energy_source'] = energy_source
 
 
@@ -786,6 +833,7 @@ def warm_lzo_gpu_daemon(file_path, alg, level, bs_arg, lsz):
         return
 
     gpu_dir = str(Path(LZO_GPU_BIN).resolve().parent)
+    sample_path = str(Path(file_path).resolve())
     warm_out = make_temp_file_path("lzo_gpu_warm", ".lzo")
     warm_dec = f"{warm_out}.dec"
     try:
@@ -797,7 +845,7 @@ def warm_lzo_gpu_daemon(file_path, alg, level, bs_arg, lsz):
             "-B", bs_arg,
             "--local", str(lsz),
             "-o", warm_out,
-            str(file_path),
+            sample_path,
         ]
         subprocess.run(warm_comp_cmd, capture_output=True, text=True, check=False, env=build_gpu_subprocess_env(), cwd=gpu_dir)
 
@@ -818,7 +866,10 @@ def warm_lzo_gpu_daemon(file_path, alg, level, bs_arg, lsz):
 def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=None, bench_seconds=3.0):
     # Mapping "lzo1x" to "1x" for CPU tool
     alg_short = alg.replace("lzo", "")
-    print(f"Bench_CPU: {file_path.name} A={alg_short} L={level} BS={bs} T={threads}")
+    sample_path = str(file_path.resolve())
+    req_threads = int(threads)
+    exec_threads = req_threads if req_threads > 0 else max(1, int(os.cpu_count() or 1))
+    print(f"Bench_CPU: {file_path.name} A={alg_short} L={level} BS={bs} T={threads} (exec={exec_threads})")
     cmd = [
         LZO_CPU_BIN,
         "--bench",
@@ -826,8 +877,8 @@ def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=No
         "-a", alg_short,
         "-L", str(level),
         "-B", str(bs),
-        "-t", str(threads),
-        str(file_path),
+        "-t", str(exec_threads),
+        sample_path,
     ]
     stats = {
         'ratio': 0.0,
@@ -848,8 +899,14 @@ def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=No
         'energy_source': 'none',
     }
     tel_window = {}
+    idle_pkg_power_w = 0.0
+    idle_core_power_w = 0.0
+    idle_gpu_power_w = 0.0
     try:
         in_sz = file_path.stat().st_size
+        if telemetry:
+            idle_pkg_power_w = telemetry.measure_idle_pkg_power_w(0.2)
+            idle_core_power_w = telemetry.measure_idle_core_power_w(0.2)
         res, tel_window = run_command_with_telemetry(cmd, telemetry=telemetry)
         output = (res.stdout or "") + (res.stderr or "")
 
@@ -871,9 +928,9 @@ def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=No
                     "-a", alg_short,
                     "-L", str(level),
                     "-B", str(bs),
-                    "-t", str(threads),
+                    "-t", str(exec_threads),
                     "-o", tmp_comp,
-                    str(file_path),
+                    sample_path,
                 ]
                 t0 = time.perf_counter()
                 comp_total_res, _ = run_command_with_telemetry(cmd_comp_total, telemetry=None)
@@ -883,7 +940,7 @@ def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=No
                     LZO_CPU_BIN,
                     "-d",
                     "-a", alg_short,
-                    "-t", str(threads),
+                    "-t", str(exec_threads),
                     "-o", tmp_dec,
                     tmp_comp,
                 ]
@@ -891,7 +948,7 @@ def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=No
                 dec_total_res, _ = run_command_with_telemetry(cmd_dec_total, telemetry=None)
                 dec_elapsed_s = max(0.0, time.perf_counter() - t1)
 
-                expected_hash = orig_hash if orig_hash else compute_sha256(str(file_path))
+                expected_hash = orig_hash if orig_hash else compute_sha256(sample_path)
                 total_ok = (
                     comp_total_res.returncode == 0
                     and dec_total_res.returncode == 0
@@ -924,6 +981,10 @@ def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=No
             float(stats.get('comp_time_s', 0.0) or 0.0),
             float(stats.get('dec_time_s', 0.0) or 0.0),
             telemetry.describe_sources(),
+            idle_pkg_power_w=idle_pkg_power_w,
+            idle_core_power_w=idle_core_power_w,
+            idle_gpu_power_w=idle_gpu_power_w,
+            gpu_share_hint=0.0,
         )
 
     return stats
@@ -931,6 +992,7 @@ def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=No
 
 def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench_seconds=3.0, use_daemon=False):
     print(f"Bench_GPU: {file_path.name} A={alg} L={level} BS={bs} LSZ={lsz}")
+    sample_path = str(file_path.resolve())
     bs_arg = str(bs).lower()
     stats = {
         'ratio': 0.0,
@@ -951,10 +1013,16 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
         'energy_source': 'none',
     }
     tel_window = {}
+    idle_pkg_power_w = 0.0
+    idle_core_power_w = 0.0
+    idle_gpu_power_w = 0.0
     try:
         in_sz = file_path.stat().st_size
         file_size_mb = in_sz / (1024.0 * 1024.0)
-        idle_pkg_power_w = telemetry.measure_idle_pkg_power_w(0.5) if telemetry else 0.0
+        if telemetry:
+            idle_pkg_power_w = telemetry.measure_idle_pkg_power_w(0.2)
+            idle_core_power_w = telemetry.measure_idle_core_power_w(0.2)
+            idle_gpu_power_w = telemetry.measure_idle_gpu_power_w(0.2)
         gpu_dir = str(Path(LZO_GPU_BIN).resolve().parent)
 
         bench_cmd = [
@@ -964,7 +1032,7 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
             "-L", str(level),
             "-B", bs_arg,
             "--local", str(lsz),
-            str(file_path),
+            sample_path,
         ]
         bench_res, tel_window = run_command_with_telemetry_cwd(bench_cmd, cwd=gpu_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
         bench_output = (bench_res.stdout or "") + (bench_res.stderr or "")
@@ -975,6 +1043,14 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
             stats['ratio'] = stable['ratio']
             stats['comp_mbs'] = stable['comp_kernel_tp']
             stats['dec_mbs'] = stable['dec_kernel_tp']
+            if stable.get('comp_total_tp', 0.0):
+                stats['comp_total_mbs'] = float(stable.get('comp_total_tp', 0.0) or 0.0)
+            if stable.get('dec_total_tp', 0.0):
+                stats['dec_total_mbs'] = float(stable.get('dec_total_tp', 0.0) or 0.0)
+            if in_sz > 0 and stats['comp_total_mbs'] > 0.0:
+                stats['comp_time_s'] = in_sz / (stats['comp_total_mbs'] * 1024.0 * 1024.0)
+            if in_sz > 0 and stats['dec_total_mbs'] > 0.0:
+                stats['dec_time_s'] = in_sz / (stats['dec_total_mbs'] * 1024.0 * 1024.0)
 
             tmp_comp = make_temp_file_path("lzo_gpu_total", ".lzo")
             tmp_dec = f"{tmp_comp}.dec"
@@ -999,7 +1075,7 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                     "-B", bs_arg,
                     "--local", str(lsz),
                     "-o", local_tmp_comp,
-                    str(file_path),
+                    sample_path,
                 ])
                 comp_total_res, comp_total_tel = run_command_with_telemetry_cwd(cmd_comp_total, cwd=gpu_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
                 comp_total_output = (comp_total_res.stdout or "") + (comp_total_res.stderr or "")
@@ -1025,7 +1101,11 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                     'cpu_freq_avg_mhz': float(comp_total_tel.get('cpu_freq_avg_mhz', 0.0) or 0.0),
                     'gpu_freq_avg_mhz': float(comp_total_tel.get('gpu_freq_avg_mhz', 0.0) or 0.0),
                     'cpu_energy_j': float(comp_total_tel.get('cpu_energy_j', 0.0) or 0.0) + float(dec_total_tel.get('cpu_energy_j', 0.0) or 0.0),
+                    'core_energy_j': float(comp_total_tel.get('core_energy_j', 0.0) or 0.0) + float(dec_total_tel.get('core_energy_j', 0.0) or 0.0),
                     'gpu_energy_j': float(comp_total_tel.get('gpu_energy_j', 0.0) or 0.0) + float(dec_total_tel.get('gpu_energy_j', 0.0) or 0.0),
+                    'cpu_pkg_peak_power_w': max(float(comp_total_tel.get('cpu_pkg_peak_power_w', 0.0) or 0.0), float(dec_total_tel.get('cpu_pkg_peak_power_w', 0.0) or 0.0)),
+                    'cpu_core_peak_power_w': max(float(comp_total_tel.get('cpu_core_peak_power_w', 0.0) or 0.0), float(dec_total_tel.get('cpu_core_peak_power_w', 0.0) or 0.0)),
+                    'gpu_peak_power_w': max(float(comp_total_tel.get('gpu_peak_power_w', 0.0) or 0.0), float(dec_total_tel.get('gpu_peak_power_w', 0.0) or 0.0)),
                 }
 
                 if local_tmp_comp and os.path.exists(local_tmp_comp):
@@ -1041,13 +1121,13 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                     and file_matches_hash(tmp_dec, orig_hash)
                 )
 
-                if comp_total_parsed.get('inclusive_tp'):
+                if comp_total_parsed.get('inclusive_tp') and stats['comp_total_mbs'] <= 0.0:
                     stats['comp_total_mbs'] = comp_total_parsed['inclusive_tp']
-                if dec_total_parsed.get('inclusive_tp'):
+                if dec_total_parsed.get('inclusive_tp') and stats['dec_total_mbs'] <= 0.0:
                     stats['dec_total_mbs'] = dec_total_parsed['inclusive_tp']
-                if comp_elapsed_s > 0.0:
+                if comp_elapsed_s > 0.0 and stats['comp_time_s'] <= 0.0:
                     stats['comp_time_s'] = comp_elapsed_s
-                if dec_elapsed_s > 0.0:
+                if dec_elapsed_s > 0.0 and stats['dec_time_s'] <= 0.0:
                     stats['dec_time_s'] = dec_elapsed_s
             finally:
                 if local_tmp_comp:
@@ -1068,7 +1148,11 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                     'cpu_freq_avg_mhz': float(bench_tel.get('cpu_freq_avg_mhz', 0.0) or io_tel.get('cpu_freq_avg_mhz', 0.0) or 0.0),
                     'gpu_freq_avg_mhz': float(bench_tel.get('gpu_freq_avg_mhz', 0.0) or io_tel.get('gpu_freq_avg_mhz', 0.0) or 0.0),
                     'cpu_energy_j': float(bench_tel.get('cpu_energy_j', 0.0) or io_tel.get('cpu_energy_j', 0.0) or 0.0),
+                    'core_energy_j': float(bench_tel.get('core_energy_j', 0.0) or io_tel.get('core_energy_j', 0.0) or 0.0),
                     'gpu_energy_j': float(bench_tel.get('gpu_energy_j', 0.0) or io_tel.get('gpu_energy_j', 0.0) or 0.0),
+                    'cpu_pkg_peak_power_w': max(float(bench_tel.get('cpu_pkg_peak_power_w', 0.0) or 0.0), float(io_tel.get('cpu_pkg_peak_power_w', 0.0) or 0.0)),
+                    'cpu_core_peak_power_w': max(float(bench_tel.get('cpu_core_peak_power_w', 0.0) or 0.0), float(io_tel.get('cpu_core_peak_power_w', 0.0) or 0.0)),
+                    'gpu_peak_power_w': max(float(bench_tel.get('gpu_peak_power_w', 0.0) or 0.0), float(io_tel.get('gpu_peak_power_w', 0.0) or 0.0)),
                 }
                 apply_wall_energy(
                     stats,
@@ -1078,6 +1162,9 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                     telemetry.describe_sources(),
                     file_size_mb=file_size_mb,
                     idle_pkg_power_w=idle_pkg_power_w,
+                    idle_core_power_w=idle_core_power_w,
+                    idle_gpu_power_w=idle_gpu_power_w,
+                    gpu_share_hint=1.0,
                 )
         else:
             stats['throughput_semantics'] = 'stable_kernel_bench_parse_failed'
@@ -1091,6 +1178,7 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
 
 def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_hash=None, telemetry=None, bench_seconds=3.0, split_mode="fixed", sample_blocks=8, level=14):
     print(f"Bench_HYBRID: {file_path.name} A={alg} L={level} BS={bs} mode={split_mode} R={gpu_ratio} T={cpu_threads} LSZ={local_size}")
+    sample_path = str(file_path.resolve())
     bs_arg = str(bs).lower()
     stats = {
         'ratio': 0.0,
@@ -1111,22 +1199,27 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_
         'energy_source': 'none',
     }
     tel_window = {}
+    idle_pkg_power_w = 0.0
+    idle_core_power_w = 0.0
+    idle_gpu_power_w = 0.0
     try:
         in_sz = file_path.stat().st_size
         file_size_mb = in_sz / (1024.0 * 1024.0)
-        idle_pkg_power_w = telemetry.measure_idle_pkg_power_w(0.5) if telemetry else 0.0
+        if telemetry:
+            idle_pkg_power_w = telemetry.measure_idle_pkg_power_w(0.2)
+            idle_core_power_w = telemetry.measure_idle_core_power_w(0.2)
+            idle_gpu_power_w = telemetry.measure_idle_gpu_power_w(0.2)
         hybrid_dir = str(Path(LZO_HYBRID_BIN).resolve().parent)
 
         bench_cmd = [
             LZO_HYBRID_BIN,
             "--bench", str(bench_seconds),
-            "--bench-io",
             "-a", alg,
             "-L", str(level),
             "-B", bs_arg,
             "--local", str(local_size),
             "--cpu-threads", str(cpu_threads),
-            str(file_path),
+            sample_path,
         ]
         if split_mode == "adaptive":
             bench_cmd[1:1] = ["--adaptive", "--sample-blocks", str(sample_blocks), "--gpu-ratio", str(gpu_ratio)]
@@ -1156,7 +1249,7 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_
                     "--local", str(local_size),
                     "--cpu-threads", str(cpu_threads),
                     "-o", tmp_comp,
-                    str(file_path),
+                    sample_path,
                 ]
                 if split_mode == "adaptive":
                     cmd_comp_total[1:1] = ["--adaptive", "--sample-blocks", str(sample_blocks), "--gpu-ratio", str(gpu_ratio)]
@@ -1196,7 +1289,11 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_
                     'cpu_freq_avg_mhz': float(comp_total_tel.get('cpu_freq_avg_mhz', 0.0) or 0.0),
                     'gpu_freq_avg_mhz': float(comp_total_tel.get('gpu_freq_avg_mhz', 0.0) or 0.0),
                     'cpu_energy_j': float(comp_total_tel.get('cpu_energy_j', 0.0) or 0.0) + float(dec_total_tel.get('cpu_energy_j', 0.0) or 0.0),
+                    'core_energy_j': float(comp_total_tel.get('core_energy_j', 0.0) or 0.0) + float(dec_total_tel.get('core_energy_j', 0.0) or 0.0),
                     'gpu_energy_j': float(comp_total_tel.get('gpu_energy_j', 0.0) or 0.0) + float(dec_total_tel.get('gpu_energy_j', 0.0) or 0.0),
+                    'cpu_pkg_peak_power_w': max(float(comp_total_tel.get('cpu_pkg_peak_power_w', 0.0) or 0.0), float(dec_total_tel.get('cpu_pkg_peak_power_w', 0.0) or 0.0)),
+                    'cpu_core_peak_power_w': max(float(comp_total_tel.get('cpu_core_peak_power_w', 0.0) or 0.0), float(dec_total_tel.get('cpu_core_peak_power_w', 0.0) or 0.0)),
+                    'gpu_peak_power_w': max(float(comp_total_tel.get('gpu_peak_power_w', 0.0) or 0.0), float(dec_total_tel.get('gpu_peak_power_w', 0.0) or 0.0)),
                 }
             finally:
                 safe_remove(tmp_comp)
@@ -1214,6 +1311,9 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_
                     telemetry.describe_sources(),
                     file_size_mb=file_size_mb,
                     idle_pkg_power_w=idle_pkg_power_w,
+                    idle_core_power_w=idle_core_power_w,
+                    idle_gpu_power_w=idle_gpu_power_w,
+                    gpu_share_hint=float(gpu_ratio),
                 )
         else:
             stats['throughput_semantics'] = 'stable_kernel_bench_parse_failed'
@@ -1294,6 +1394,15 @@ def main():
     use_mhz_mode = (cpu_freq_mhz_points != [None] or gpu_freq_mhz_points != [None] or len(hybrid_freq_pairs) > 0)
     if use_mhz_mode:
         freq_points = [None]
+
+    if IS_WINDOWS:
+        if use_mhz_mode or freq_points != [None]:
+            print("[FreqControl] Windows detected; disabling frequency scan and forcing a single default point.")
+        use_mhz_mode = False
+        freq_points = [None]
+        cpu_freq_mhz_points = [None]
+        gpu_freq_mhz_points = [None]
+        hybrid_freq_pairs = []
 
     telemetry = None if args.no_telemetry else TelemetryProbe()
     if telemetry is not None:

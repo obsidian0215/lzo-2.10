@@ -26,6 +26,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 /* CPU LZO library */
 #include <lzo/lzoconf.h>
@@ -48,6 +51,17 @@ static inline uint64_t hybrid_now_ns(void) {
 
 static inline size_t lzo_worst_size(size_t n) {
     return n + n / 16 + 64 + 3;
+}
+
+static long get_online_cpu_count(void) {
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (si.dwNumberOfProcessors > 0) ? (long)si.dwNumberOfProcessors : 1;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return (n > 0) ? n : 1;
+#endif
 }
 
 static size_t block_input_size(size_t total_size, size_t block_size, size_t block_idx) {
@@ -470,11 +484,13 @@ typedef struct {
     /* shared across all workers */
     cpu_compress_job_t* job;
     _Atomic size_t next_idx;
+    _Atomic uint64_t max_worker_us;
 } cpu_compress_pool_t;
 
 static void* cpu_compress_worker(void* arg) {
     cpu_compress_pool_t* pool = (cpu_compress_pool_t*)arg;
     cpu_compress_job_t* job = pool->job;
+    uint64_t t0 = hybrid_now_ns();
 
     /* Per-thread work memory for LZO */
     void* wrkmem = NULL;
@@ -515,6 +531,14 @@ static void* cpu_compress_worker(void* arg) {
     }
 
     lzo_aligned_free_portable(wrkmem);
+
+    {
+        uint64_t elapsed_us = (hybrid_now_ns() - t0) / 1000ULL;
+        uint64_t old = atomic_load(&pool->max_worker_us);
+        while (elapsed_us > old && !atomic_compare_exchange_weak(&pool->max_worker_us, &old, elapsed_us)) {
+            /* retry */
+        }
+    }
     return NULL;
 }
 
@@ -538,11 +562,13 @@ typedef struct {
 typedef struct {
     cpu_decompress_job_t* job;
     _Atomic size_t next_idx;
+    _Atomic uint64_t max_worker_us;
 } cpu_decompress_pool_t;
 
 static void* cpu_decompress_worker(void* arg) {
     cpu_decompress_pool_t* pool = (cpu_decompress_pool_t*)arg;
     cpu_decompress_job_t* job = pool->job;
+    uint64_t t0 = hybrid_now_ns();
 
     for (;;) {
         size_t wi = atomic_fetch_add(&pool->next_idx, 1);
@@ -571,6 +597,14 @@ static void* cpu_decompress_worker(void* arg) {
             job->rc = -1;
         }
         job->out_lengths[blk_idx] = (uint32_t)dst_len;
+    }
+
+    {
+        uint64_t elapsed_us = (hybrid_now_ns() - t0) / 1000ULL;
+        uint64_t old = atomic_load(&pool->max_worker_us);
+        while (elapsed_us > old && !atomic_compare_exchange_weak(&pool->max_worker_us, &old, elapsed_us)) {
+            /* retry */
+        }
     }
 
     return NULL;
@@ -661,7 +695,7 @@ static double choose_adaptive_gpu_ratio(cl_context ctx, cl_command_queue queue,
     Pg0 = g_lzo_dev_profile.gpu_throughput;
     t0  = g_lzo_dev_profile.gpu_overhead_s;
 
-    total_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    total_cores = get_online_cpu_count();
     if (total_cores <= 0) total_cores = 4;
     if (params->cpu_threads > 0)
         thread_count = params->cpu_threads;
@@ -888,6 +922,7 @@ static int hybrid_compress_buf(
     cpu_compress_pool_t cpu_pool = {
         .job = &cpu_job,
         .next_idx = 0,
+        .max_worker_us = 0,
     };
 
     n_cpu_threads = (cpu_count > 0) ? params->cpu_threads : 0;
@@ -896,7 +931,7 @@ static int hybrid_compress_buf(
     if (n_cpu_threads > 0) {
         if (n_cpu_threads == 1) {
             cpu_compress_worker(&cpu_pool);
-            timing.cpu_kernel_us = (unsigned long)((hybrid_now_ns() - t_cpu_start) / 1000);
+            timing.cpu_kernel_us = (unsigned long)atomic_load(&cpu_pool.max_worker_us);
         } else {
             cpu_tids = (pthread_t*)malloc(n_cpu_threads * sizeof(pthread_t));
             for (int i = 0; i < n_cpu_threads; i++)
@@ -1136,7 +1171,7 @@ static int hybrid_compress_buf(
         t_cpu_end = hybrid_now_ns();
         free(cpu_tids);
         cpu_tids = NULL;
-        timing.cpu_kernel_us = (unsigned long)((t_cpu_end - t_cpu_start) / 1000);
+        timing.cpu_kernel_us = (unsigned long)atomic_load(&cpu_pool.max_worker_us);
     }
     timing.gpu_kernel_us = (t_gpu_k1 > t_gpu_k0) ? (unsigned long)((t_gpu_k1 - t_gpu_k0) / 1000) + pack_kernel_us : pack_kernel_us;
 
@@ -1249,6 +1284,7 @@ static int hybrid_decompress_buf(
     cpu_decompress_pool_t cpu_pool = {
         .job = &cpu_job,
         .next_idx = 0,
+        .max_worker_us = 0,
     };
 
     n_cpu_threads = (cpu_count > 0) ? params->cpu_threads : 0;
@@ -1257,7 +1293,7 @@ static int hybrid_decompress_buf(
     if (n_cpu_threads > 0) {
         if (n_cpu_threads == 1) {
             cpu_decompress_worker(&cpu_pool);
-            timing.cpu_kernel_us = (unsigned long)((hybrid_now_ns() - t_cpu_start) / 1000);
+            timing.cpu_kernel_us = (unsigned long)atomic_load(&cpu_pool.max_worker_us);
         } else {
             cpu_tids = (pthread_t*)malloc(n_cpu_threads * sizeof(pthread_t));
             for (int i = 0; i < n_cpu_threads; i++)
@@ -1367,7 +1403,7 @@ static int hybrid_decompress_buf(
         t_cpu_end = hybrid_now_ns();
         free(cpu_tids);
         cpu_tids = NULL;
-        timing.cpu_kernel_us = (unsigned long)((t_cpu_end - t_cpu_start) / 1000);
+        timing.cpu_kernel_us = (unsigned long)atomic_load(&cpu_pool.max_worker_us);
     }
     timing.gpu_kernel_us = (t_gpu_k1 > t_gpu_k0) ? (unsigned long)((t_gpu_k1 - t_gpu_k0) / 1000) : 0;
 

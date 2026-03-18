@@ -9,6 +9,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "../lzo_gpu/lzo_defaults.h"
 #include "../lzo_gpu/lzo_gpu_utils.h"
@@ -32,6 +35,17 @@ static inline uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static long get_online_cpu_count(void) {
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (si.dwNumberOfProcessors > 0) ? (long)si.dwNumberOfProcessors : 1;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return (n > 0) ? n : 1;
+#endif
 }
 
 static int ocl_init(void) {
@@ -205,7 +219,7 @@ int main(int argc, char** argv) {
     if (gpu_ratio < 0.0) gpu_ratio = 0.0;
     if (gpu_ratio > 1.0) gpu_ratio = 1.0;
     if (cpu_threads <= 0) {
-        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        long n = get_online_cpu_count();
         cpu_threads = (n > 0) ? (int)n : 4;
     }
 

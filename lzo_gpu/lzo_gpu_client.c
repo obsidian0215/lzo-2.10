@@ -282,7 +282,7 @@ static void show_help(const char* prog) {
     fprintf(stderr, "  -a, --alg <lzo1x|lzo1y>       Set algorithm. Default: lzo1x.\n");
     fprintf(stderr, "  -d, --decompress              Decompress mode.\n");
     fprintf(stderr, "  -o, --output <file>           Output file (only valid for single input).\n");
-    fprintf(stderr, "  -B N, --block-size N          Block size (B/KB/MB, default: 16KB).\n");
+    fprintf(stderr, "  -B N, --block-size N          Block size (B/KB/MB, default: 64KB).\n");
     fprintf(stderr, "  --mt-io / --no-mt-io          Enable/disable multi-threaded I/O.\n");
     fprintf(stderr, "  --zero-copy / --standard-copy Enable/disable zero-copy (pinned memory).\n");
     fprintf(stderr, "  --local N                     Local work-group size.\n");
@@ -343,7 +343,7 @@ int run_lzo_client(int argc, char** argv)
             if (i + 1 < argc) {
                 i++;
                 int val = atoi(argv[i]);
-                if (val == 999 || (val >= 10 && val <= 18)) {
+                if (val == 999 || (val >= 11 && val <= 16)) {
                     level = val;
                 } else {
                     // 尝试兼容旧参数
@@ -352,7 +352,7 @@ int run_lzo_client(int argc, char** argv)
                     else if (strcmp(argv[i], "1l") == 0) level = 11;
                     else if (strcmp(argv[i], "1o") == 0) level = 14;
                     else {
-                        fprintf(stderr, "错误: level必须是 10-18 (bits)\n");
+                        fprintf(stderr, "错误: level必须是 11-16 (bits)\n");
                         free(inputs); return 1;
                     }
                 }

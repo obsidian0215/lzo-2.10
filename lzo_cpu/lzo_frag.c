@@ -23,6 +23,8 @@
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
+#include <windows.h>
+#include <malloc.h>
 #endif
 
 #include <lzo/lzo1x.h>
@@ -202,8 +204,36 @@ static double median_double(const double *vals, size_t n) {
 
 static size_t g_cli_fixed_block_bytes = 0;
 
-static int auto_detect_threads(void) {
+static long get_online_cpu_count(void) {
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (si.dwNumberOfProcessors > 0) ? (long)si.dwNumberOfProcessors : 1;
+#else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return (n > 0) ? n : 1;
+#endif
+}
+
+static int lzo_cpu_aligned_alloc(void **ptr, size_t align, size_t size) {
+#ifdef _WIN32
+    *ptr = _aligned_malloc(size, align);
+    return (*ptr != NULL) ? 0 : -1;
+#else
+    return posix_memalign(ptr, align, size);
+#endif
+}
+
+static void lzo_cpu_aligned_free(void *ptr) {
+#ifdef _WIN32
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
+
+static int auto_detect_threads(void) {
+    long n = get_online_cpu_count();
     return (n > 0) ? (int)n : 4;
 }
 
@@ -386,15 +416,8 @@ static void *compress_worker(void *opaque) {
     compress_job_t *job = (compress_job_t *)opaque;
     lzo_align_t *thread_wrkmem = NULL;
     int have_wrkmem = 0;
-#if defined(_WIN32) || defined(_WIN64)
-    #define LZO_CPU_ALIGNED_ALLOC(ptr, align, size) (((*(void**)(ptr) = _aligned_malloc((size), (align))) == NULL) ? -1 : 0)
-    #define LZO_CPU_ALIGNED_FREE(ptr) _aligned_free((ptr))
-#else
-    #define LZO_CPU_ALIGNED_ALLOC(ptr, align, size) posix_memalign((void **)(ptr), (align), (size))
-    #define LZO_CPU_ALIGNED_FREE(ptr) free((ptr))
-#endif
     size_t wrkmem_sz = workmem_size_for(job->compression_alg, job->variant);
-    if (LZO_CPU_ALIGNED_ALLOC((void **)&thread_wrkmem, sizeof(lzo_align_t), wrkmem_sz) == 0) {
+    if (lzo_cpu_aligned_alloc((void **)&thread_wrkmem, sizeof(lzo_align_t), wrkmem_sz) == 0) {
         have_wrkmem = 1;
     } else {
         thread_wrkmem = NULL;
@@ -461,7 +484,7 @@ static void *compress_worker(void *opaque) {
             ck->comp_size = out_len;
         }
     }
-    if (have_wrkmem && thread_wrkmem) LZO_CPU_ALIGNED_FREE(thread_wrkmem);
+    if (have_wrkmem && thread_wrkmem) lzo_cpu_aligned_free(thread_wrkmem);
     return NULL;
 }
 
@@ -1661,7 +1684,7 @@ static int compress_block_into(const unsigned char *in, size_t in_size,
         wrkmem_ptr = (lzo_align_t *)wrkmem_in;
     } else {
         size_t wrkmem_sz = workmem_size_for(compression_alg, variant);
-        if (posix_memalign((void **)&wrkmem_heap, sizeof(lzo_align_t), wrkmem_sz) != 0) {
+        if (lzo_cpu_aligned_alloc((void **)&wrkmem_heap, sizeof(lzo_align_t), wrkmem_sz) != 0) {
             wrkmem_heap = NULL;
         }
         if (!wrkmem_heap) return LZO_E_OUT_OF_MEMORY;
@@ -1694,7 +1717,7 @@ static int compress_block_into(const unsigned char *in, size_t in_size,
             rc = lzo1x_1_compress(in, (lzo_uint)in_size, out, &dst_len, wrkmem_ptr);
             break;
     }
-    if (wrkmem_heap) free(wrkmem_heap);
+    if (wrkmem_heap) lzo_cpu_aligned_free(wrkmem_heap);
     if (rc != LZO_E_OK) return rc;
     *out_size = (size_t)dst_len;
     return LZO_E_OK;
