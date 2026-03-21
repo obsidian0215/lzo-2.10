@@ -44,22 +44,22 @@ GPU_CONTROL_SCRIPT = str(REPO_ROOT / "tools" / "gpu_control.sh")
 
 ALGS = ["lzo1x", "lzo1y"]
 CPU_BLOCK_SIZES = ["64K", "1M"]
-GPU_BLOCK_SIZES = ["64K", "128K", "256K"]
+GPU_BLOCK_SIZES = ["32K", "64K"]
 CPU_LEVELS = [14]
-CPU_THREADS = [1, 4, 0]
+CPU_THREADS = [1, 2, 4]
 GPU_LEVELS = [14, 15]
 GPU_LOCAL_SIZES = [1]
-HYBRID_BLOCK_SIZES = ["64K", "128K", "256K"]
+HYBRID_BLOCK_SIZES = ["64K", "256K"]
 HYBRID_LEVELS = [15]
 HYBRID_LOCAL_SIZES = [1]
 HYBRID_GPU_RATIOS = [0.0, 0.3, 0.5, 0.7, 1.0]
-HYBRID_CPU_THREADS = [1, 4, 0]
+HYBRID_CPU_THREADS = [1, 2, 4]
 HYBRID_SPLIT_MODES = ["adaptive"]
 HYBRID_SPLIT_LAYOUTS = ["prefix", "striped"]
 
 # Default frequency configs (for intel iGPU)
 DEFAULT_CPU_FREQ_MHZ = "800,1900,3000,5000"
-DEFAULT_GPU_FREQ_MHZ = "300,1500"
+DEFAULT_GPU_FREQ_MHZ = "500,1000,1500"
 
 BASELINE_IDLE_PKG_W = None
 BASELINE_IDLE_CORE_W = None
@@ -718,18 +718,6 @@ def apply_wall_energy(stats, tel_window, comp_elapsed_s, dec_elapsed_s, energy_s
     cpu_delta_power_w = max(0.0, cpu_ref_power_w - cpu_idle_power_w)
     gpu_delta_power_w = max(0.0, gpu_ref_power_w - gpu_idle_power_w)
 
-    comp_kernel_mbs = float(stats.get('comp_mbs', 0.0) or 0.0)
-    dec_kernel_mbs = float(stats.get('dec_mbs', 0.0) or 0.0)
-    if file_size_mb > 0.0 and comp_kernel_mbs > 0.0:
-        stats['comp_time_s'] = file_size_mb / comp_kernel_mbs
-    if file_size_mb > 0.0 and dec_kernel_mbs > 0.0:
-        stats['dec_time_s'] = file_size_mb / dec_kernel_mbs
-
-    comp_time = float(stats.get('comp_time_s', 0.0) or 0.0)
-    dec_time = float(stats.get('dec_time_s', 0.0) or 0.0)
-    if comp_time <= 0.0 and dec_time <= 0.0:
-        comp_time = elapsed_s
-
     # 兼容现有 CSV 字段：旧 Energy 列改为 Idle/Active Power
     stats['cpu_energy_j'] = cpu_idle_power_w
     stats['gpu_energy_j'] = gpu_idle_power_w
@@ -920,6 +908,24 @@ def parse_stable_bench_output(output):
     return result
 
 
+def apply_total_throughput_from_elapsed(stats, input_bytes, comp_elapsed_s, dec_elapsed_s):
+    in_mb = (float(input_bytes) / (1024.0 * 1024.0)) if input_bytes and input_bytes > 0 else 0.0
+    c_elapsed = float(comp_elapsed_s or 0.0)
+    d_elapsed = float(dec_elapsed_s or 0.0)
+
+    if in_mb > 0.0 and c_elapsed > 0.0:
+        stats['comp_time_s'] = c_elapsed
+        stats['comp_total_mbs'] = in_mb / c_elapsed
+    elif in_mb > 0.0 and float(stats.get('comp_total_mbs', 0.0) or 0.0) > 0.0:
+        stats['comp_time_s'] = in_mb / float(stats['comp_total_mbs'])
+
+    if in_mb > 0.0 and d_elapsed > 0.0:
+        stats['dec_time_s'] = d_elapsed
+        stats['dec_total_mbs'] = in_mb / d_elapsed
+    elif in_mb > 0.0 and float(stats.get('dec_total_mbs', 0.0) or 0.0) > 0.0:
+        stats['dec_time_s'] = in_mb / float(stats['dec_total_mbs'])
+
+
 def parse_adaptive_bench_info(output):
     m = re.search(
         r"Bench\s+Adaptive\s*:\s*gpu_ratio=([0-9]+(?:\.[0-9]+)?)\s*objective=([^\s]+)",
@@ -1075,12 +1081,11 @@ def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=No
                     and file_matches_hash(tmp_dec, expected_hash)
                 )
 
+                apply_total_throughput_from_elapsed(stats, in_sz, comp_elapsed_s, dec_elapsed_s)
+
             finally:
                 safe_remove(tmp_comp)
                 safe_remove(tmp_dec)
-
-            stats['comp_time_s'] = (in_sz / (float(stats.get('comp_mbs', 0.0) or 0.0) * 1024.0 * 1024.0)) if in_sz > 0 and float(stats.get('comp_mbs', 0.0) or 0.0) > 0 else 0.0
-            stats['dec_time_s'] = (in_sz / (float(stats.get('dec_mbs', 0.0) or 0.0) * 1024.0 * 1024.0)) if in_sz > 0 and float(stats.get('dec_mbs', 0.0) or 0.0) > 0 else 0.0
             stats['throughput_semantics'] = 'stable_kernel_bench_with_op_total'
             stats['roundtrip_verified'] = bool(stable['verify_ok']) and (res.returncode == 0) and total_ok
         else:
@@ -1147,9 +1152,9 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                 idle_core_power_w = float(BASELINE_IDLE_CORE_W or idle_pkg_power_w)
                 idle_gpu_power_w = float(BASELINE_IDLE_GPU_W or 0.0)
             else:
-                idle_pkg_power_w = telemetry.measure_idle_pkg_power_w(0.2)
-                idle_core_power_w = telemetry.measure_idle_core_power_w(0.2)
-                idle_gpu_power_w = telemetry.measure_idle_gpu_power_w(0.2)
+                idle_pkg_power_w = telemetry.measure_idle_pkg_power_w(10)
+                idle_core_power_w = telemetry.measure_idle_core_power_w(10)
+                idle_gpu_power_w = telemetry.measure_idle_gpu_power_w(10)
         gpu_dir = str(Path(LZO_GPU_BIN).resolve().parent)
 
         bench_cmd = [
@@ -1172,11 +1177,6 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
             stats['dec_mbs'] = stable['dec_kernel_tp']
             stats['comp_total_mbs'] = stable.get('comp_total_tp', 0.0)
             stats['dec_total_mbs'] = stable.get('dec_total_tp', 0.0)
-            if in_sz > 0:
-                if float(stats.get('comp_total_mbs', 0.0) or 0.0) > 0.0:
-                    stats['comp_time_s'] = in_sz / (float(stats['comp_total_mbs']) * 1024.0 * 1024.0)
-                if float(stats.get('dec_total_mbs', 0.0) or 0.0) > 0.0:
-                    stats['dec_time_s'] = in_sz / (float(stats['dec_total_mbs']) * 1024.0 * 1024.0)
 
             tmp_comp = make_temp_file_path("lzo_gpu_total", ".lzo")
             tmp_dec = f"{tmp_comp}.dec"
@@ -1204,8 +1204,6 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                     sample_path,
                 ])
                 comp_total_res, comp_total_tel = run_command_with_telemetry_cwd(cmd_comp_total, cwd=gpu_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
-                comp_total_output = (comp_total_res.stdout or "") + (comp_total_res.stderr or "")
-                comp_total_parsed = parse_gpu_output(comp_total_output)
 
                 cmd_dec_total = [LZO_GPU_BIN]
                 if use_daemon:
@@ -1217,8 +1215,6 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                     local_tmp_comp,
                 ])
                 dec_total_res, dec_total_tel = run_command_with_telemetry_cwd(cmd_dec_total, cwd=gpu_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
-                dec_total_output = (dec_total_res.stdout or "") + (dec_total_res.stderr or "")
-                dec_total_parsed = parse_gpu_output(dec_total_output)
 
                 comp_elapsed_s = float(comp_total_tel.get('elapsed_s', 0.0) or 0.0)
                 dec_elapsed_s = float(dec_total_tel.get('elapsed_s', 0.0) or 0.0)
@@ -1247,18 +1243,7 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                     and file_matches_hash(tmp_dec, orig_hash)
                 )
 
-                if float(stats.get('comp_total_mbs', 0.0) or 0.0) <= 0.0 and comp_elapsed_s > 0.0:
-                    stats['comp_time_s'] = comp_elapsed_s
-                elif comp_total_parsed.get('inclusive_tp'):
-                    stats['comp_total_mbs'] = comp_total_parsed['inclusive_tp']
-                    if in_sz > 0 and float(stats.get('comp_total_mbs', 0.0) or 0.0) > 0.0:
-                        stats['comp_time_s'] = in_sz / (float(stats['comp_total_mbs']) * 1024.0 * 1024.0)
-                if float(stats.get('dec_total_mbs', 0.0) or 0.0) <= 0.0 and dec_elapsed_s > 0.0:
-                    stats['dec_time_s'] = dec_elapsed_s
-                elif dec_total_parsed.get('inclusive_tp'):
-                    stats['dec_total_mbs'] = dec_total_parsed['inclusive_tp']
-                    if in_sz > 0 and float(stats.get('dec_total_mbs', 0.0) or 0.0) > 0.0:
-                        stats['dec_time_s'] = in_sz / (float(stats['dec_total_mbs']) * 1024.0 * 1024.0)
+                apply_total_throughput_from_elapsed(stats, in_sz, comp_elapsed_s, dec_elapsed_s)
             finally:
                 if local_tmp_comp:
                     safe_remove(local_tmp_comp)
@@ -1352,9 +1337,9 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_
                 idle_core_power_w = float(BASELINE_IDLE_CORE_W or idle_pkg_power_w)
                 idle_gpu_power_w = float(BASELINE_IDLE_GPU_W or 0.0)
             else:
-                idle_pkg_power_w = telemetry.measure_idle_pkg_power_w(0.2)
-                idle_core_power_w = telemetry.measure_idle_core_power_w(0.2)
-                idle_gpu_power_w = telemetry.measure_idle_gpu_power_w(0.2)
+                idle_pkg_power_w = telemetry.measure_idle_pkg_power_w(5)
+                idle_core_power_w = telemetry.measure_idle_core_power_w(5)
+                idle_gpu_power_w = telemetry.measure_idle_gpu_power_w(5)
         hybrid_dir = str(Path(LZO_HYBRID_BIN).resolve().parent)
 
         bench_cmd = [
@@ -1385,11 +1370,6 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_
             if adaptive_info:
                 stats['adaptive_gpu_ratio'] = adaptive_info['gpu_ratio']
                 stats['adaptive_objective'] = adaptive_info['objective']
-            if in_sz > 0:
-                if float(stats.get('comp_total_mbs', 0.0) or 0.0) > 0.0:
-                    stats['comp_time_s'] = in_sz / (float(stats['comp_total_mbs']) * 1024.0 * 1024.0)
-                if float(stats.get('dec_total_mbs', 0.0) or 0.0) > 0.0:
-                    stats['dec_time_s'] = in_sz / (float(stats['dec_total_mbs']) * 1024.0 * 1024.0)
             total_ok = False
             total_tel = {}
             tmp_comp = make_temp_file_path("lzo_hybrid_verify_tmp", ".lzo")
@@ -1427,10 +1407,7 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_
 
                 comp_elapsed_s = float(comp_total_tel.get('elapsed_s', 0.0) or 0.0)
                 dec_elapsed_s = float(dec_total_tel.get('elapsed_s', 0.0) or 0.0)
-                if float(stats.get('comp_total_mbs', 0.0) or 0.0) <= 0.0 and comp_elapsed_s > 0.0:
-                    stats['comp_time_s'] = comp_elapsed_s
-                if float(stats.get('dec_total_mbs', 0.0) or 0.0) <= 0.0 and dec_elapsed_s > 0.0:
-                    stats['dec_time_s'] = dec_elapsed_s
+                apply_total_throughput_from_elapsed(stats, in_sz, comp_elapsed_s, dec_elapsed_s)
                 total_ok = (
                     comp_total_res.returncode == 0
                     and dec_total_res.returncode == 0
@@ -1607,10 +1584,10 @@ def main():
     telemetry = None if args.no_telemetry else TelemetryProbe()
     if telemetry is not None:
         print(f"Telemetry sources: {telemetry.describe_sources()}")
-        print("[TelemetryBaseline] measuring idle for 60s (one-time)...")
-        BASELINE_IDLE_PKG_W = telemetry.measure_idle_pkg_power_w(20.0)
-        BASELINE_IDLE_CORE_W = telemetry.measure_idle_core_power_w(20.0)
-        BASELINE_IDLE_GPU_W = telemetry.measure_idle_gpu_power_w(20.0)
+        print("[TelemetryBaseline] measuring idle for 10s (one-time)...")
+        BASELINE_IDLE_PKG_W = telemetry.measure_idle_pkg_power_w(10.0)
+        BASELINE_IDLE_CORE_W = telemetry.measure_idle_core_power_w(10.0)
+        BASELINE_IDLE_GPU_W = telemetry.measure_idle_gpu_power_w(10.0)
         print(
             "[TelemetryBaseline] "
             f"cpu_pkg_idle={BASELINE_IDLE_PKG_W:.3f}W "

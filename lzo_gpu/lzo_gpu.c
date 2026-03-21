@@ -115,35 +115,104 @@ static cl_device_type preferred_opencl_device_type(void)
     return CL_DEVICE_TYPE_GPU;
 }
 
+static cl_int lzo_try_get_device(cl_platform_id *platforms, cl_uint num_platforms, cl_device_type dtype, cl_device_id *out_dev, cl_platform_id *out_pf)
+{
+    for (cl_uint pi = 0; pi < num_platforms; pi++) {
+        cl_device_id tmp_dev = NULL;
+        cl_int r = clGetDeviceIDs(platforms[pi], dtype, 1, &tmp_dev, NULL);
+        if (r == CL_SUCCESS && tmp_dev != NULL) {
+            *out_dev = tmp_dev;
+            *out_pf = platforms[pi];
+            return CL_SUCCESS;
+        }
+    }
+    return CL_DEVICE_NOT_FOUND;
+}
+
 static void ocl_init(void)
 {
     uint64_t t1 = now_ns();
     cl_int err;
-    cl_platform_id pf = NULL;
     cl_device_type pref_type = preferred_opencl_device_type();
-    err = clGetPlatformIDs(1, &pf, NULL);
-    if (err != CL_SUCCESS || pf == NULL) {
+
+    cl_uint num_platforms = 0;
+    err = clGetPlatformIDs(0, NULL, &num_platforms);
+    if (err != CL_SUCCESS || num_platforms == 0) {
         fprintf(stderr, "OpenCL init failed: clGetPlatformIDs err=%d\n", err);
         ctx = NULL;
         q = NULL;
         return;
     }
 
-    err = clGetDeviceIDs(pf, pref_type, 1, &dev, NULL);
-    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_GPU) {
-        err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_GPU, 1, &dev, NULL);
-    }
-    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_DEFAULT) {
-        err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_DEFAULT, 1, &dev, NULL);
-    }
-    if (err != CL_SUCCESS && pref_type != CL_DEVICE_TYPE_ALL) {
-        err = clGetDeviceIDs(pf, CL_DEVICE_TYPE_ALL, 1, &dev, NULL);
-    }
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "OpenCL init failed: clGetDeviceIDs err=%d\n", err);
+    cl_platform_id* platforms = (cl_platform_id*)malloc(num_platforms * sizeof(cl_platform_id));
+    if (!platforms) {
+        fprintf(stderr, "OpenCL init failed: malloc platforms\n");
         ctx = NULL;
         q = NULL;
         return;
+    }
+
+    err = clGetPlatformIDs(num_platforms, platforms, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "OpenCL init failed: clGetPlatformIDs err=%d\n", err);
+        free(platforms);
+        ctx = NULL;
+        q = NULL;
+        return;
+    }
+
+    dev = NULL;
+    cl_platform_id selected_pf = NULL;
+
+    cl_int r = CL_DEVICE_NOT_FOUND;
+    if (pref_type == CL_DEVICE_TYPE_GPU) {
+        r = lzo_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_GPU, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lzo_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_DEFAULT, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lzo_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lzo_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_CPU, &dev, &selected_pf);
+    } else if (pref_type == CL_DEVICE_TYPE_CPU) {
+        r = lzo_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_CPU, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lzo_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_DEFAULT, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lzo_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lzo_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_GPU, &dev, &selected_pf);
+    } else if (pref_type == CL_DEVICE_TYPE_DEFAULT) {
+        r = lzo_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_DEFAULT, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lzo_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_GPU, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lzo_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_CPU, &dev, &selected_pf);
+        if (r != CL_SUCCESS) r = lzo_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, &dev, &selected_pf);
+    } else { /* CL_DEVICE_TYPE_ALL */
+        r = lzo_try_get_device(platforms, num_platforms, CL_DEVICE_TYPE_ALL, &dev, &selected_pf);
+    }
+
+    free(platforms);
+
+    if (dev == NULL) {
+        fprintf(stderr, "OpenCL init failed: clGetDeviceIDs failed for all type/plat combos\n");
+        ctx = NULL;
+        q = NULL;
+        return;
+    }
+
+    if (dev == NULL) {
+        fprintf(stderr, "OpenCL init failed: clGetDeviceIDs failed for all type/plat combos\n");
+        ctx = NULL;
+        q = NULL;
+        return;
+    }
+
+    {
+        char pfname[256] = {0};
+        char devname[256] = {0};
+        cl_device_type devtype = 0;
+        clGetPlatformInfo(selected_pf, CL_PLATFORM_NAME, sizeof(pfname), pfname, NULL);
+        clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(devname), devname, NULL);
+        clGetDeviceInfo(dev, CL_DEVICE_TYPE, sizeof(devtype), &devtype, NULL);
+        fprintf(stderr, "[OpenCL DEBUG] Selected platform=%s, device=%s (type=%s)\n",
+                pfname,
+                devname,
+                (devtype & CL_DEVICE_TYPE_GPU) ? "GPU" :
+                (devtype & CL_DEVICE_TYPE_CPU) ? "CPU" :
+                (devtype & CL_DEVICE_TYPE_DEFAULT) ? "DEFAULT" : "UNKNOWN");
     }
 
     ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, &err);
@@ -221,7 +290,7 @@ static inline void show_help(char *prog_name)
     fprintf(stderr, "  -o, --output FILE    Output file (use '-' for stdout)\n");
     fprintf(stderr, "  -a, --alg ALG        Algorithm (lzo1x, lzo1y) (default: lzo1x)\n");
     fprintf(stderr, "  -L, --level LEVEL    Compression level: 11-15=D_BITS (default: 14), 99=enhanced greedy, 999=optimal (SWD)\n");
-    fprintf(stderr, "  -B, --block-size N   Block size (B/KB/MB) (default: 16KB)\n");
+    fprintf(stderr, "  -B, --block-size N   Block size (B/KB/MB) (default: 64KB)\n");
     fprintf(stderr, "  -v, --verbose        Enable performance statistics\n");
     fprintf(stderr, "  --local N            Local work-group size (default: 1)\n");
     fprintf(stderr, "  --bench [N]          Stable benchmark (compress+decompress+verify), optional N seconds (default: 3)\n");
@@ -504,7 +573,8 @@ static int run_lzo_bench(const char *in_path,
     if (err != CL_SUCCESS || !pack_krn) pack_krn = NULL;
 
     char decomp_base[64];
-    if (debug_counters)
+    /* For 99/999 we don't have debug-specific decompressor sources, use base algorithm name. */
+    if (debug_counters && comp_level != 999 && comp_level != 99)
         snprintf(decomp_base, sizeof(decomp_base), "%s_debug", alg_name);
     else
         snprintf(decomp_base, sizeof(decomp_base), "%s", alg_name);
@@ -589,6 +659,8 @@ static int run_lzo_bench(const char *in_path,
     int bench_dec_kernel_set = 0;
     /* Cached decompression dispatch sizes */
     size_t bench_dec_global = 0, bench_dec_local = 0;
+    /* Track decompression parameters to reset kernel args when data shape changes. */
+    size_t bench_dec_prev_nblk = 0, bench_dec_prev_blk = 0, bench_dec_prev_in_size = 0;
 
     while (verify_ok) {
         timing_t tc = {0};
@@ -647,7 +719,6 @@ static int run_lzo_bench(const char *in_path,
         }
         memcpy(bench_h_lens, map_len, nblk * sizeof(cl_uint));
         clEnqueueUnmapMemObject(q, ws.d_len, map_len, 0, NULL, NULL);
-        clFinish(q);
 
         for (size_t i = 0; i < nblk; ++i) {
             if ((size_t)bench_h_lens[i] > worst_blk) {
@@ -693,14 +764,22 @@ static int run_lzo_bench(const char *in_path,
             bench_dec_kernel_set = 0;
         }
 
-        err  = clEnqueueWriteBuffer(q, bench_d_off, CL_FALSE, 0, nblk * sizeof(cl_uint), bench_h_off, 0, NULL, NULL);
-        err |= clEnqueueWriteBuffer(q, bench_d_comp_lens, CL_FALSE, 0, nblk * sizeof(cl_uint), bench_h_lens, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
+        cl_event write_events[2] = { NULL, NULL };
+        cl_int err_w0 = clEnqueueWriteBuffer(q, bench_d_off, CL_FALSE, 0, nblk * sizeof(cl_uint), bench_h_off, 0, NULL, &write_events[0]);
+        cl_int err_w1 = clEnqueueWriteBuffer(q, bench_d_comp_lens, CL_FALSE, 0, nblk * sizeof(cl_uint), bench_h_lens, 0, NULL, &write_events[1]);
+        if (err_w0 != CL_SUCCESS || err_w1 != CL_SUCCESS) {
+            if (write_events[0]) clReleaseEvent(write_events[0]);
+            if (write_events[1]) clReleaseEvent(write_events[1]);
             verify_ok = 0;
             goto iter_cleanup;
         }
 
-        /* Set kernel args only when buffers changed (first iter or resize) */
+        /* Force kernel arg reset when compression parameters changed between iterations. */
+        if (bench_dec_kernel_set && (bench_dec_prev_nblk != nblk || bench_dec_prev_blk != blk || bench_dec_prev_in_size != in_size)) {
+            bench_dec_kernel_set = 0;
+        }
+
+        /* Set kernel args only when buffers changed (first iter or resize), or parameters changed. */
         if (!bench_dec_kernel_set) {
             cl_uint blk_sz = (cl_uint)blk;
             cl_uint orig_sz = (cl_uint)in_size;
@@ -750,15 +829,22 @@ static int run_lzo_bench(const char *in_path,
             bench_dec_global = ((target_items + bench_dec_local - 1) / bench_dec_local) * bench_dec_local;
             if (bench_dec_global == 0) bench_dec_global = 1;
 
+            bench_dec_prev_nblk = nblk;
+            bench_dec_prev_blk = blk;
+            bench_dec_prev_in_size = in_size;
             bench_dec_kernel_set = 1;
         }
 
-        /* Ensure uploads complete before kernel launch */
-        clFinish(q);
-
         uint64_t td0 = now_ns();
-        err = clEnqueueNDRangeKernel(q, krn_d, 1, NULL, &bench_dec_global, &bench_dec_local, 0, NULL, NULL);
-        if (err == CL_SUCCESS) clFinish(q);
+        cl_event dec_kernel_evt = NULL;
+        err = clEnqueueNDRangeKernel(q, krn_d, 1, NULL, &bench_dec_global, &bench_dec_local, 2, write_events, &dec_kernel_evt);
+        if (write_events[0]) clReleaseEvent(write_events[0]);
+        if (write_events[1]) clReleaseEvent(write_events[1]);
+        if (err == CL_SUCCESS && dec_kernel_evt) {
+            clWaitForEvents(1, &dec_kernel_evt);
+            clReleaseEvent(dec_kernel_evt);
+            dec_kernel_evt = NULL;
+        }
         uint64_t td1 = now_ns();
         dec_kernel_us = (double)(td1 - td0) / 1000.0;
         if (err != CL_SUCCESS) {
@@ -795,6 +881,7 @@ static int run_lzo_bench(const char *in_path,
             out_total += (size_t)bench_h_out_lens[i];
         }
         if (!verify_ok || out_total != in_size) {
+            fprintf(stderr, "[BENCH] level=%d nblk=%zu in_size=%zu out_total=%zu\n", comp_level, nblk, in_size, out_total);
             verify_ok = 0;
             goto iter_cleanup;
         }
@@ -805,10 +892,19 @@ static int run_lzo_bench(const char *in_path,
             goto iter_cleanup;
         }
         if (memcmp(map_dec, input_ref, in_size) != 0) {
+            fprintf(stderr, "[BENCH] content mismatch level=%d nblk=%zu in_size=%zu\n", comp_level, nblk, in_size);
+            size_t mpos = 0;
+            unsigned char* mdata = (unsigned char*)map_dec;
+            for (size_t i = 0; i < in_size; ++i) {
+                if (mdata[i] != input_ref[i]) {
+                    mpos = i;
+                    break;
+                }
+            }
+            fprintf(stderr, "[BENCH] first mismatch at offset %zu: got %02x expected %02x\n", mpos, mdata[mpos], input_ref[mpos]);
             verify_ok = 0;
         }
         clEnqueueUnmapMemObject(q, bench_d_out, map_dec, 0, NULL, NULL);
-        clFinish(q);
         uint64_t dec_total_end = now_ns();
         double dec_total_us = (double)(dec_total_end - dec_total_start) / 1000.0;
         if (!verify_ok) {

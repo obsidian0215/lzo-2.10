@@ -208,10 +208,7 @@ static int lzo_zero_buffer(cl_command_queue queue, cl_mem buf, size_t bytes) {
     {
         static const cl_uint zero = 0;
         cl_int ferr = clEnqueueFillBuffer(queue, buf, &zero, sizeof(zero), 0, bytes, 0, NULL, NULL);
-        if (ferr == CL_SUCCESS) {
-            (void)clFinish(queue);
-            return 0;
-        }
+        if (ferr == CL_SUCCESS) return 0;
     }
 #endif
     {
@@ -221,7 +218,6 @@ static int lzo_zero_buffer(cl_command_queue queue, cl_mem buf, size_t bytes) {
         memset(mapped, 0, bytes);
         err = clEnqueueUnmapMemObject(queue, buf, mapped, 0, NULL, NULL);
         if (err != CL_SUCCESS) return -1;
-        (void)clFinish(queue);
     }
     return 0;
 }
@@ -232,10 +228,7 @@ static int lzo_zero_buffer_range(cl_command_queue queue, cl_mem buf, size_t offs
     {
         static const cl_uint zero = 0;
         cl_int ferr = clEnqueueFillBuffer(queue, buf, &zero, sizeof(zero), offset, bytes, 0, NULL, NULL);
-        if (ferr == CL_SUCCESS) {
-            (void)clFinish(queue);
-            return 0;
-        }
+        if (ferr == CL_SUCCESS) return 0;
     }
 #endif
     {
@@ -245,7 +238,6 @@ static int lzo_zero_buffer_range(cl_command_queue queue, cl_mem buf, size_t offs
         memset(mapped, 0, bytes);
         err = clEnqueueUnmapMemObject(queue, buf, mapped, 0, NULL, NULL);
         if (err != CL_SUCCESS) return -1;
-        (void)clFinish(queue);
     }
     return 0;
 }
@@ -308,7 +300,6 @@ static int lzo_read_buffer_auto(cl_command_queue queue, cl_mem buf, void* dst, s
         memcpy(dst, mapped, bytes);
         err = clEnqueueUnmapMemObject(queue, buf, mapped, 0, NULL, NULL);
         if (err != CL_SUCCESS) return -1;
-        clFinish(queue);
         return 0;
     }
 

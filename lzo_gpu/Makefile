@@ -70,6 +70,10 @@ precompile-combos: $(PRECOMPILE_HELPER)
 			echo "Building $${alg}_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits})..."; \
 			./$(PRECOMPILE_HELPER) $${alg}.cl $${alg}_$${bits}.clbin "-I. -D D_BITS=$${bits}" || exit 1; \
 		done; \
+		for bits in 99 999; do \
+			echo "Building $${alg}_$${bits}.clbin from $${alg}_$${bits}.cl..."; \
+			./$(PRECOMPILE_HELPER) $${alg}_$${bits}.cl $${alg}_$${bits}.clbin "-I." || exit 1; \
+		done; \
 	done
 
 precompile-all: precompile-combos
