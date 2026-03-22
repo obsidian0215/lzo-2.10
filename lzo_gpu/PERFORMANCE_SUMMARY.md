@@ -1,692 +1,757 @@
-# LZO GPU 实现：设计、优化与性能分析
+# LZO GPU 性能总结（Intel + Nvidia）
 
-更新时间：2026-03-18
-
-## Intel 平台（保留原文）
-
-以下原有内容作为 Intel Core + Iris Xe 平台的保留章节；Windows + NVIDIA 的结果在文末单独补充。
-
-### 2026-03-18 状态修正（当前 live implementation）
-
-当前 Intel 版 `lzo_gpu` 的正式描述需要基于已经重新验证并保留的 live code，而不是把中间试验态实现混入主叙述：
-
-1. **OpenCL 平台选择逻辑已修正**：默认优先选中 Intel Graphics 平台，避免错误落到 Intel CPU OpenCL，且支持 `FORCE_OPENCL_PLATFORM` 覆盖。
-2. **GPU verify / parity 路径已恢复稳定**：此前出现过 verify failed 的阶段性问题，当前已修复，不应再把它写成设计特征。
-3. **当前唯一继续保留的新增实现改动是 `dict-tail-zero-on-growth`**；其价值在于保证 grow-only 工作区在多轮运行中的稳定性和可重复性。
-4. **新的全量验证正在后台重跑**，包含默认 CPU/GPU 频率扫描；实验统计必须等待新 artifact 完成后再最终写入结果章节。
+> 更新时间：2026-03-22
+> 代码路径：`/root/lzo-2.10/lzo_gpu`
+> 当前二进制：`/root/lzo-2.10/lzo_gpu/lzo_gpu`
+> 当前哈希：`sha256=f770e2caaa5a41205d81d5fd8c290ade3e200f7e040f092eb6249f71154ccf02`
+> 基线二进制：`/root/lzo-2.10/exp_results/baselines/lzo_gpu_baseline_before_nonio_hostopt`
+> 基线哈希：`sha256=f770e2caaa5a41205d81d5fd8c290ade3e200f7e040f092eb6249f71154ccf02`
 
 ---
 
-## 1. 项目概述
+## Intel 平台（五章重构版）
 
-`lzo_gpu` 是基于 OpenCL 的 LZO 压缩/解压实现，目标是在 GPU 上实现超越 CPU 单线程及多线程（≤2 线程）的吞吐量，同时保持与 CPU 实现一致的压缩率。支持 lzo1x 和 lzo1y 两种算法。
+### 1. 设计动机
 
-### 1.1 硬件平台
+当前 LZO Intel 路线的核心不是“继续堆实验”，而是把已有实现收敛成可部署、可解释、可复现的体系。
 
-| 组件 | 规格 |
-|------|------|
-| CPU | 13th Gen Intel Core i7-1370P |
-| GPU | Intel Iris Xe Graphics (Gen12 LP), 96 EUs, 7 threads/EU, 64KB SLM |
-| GPU 最大频率 | 1500 MHz |
-| 内存架构 | 共享内存 (iGPU)，零拷贝可用 |
-| OpenCL | 3.0 NEO Driver |
-| 能耗遥测 | Intel RAPL: `cpu=rapl:package-0`, `gpu=rapl:uncore` |
+#### 1.1 目标
 
-### 1.2 设计目标与核心发现
+1. **GPU vs CPU 必须同口径比较**：同时报告 kernel 与 total。
+2. **压缩率必须并列报告**：吞吐提升不能脱离 ratio 成本。
+3. **功耗与吞吐一体化分析**：必须给出 MB/s/W 与 J/GB。
+4. **实现与实验闭环**：每个结论都能映射到函数/内核。
+5. **历史候选分账**：采纳与回退必须分开。
 
-1. **吞吐量优先**：内核吞吐量和端到端总吞吐量均需超越 CPU（至少在 1-2 线程下）
-2. **压缩率不退化**：与 CPU 实现保持一致的压缩率
-3. **能效优势**：GPU 在内核执行期间的能耗应优于 CPU
-4. **频率不敏感性**：在 Intel iGPU 架构下，吞吐量对执行单元（EU）频率不敏感，这为极致能效优化提供了空间（详见 §5.4）
+#### 1.2 为什么需要重构文档
 
----
+- 旧文档存在历史阶段信息与当前主线混写；
+- 旧结构难以快速回答“哪段代码带来了什么收益”；
+- GPU/CPU 对比存在“只看局部指标”的误读风险。
 
-## 2. 整体架构
+#### 1.3 当前基线状态
 
-### 2.1 系统组件
-
-```
-lzo_gpu/
-├── lzo_gpu.c              主入口：CLI 解析、standalone 压缩/解压、bench 模式
-├── lzo_gpu_core.c         核心主机端逻辑：OpenCL buffer 管理、块分割、数据传输、内核调度
-├── lzo_gpu_core.h         核心接口：workspace、参数结构体、compress/decompress_core API
-├── lzo_gpu_utils.c        OpenCL 工具：程序加载、clbin 缓存、自适应块大小选择、autotune
-├── lzo_gpu_daemon.c       Daemon 模式：长驻进程，OpenCL 初始化一次，通过 Unix socket 服务
-├── lzo_gpu_client.c       Client 模式：向 daemon 发送压缩/解压请求
-├── lzo_gpu_protocol.h     Daemon 通信协议定义
-├── lzo_defaults.h         默认参数：块大小、D_BITS、对齐、work-group 大小等
-├── lzo_gpu.h              共享类型定义（主机与内核共用）
-├── lzo1x.cl               lzo1x 算法 OpenCL 内核（压缩+解压）
-├── lzo1y.cl               lzo1y 算法 OpenCL 内核（压缩+解压）
-├── build_kernel.c         内核编译与 clbin 缓存管理
-└── timing.h               高精度计时工具
-```
-
-### 2.2 数据流
-
-```
-输入文件 → 分块 → [零拷贝/标准拷贝] → GPU 全局内存
-                                           ↓
-                                    压缩/解压内核（每 work-item 处理一个块）
-                                           ↓
-                              结果读回 → 组装输出 → 写入文件
-```
-
-**压缩流程**：
-1. 读取输入文件到内存（或零拷贝映射）
-2. `choose_block_size()` 自适应确定块大小（考虑文件大小、熵、EU 数量）
-3. 分块上传到 GPU 全局内存
-4. 分配字典缓冲区（每 work-item 独立字典）
-5. 启动压缩内核（每 work-item 独立处理一个块）
-6. 读回压缩结果和长度
-7. 组装 LZO 格式输出（magic + header + packed blocks）
-
-**解压流程**：
-1. 解析 LZO 文件头（magic、原始大小、块大小、块数量、长度表）
-2. 打包压缩数据到连续缓冲区
-3. 上传压缩数据 + 偏移表
-4. 启动解压内核（每 work-item 独立解压一个块）
-5. 读回解压结果
-
-### 2.3 运行模式
-
-| 模式 | 说明 | OpenCL 初始化 |
-|------|------|---------------|
-| Standalone | 单次压缩/解压，进程退出 | 每次启动初始化 |
-| Daemon | 长驻进程，监听 Unix socket | 初始化一次，复用 |
-| Client | 向 daemon 发请求 | 不初始化，复用 daemon |
-| Bench | 性能测试模式，反复运行内核 | 初始化一次 |
-
-### 2.4 I/O 模式
-
-| 模式 | 机制 | 适用场景 |
-|------|------|----------|
-| 零拷贝 (默认) | `CL_MEM_ALLOC_HOST_PTR` + `fread` 直接写入映射指针 | iGPU 共享内存 |
-| 标准拷贝 | 主机 buffer → `clEnqueueWriteBuffer` → 设备 buffer | dGPU / PCIe |
+- 当前与基线哈希一致（见页首证据），说明当前处于“回退后稳定态”；
+- 该状态适合用于重新建立 Intel 主章节的标准表达。
 
 ---
 
-## 3. GPU 内核内部架构
+### 2. 系统架构
 
-### 3.1 压缩内核 (`lzo1x_block_compress` / `lzo1y_block_compress`)
+> 本节包含组件图解与压缩/解压过程详解。
 
-每个 OpenCL work-item 独立处理一个数据块，核心组件及其深度设计如下：
+#### 2.1 组件清单
 
-#### 3.1.1 字典系统
-
-**32-bit 紧凑字典**（当前实现）：
-- **设计动机**：原始实现使用 64-bit 条目，导致 D_BITS=14 时每 WI 字典占用 128KB。在 Intel iGPU 等共享内存架构下，这不仅消耗大量内存，还因缓存行利用率低限制了全局内存带宽。
-- **结构设计**：每个字典条目压缩至 4 字节：`epoch_12 | offset_20`。
-    - **12-bit Epoch (4095 max)**：相比 LZ4 的 8-bit epoch (255 max)，LZO 需要更宽的 epoch 空间。这是因为单个 LZO WI 在一个 session 中可能处理更多的块或更长的数据序列，更宽的 epoch 能更安全地避免历史脏数据干扰，完全替代耗时的字典清零操作。
-    - **20-bit Offset**：足以覆盖 `M4_MAX_OFFSET = 49151` 且留有充足余量。相比 LZ4 使用 16-bit 索引覆盖 64KB，LZO 的 20-bit 设计为更大块的处理预留了扩展性。
-- **内存占用分析**：D_BITS=14 时，每 WI 字典占 16K entries × 4B = 64KB。这与高性能 LZ4 实现（HL=14）的内存足迹保持一致，在平衡冲突率与内存压力方面达到最优。
-
-```c
-#define DICT_EPOCH_SHIFT 20
-#define DICT_OFF_MASK    0x000FFFFFu
-
-static inline void dict_store32(__global uint* dict, uint idx, uint offset, uint epoch) {
-    dict[idx] = ((epoch & 0xFFFu) << DICT_EPOCH_SHIFT) | (offset & DICT_OFF_MASK);
-}
-static inline uint dict_load32(__global const uint* dict, uint idx, uint epoch, uint* valid) {
-    uint entry = dict[idx];
-    *valid = (((entry >> DICT_EPOCH_SHIFT) & 0xFFFu) == (epoch & 0xFFFu));
-    return entry & DICT_OFF_MASK;
-}
-```
-
-#### 3.1.2 哈希探测与延迟写入
-
-**哈希函数设计**：
-LZO 采用了比 LZ4 更复杂的 `lzo1x_hash32()` 多步混合哈希：
-```c
-dv ^= dv >> 7;
-dv ^= dv >> 3;
-dv *= 0x9E3779B1u; // Knuth's multiplicative hash
-dv ^= dv >> 16;
-```
-- **设计理由**：LZO 的 4 位置批量探测对哈希分布质量高度敏感。相比 LZ4 的单次乘法哈希，这种多步混合能显著减少哈希冲突，提升字典条目的质量。
-- **向量化计算**：利用 OpenCL `uint4` 类型，同时计算 4 个连续位置的哈希值。这种 SIMD 风格的计算充分利用了 GPU 的算术流水线。
-
-**4 位置批量探测与延迟写入 (Deferred Store)**：
-- **实现细节**：一次性读取 4 个字典条目 -> 同时检查 4 个位置的匹配情况 -> 选出最佳匹配 -> **最后**批量写回 4 个位置的字典更新。
-- **设计动机**：分离读和写相位。GPU 内存控制器（尤其是 Intel Xe 架构）对纯读或纯写序列的调度效率远高于交替读写。
-- **性能分析**：在 Intel Xe iGPU 上，L3 缓存作为共享一致性域，频繁的读写切换会导致缓存行状态频繁迁移。延迟写入模式减少了这种开销，使内存带宽利用率提升约 2-3%。
-
-#### 3.1.3 匹配编码
-
-遵循 LZO 标准编码格式，通过精确的位字段映射实现：
-- **M2**：匹配长度 3-8，偏移 1-1024。
-- **M3**：匹配长度 3-33，偏移 1-16384。
-- **M4**：匹配长度 3+，偏移 16384-49151。
-- **实现方案**：使用分支预测友好的逻辑或 `select` 谓词来分发编码逻辑，减少 SIMD 发散。
-
-#### 3.1.4 Match 扩展与循环展开
-
-**2x 循环展开策略**：
-- **技术实现**：在匹配长度扩展热路径中启用 `LZO_USE_UNROLL2 = 1`。
-- **64-bit 比较加速**：使用 `*(ulong*)s1 ^ *(ulong*)s2` 一次比较 8 字节，配合硬件指令 `ctz()` (Count Trailing Zeros) 精确计算匹配字节数。
-- **设计权衡**：LZO 从 LSB 开始计数 (ctz)，而 LZ4 通常从 MSB 开始 (clz)。2x 展开意味着每轮迭代处理 16 字节，相较于单轮 8 字节，循环控制开销降低了 50%，指令级并行度 (ILP) 显著提升。
-- **分析**：这是内核中仅次于哈希查找的第二热路径，展开带来的吞吐量提升直接反映在最终性能中。
-
-### 3.2 解压内核 (`lzo1x_block_decompress` / `lzo1y_block_decompress`)
-
-#### 3.2.1 命令解析
-
-逐字节解析控制流。由于 LZO 编码的复杂性（多种变体长度编码），此部分主要依靠高效的状态机实现。
-
-#### 3.2.2 向量化拷贝
-
-**多策略匹配拷贝 (`COPY_MATCH`)**：
-针对不同 offset 采用特定的 SIMD 广播模式：
-- `offset == 1`：RLE 模式，使用 `uchar16` 广播单字节填充。
-- `offset == 2`：交替模式（如 `ABAB...`），广播 2 字节模式。
-- `offset == 4`：4 字节广播。
-- `offset >= 64/32/16/8`：逐级降级的向量宽度拷贝。
-- **设计动机**：重叠匹配（Overlapping Match）是 LZO 解压的难点。通过识别这些特殊 offset，可以使用向量化指令安全且高效地处理 RLE 等高频场景。
-
-#### 3.2.3 匹配拷贝优化
-
-- **非重叠快路径**：关键分析显示，在典型数据集中，约 80-95% 的匹配是非重叠的 (`match_offset >= match_length`)。
-- **方案**：针对此场景跳过逐字节安全检查，直接使用最高宽度的向量化 `COPYN_FAST`。这是解压内核达到 15GB/s+ 吞吐量的核心原因。
-
-### 3.3 lzo1x vs lzo1y 差异
-
-- **位域定义**：lzo1x 的 `D_BITS` 参数直接控制字典哈希位数，而 lzo1y 在 M2/M3/M4 的编码阈值上略有不同，允许在特定偏移范围内获得更好的压缩比。
-- **共性架构**：两者在 GPU 端的实现完全共享同一套内核骨架、优化策略（32-bit 字典、向量化拷贝等）和调度参数。这种对称性确保了两种变体都能在 GPU 上获得一致的加速比。
-
----
-
-## 4. 设计演进历史
-
-### 4.1 时间线
-
-基于 git 提交历史，按时间顺序列出关键设计变更：
-
-| 日期 | 提交 | 变更 |
-|------|------|------|
-| 2025-10-28 | `177d630` | 初始 lzo_gpu 和 lzo_cpu 实现 |
-| 2025-11-12 | `aa01cc3` | CLI 重构 |
-| 2025-11-19 | `0f458f4` | 重构 lzo_gpu，添加参数扫描脚本 |
-| 2025-11-19 | `ee6d4ef` | 移除 delayed store 和 usehost 模式 |
-| 2025-11-21 | `3fbab57` | 移除 atomic 操作，避免 usehost |
-| 2025-11-23 | `a2d2ed2` | 添加 Daemon 模式，GPU 优化 |
-| 2025-11-24 | `9647cb3` | 优化 lzo1x 压缩/解压，自适应块大小选择 |
-| 2025-11-25 | `491405c` | 修复 daemon 压缩，实现全路径零拷贝 |
-| 2025-11-25 | `80ecbf1` | Standalone 模式独立化 |
-| 2025-11-25 | `24fbdae` | 添加多线程 I/O |
-| 2025-12-02 | `10ede4c` | 实现 wildcopy / timing，新增 benchmark 脚本 |
-| 2025-12-05 | `b53f086` | 修复向量化解压 |
-| 2025-12-05 | `4a38696` | 修复并对比 lzo_gpu 与 lzo_cpu |
-| 2025-12-07 | `824ee11` | 首次微基准测试 GPU vs CPU |
-| 2025-12-11 | `9f99457` | 计时精度修正 |
-| 2025-12-20 | `7096f89` | 添加 lzo1y 支持，哈希表可配置化 |
-| 2025-12-25 | `6118a51` | 架构重构：拆分 lzo_gpu_io/lzo_gpu_core，重写 standalone/daemon，实现解压零拷贝上传，添加 --level 和 --kernel-opt |
-| 2026-01-14 | `99d8472` | 主机端与内核性能优化 |
-| 2026-01-23 | `5019c3f` | 完成一个完整版本 |
-| 2026-02-13 | `e0db950` | 确定 benchmark 语义，编写性能总结 |
-| 2026-02-24 | `adf15e1` | 压缩路径优化基线快照 |
-| 2026-02-25 | `006dde8` | 压缩匹配搜索探测向量宽度缩减 |
-| 2026-02-26 | `0a2d593` | 解压匹配拷贝添加非重叠快路径 |
-| 2026-02-26 | `321f9c1` | 解压拷贝热路径精简 |
-| 2026-02-28 | `dd89965` | 启用 unroll2，增强 OpenCL 初始化鲁棒性 |
-| 2026-03-05 | `b8a6533` | 内核与工具链改进 |
-| 2026-03-05 | (未提交) | 32-bit 字典、延迟写入、主机端 bench 循环优化、总吞吐量测量 |
-
-### 4.2 关键架构决策
-
-**早期探索与淘汰（2025-11）**：
-- **Atomic 操作**：尝试使用 GPU atomic 进行输出同步 → 性能差，移除
-- **UseHost 模式**：`CL_MEM_USE_HOST_PTR` → 在 iGPU 上无优势，移除
-- **Delayed Store**：早期延迟字典写入实验 → 当时移除（后以不同形式重新引入）
-
-**架构稳定化（2025-12）**：
-- 确立「每 work-item 处理一个块」的并行模型
-- 实现自适应块大小选择（基于文件大小、熵、EU 数量）
-- 向量化解压拷贝路径
-
-**性能优化阶段（2026-02 ~ 03）**：
-- 匹配搜索路径优化（探测宽度调整、循环展开）
-- 解压路径优化（非重叠快路径、拷贝热路径精简）
-- OpenCL 调度参数调优（WI_PER_CU 提升至 384）
-
----
-
-## 5. 优化实现详述
-
-### 5.1 内核端优化
-
-#### 5.1.1 32-bit 紧凑字典（+15.3% 压缩吞吐量）
-
-- **技术细节**：将 64-bit 字典条目（`epoch_32 | entry_32`）优化为 32-bit（`epoch_12 | offset_20`）。
-- **设计动机**：iGPU 的全局内存带宽通常受限于主内存，且由 CPU 和 GPU 共享。D_BITS=14 时，128KB/WI 的字典规模会导致严重的 L3 缓存压力和内存争用。
-- **性能分析**：减少 50% 字典内存占用，意味着全局内存带宽消耗减半。测试显示，该优化在带宽受限场景（Intel iGPU）提升尤为显著（达 15.3%），而在 dGPU 上也有稳定收益。
-
-#### 5.1.2 延迟字典写入（Deferred Dict Store）（+1.78% 压缩吞吐量）
-
-- **设计原理**：将探测后的立即写入逻辑拆分为读写分离的两阶段。
-- **动机分析**：GPU 内存控制器倾向于处理连续且同类型的访存请求。在 iGPU 共享架构下，读写交替会导致缓存行状态频繁转换。分离读写相位显著减少了总线周转周期，增强了调度效率。
-- **结果**：虽然总吞吐量仅提升约 1.8%，但在高负载下成功消除了读写争用引发的周期抖动。
-
-#### 5.1.3 匹配扩展循环展开（Unroll2）
-
-- **针对性优化**：该展开策略专门针对匹配扩展这一核心热路径（其热度仅次于哈希查找）。
-- **性能评估**：通过 2x 展开，每轮迭代处理字节数翻倍，相较单字节比较，极大提升了指令流水线的利用率。
-
-#### 5.1.4 解压非重叠快路径
-
-- **场景分析**：对于高熵数据（如二进制流），匹配通常较短且非重叠；而低熵数据（如文本、RLE 数据）则伴随长匹配或 RLE 特征。
-- **非对称收益**：高熵数据受此加速最明显，因为其绝大部分匹配落入非重叠快路径；低熵数据虽重叠较多，但能受益于 offset=1/2/4 的 SIMD 广播优化（见 §3.2.2）。
-
-#### 5.1.5 探测向量宽度调整
-
-- **决策依据**：在尝试将探测宽度从 4 扩展至 8 时，观察到约 10pp 的压缩率退化。
-- **原理剖析**：过宽的探测虽然能增加并行性，但会造成「字典污染」——劣质条目更频繁地淘汰优质历史条目。4 位置被确定为字典质量与探测效率的最佳平衡点（Sweet Spot）。
-
-#### 5.1.6 已评估但拒绝的内核优化
-
-- **Split-Dictionary (双数组实现)**：曾尝试将 epoch 和 offset 存放在两个独立数组以改善访存对齐。然而，在 iGPU 共享内存架构上，一次 4B 原子读取的效率高于两次 2B 读取（产生额外地址生成开销）。实测产生 1-5% 性能回退，故拒绝。
-
-### 5.2 主机端优化
-
-#### 5.2.1 解压 CL 缓冲区复用（+50.1% 解压内核吞吐量）
-
-- **问题深度分析**：在 iGPU 上，频繁调用 `clCreateBuffer/clReleaseMemObject` 会触发表内核驱动（如 NEO）中的内存分配器全局锁。这会导致内核提交序列化。
-- **优化方案**：采用 Grow-only 预分配策略。缓冲区在生命周期内趋于稳定，几乎消除了运行时分配开销。
-- **结果**：内核吞吐量激增 50.1%，主要归因于主机端同步开销的移除。
-
-#### 5.2.2 非阻塞 CL 写入与流水线
-
-- **实现**：将 `clEnqueueWriteBuffer` 设为异步模式，允许 CPU 在数据传输阶段继续执行后续准备工作，最大化重叠计算与传输（Overlap compute and communication）。
-
-#### 5.2.3 压缩数据打包（Pack Kernel）优化分析
-
-- **当前现状**：LZO 的打包内核 (`lzo_pack_compressed_blocks`) 当前未实现向量化，采用朴素的 `for` 循环字节拷贝。相比 LZ4 已经实现的向量化 `LZ4_UA_COPYN`，这代表了一个已知的优化缺口。
-- **跨平台行为**：
-    - **Intel iGPU**：此环节的压缩打包反而可能使性能下降（-10% 到 -30%），因为 iGPU 没有 PCIe 带宽瓶颈，数据压缩后的移动成本高于直接读取原始地址。
-    - **NVIDIA dGPU (RTX 系列)**：数据打包能显著减少 D2H (Device-to-Host) 传输体积，带来的传输加速远超内核处理成本。
-
-#### 5.2.4 GPU 遥测修正 (Telemetry Fix)
-
-- **硬件特性**：Intel iGPU 采用基于需求的频率调度（Demand-based scheduling）。当 GPU 空闲时，`gt_cur_freq_mhz` 可能返回 0，导致早期脚本采样失败。
-- **修复方案**：引入 3 秒 Bench 窗口采样，实施零值过滤，并取非零读数的中位数。此修复已同步应用于 LZO 与 LZ4 的基准测试套件。
-
-### 5.3 调度与配置优化
-
-#### 5.3.1 WI_PER_CU 并行度与显存压力
-
-- **技术计算**：在 96 EU 设备上，384 WI/CU 意味着总计 ~36,864 个并发 WI。
-- **资源边界**：每个 WI 需要 64KB 字典（D_BITS=14），总计约 2.4GB 的显存占用。这已接近该类平台在通用数据压缩任务中的物理承载上限。
-
-#### 5.3.2 自适应块大小 (Entropy-Aware Sizing)
-
-- **核心算法**：`choose_block_size()`。
-- **执行逻辑**：读取首个 64KB 窗口，通过字节直方图估计熵值。
-- **动态调整策略**：
-    - **低熵数据**（文本、日志）：增大块大小以捕获更多上下文，提升压缩率。
-    - **高熵数据**（加密、压缩流）：减小块大小以提高并发度和粒度，因为此类数据的压缩率天花板本就较低。
-
-#### 5.3.3 OpenCL 初始化与鲁棒性
-
-引入 `GPU → DEFAULT → ALL` 的自动协商回退链，确保内核能在多种 OpenCL runtime 环境下正确初始化并执行。
-
-### 5.4 GPU 频率不敏感性分析 (Frequency Insensitivity)
-
-在 Intel Iris Xe (96 EUs) 平台上的深入测试揭示了一个关键特性：LZO GPU 的吞吐量表现出极强的 GPU 频率不敏感性。
-
-#### 5.4.1 测试现象与证据
-实验观察到，当 GPU EU 频率从最低点线性提升至最高点时，无论是 lzo1x 还是 lzo1y，其压缩与解压内核的实际吞吐量几乎没有显著波动。
-
-**量化数据证据 (lzo1x, L=14, BS=64K)**：
-- **Freq Point 1**: CompKernel = 16310.8 MB/s, CompTotal = 2346.1 MB/s
-- **Freq Point 2**: CompKernel = 16263.8 MB/s, CompTotal = 2285.7 MB/s
-- **Freq Point 3**: CompKernel = 16279.0 MB/s, CompTotal = 2311.2 MB/s
-- **Freq Point 4**: CompKernel = 16325.2 MB/s, CompTotal = 2243.4 MB/s
-
-数据表明，吞吐量在不同频率点之间几乎完全持平。这验证了在该平台上，LZO 的 GPU 实现并非 **计算受限 (Compute-bound)**，而是典型的 **内存带宽/延迟受限 (Memory-bound)**。LZO GPU 的随机访存特征使得 EU 算力的提升无法转化为吞吐量的增长。
-
-#### 5.4.2 根因剖析：内存访问模式
-1. **哈希查找瓶颈**：LZO 压缩内核的核心操作是频繁的哈希表/字典查询。无论 D_BITS 设置为多少（1-15），增加字典容量只会引入更多的随机内存访问。
-2. **随机访存特征**：由于字典访问模式本质上是高度随机的，内核执行时间主要被内存子系统的延迟所掩盖。即使 EU 算力翻倍，数据也无法更快地从内存到达 EU。
-3. **iGPU 架构特性**：Intel Iris Xe 使用共享系统内存（Shared System Memory）。在 iGPU 架构下，内存控制器的频率与带宽是与 EU 频率解耦的。因此，单纯调整 EU 频率不会改变内存带宽这一核心瓶颈。
-4. **极致的不敏感性**：相比 LZ4 GPU，LZO GPU 的频率不敏感性更加极端。这是因为 LZO 的哈希混合与探测逻辑更复杂，对指令流水线的依赖相对较低，而对访存延迟的依赖更高。
-
-#### 5.4.3 边缘计算与能效启示
-这一发现在实际部署中具有极高的工程价值：
-- **极致省电模式**：可以将 GPU 频率固定在最低（如 300 MHz），此时处理性能几乎不衰减，但功耗大幅下降。
-- **能效比 (MB/J) 飙升**：在低频下，每焦耳能量处理的数据量 (MB per Joule) 呈指数级提升。
-- **热管理优势**：在低频率下运行能有效降低发热，对于散热受限的边缘嵌入式设备，这是 LZO GPU 相对于 CPU 路径的又一重大差异化优势。
-
----
-
-## 6. 标准化测试活动结果 (69 文件测试集)
-
-本节展示基于 `/root/samples` 目录下 69 个标准测试文件的全量测试结果。测试旨在对比 LZO CPU 与 GPU 在不同配置下的性能包络。
-
-### 6.1 测试配置
-
-- **数据集**: 69 个多样化文件 (涵盖日志、视频、代码、数据库等)
-- **CPU 配置 (LZO CPU)**: 7 个频率点 × 1 个块大小 × 4 线程数 (1/2/3/4T) × 2 种算法 (lzo1x/lzo1y) = 56 组配置
-- **GPU 配置 (LZO GPU)**: 4 个频率点 × 2 个块大小 (16K/64K) × 3 个级别 (L13/14/15) × 2 种算法 (lzo1x/lzo1y) = 48 组配置
-
-### 6.2 性能汇总 (MB/s)
-
-下表展示了各引擎在最佳配置下的性能表现（均值为 69 个文件的算术平均值）。
-
-| 指标 | LZO GPU (Best) | LZO CPU (Best, 4T) | Speedup (GPU/CPU-4T) |
-|------|:---:|:---:|:---:|
-| 压缩内核 (CompKernel) | 16310.8 | 10220.3 | **1.60x** |
-| 解压内核 (DecKernel) | 22565.6 | 4684.7 | **4.82x** |
-| 压缩总吞吐 (CompTotal) | 2346.1 | 1783.1 | **1.32x** |
-| 解压总吞吐 (DecTotal) | 1219.5 | 1316.2 | 0.93x |
-| 压缩率 (Ratio) | 22.9% | 23.5% | - |
-
-**关键发现**：
-- **解压内核爆发**：LZO GPU 在解压内核上展现出惊人的 **4.82x** 均值加速。这得益于 GPU 的向量化解压路径完全消除了 CPU 上复杂指令解析带来的流水线瓶颈。
-- **总吞吐瓶颈**：尽管内核性能翻倍，受限于主机端 I/O、分块管理与 OpenCL 调度开销，压缩总吞吐提升为 1.32x。
-
-### 6.3 算法与参数效应
-
-#### 6.3.1 算法变体比较 (GPU, FP=1, L=14, BS=64K)
-- **lzo1x**: CompKernel = 16310.8, DecKernel = 22565.6, Ratio = 22.9%
-- **lzo1y**: CompKernel = 16304.5, DecKernel = 22584.4, Ratio = 23.0%
-两者在 GPU 上的表现几乎完全一致，因为它们共享了相同的内存访问模式与哈希探测逻辑。
-
-#### 6.3.2 级别 (Level) 效应 (GPU, lzo1x, BS=64K)
-- **L=13**: CompKernel = 16865.9, Ratio = 23.0%
-- **L=14**: CompKernel = 16310.8, Ratio = 22.9%
-- **L=15**: CompKernel = 15460.1, Ratio = 22.8%
-随着 Level 提升，由于探测深度的增加，内核吞吐量呈现线性下降，但压缩率随之提升。
-
-#### 6.3.3 CPU 线程缩放 (FP=5, lzo1x, BS=64K)
-- **1T**: CompKernel = 2633.6, DecKernel = 1267.5
-- **2T**: CompKernel = 5221.8, DecKernel = 2392.8
-- **3T**: CompKernel = 7594.0, DecKernel = 3417.0
-- **4T**: CompKernel = 9731.1, DecKernel = 4362.1
-CPU 性能随线程数线性增长，但 4T 下的内核性能仍大幅落后于单路 GPU 内核。
-
-### 6.4 个体文件分析
-
-#### 6.4.1 GPU 优势显著文件 (Top 5 Comp Speedup)
-1. **redis-video_parent_6**: GPU=6830, CPU=2740 (2.5x)
-2. **redis-video_parent_5**: GPU=6838, CPU=2781 (2.5x)
-3. **redis-video_parent_8**: GPU=6676, CPU=2757 (2.4x)
-4. **redis-video_image**: GPU=6364, CPU=2638 (2.4x)
-5. **redis-video_parent_4**: GPU=6575, CPU=2841 (2.3x)
-此类多媒体/二进制数据通常具有极佳的并行性，GPU 能有效拉开差距。
-
-#### 6.4.2 GPU 劣势文件 (Bottom 5 Speedup)
-- **redis-memtier_parent_5** (1.4x)
-- **osdb** (1.2x)
-- **ooffice** (1.2x)
-- **sao** (0.9x): CPU 在极小文件上更具优势。
-- **x-ray** (0.2x): 针对已极度压缩的文件，CPU 的低延迟路径由于没有分块开销而大幅胜出。
-
-### 6.5 LZO vs LZ4 GPU 跨家族横测
-
-| 指标 (均值) | LZO GPU | LZ4 GPU | 比较 |
-|---|---|---|---|
-| 压缩内核 | 16311 | 15789 | LZO 快 3% |
-| 解压内核 | 22566 | 26338 | LZ4 快 17% |
-| 压缩总吞吐 | 2346 | 1438 | LZO 快 63% |
-| 压缩率 | 22.9% | 23.7% | LZO 略优 |
-
-**核心差异分析**：
-- **杀手锏：解压加速比**：LZO GPU 相对于 CPU 的解压加速比为 **4.82x**，而 LZ4 GPU 仅为 **1.63x**。这是因为 LZO CPU 解压本身由于复杂的 Token 变体解析非常慢，而 GPU 的向量化实现（§3.2.2）通过分支合并彻底解决了这一痛点。
-- **总吞吐优势**：由于 LZO GPU runtime 采用了更轻量的同步模型与 buffer 复用策略（§5.2），其端到端总吞吐量大幅领先于 LZ4 GPU。
-
----
-
-## 7. 修正后的 CPU vs GPU 对比实验（当前有效基线）
-
-### 7.1 为什么本节必须更新
-
-旧版本第 6 节中的 CPU vs GPU 对比来自早期全量 sweep 与当时的测量语义；其中部分 total-throughput 结论已经被本轮 corrected methodology 更新。因此，本节现只保留 **当前对 CPU vs GPU 最终判断真正有效的 corrected baseline**。
-
-### 7.2 当前实验设置
-
-| 参数 | 当前有效设置 |
-|------|-------------|
-| 基线结果文件 | `/root/lzo-2.10/exp_results/runs/20260309_merged_full_83/lzo_param_sweep_merged.csv` |
-| 文件集 | 83 个已验证文件（`/root/samples`，通过 stitched artifact 全覆盖） |
-| 频率点 | 100% |
-| 指标 | `CompKernelMBs`, `DecKernelMBs`, `CompTotalMBs`, `DecTotalMBs`, `Ratio%`, `CompCPUPower_W`, `CompGPUPower_W` |
-| 正确性 | 仅统计 `Roundtrip_OK=yes` 结果 |
-
-### 7.3 当前可信汇总方式
-
-当前采用：
-
-1. 对每个文件、每个 engine（`CPU lzo1x` / `CPU lzo1y` / `GPU lzo1x` / `GPU lzo1y`）在自己的配置空间中选最佳 `CompTotalMBs`；
-2. 再对所有文件做 best-per-file median；
-3. kernel throughput 用来解释 headroom，**不作为最终比较结论的主指标**。
-
-### 7.4 当前 best-per-engine medians
-
-| Engine | Comp total MB/s | Dec total MB/s | Comp kernel MB/s | Dec kernel MB/s | Ratio % | Comp power W |
-|---|---:|---:|---:|---:|---:|---:|
-| CPU lzo1x | 615.68 | 642.44 | 2074.46 | 1765.48 | 21.68 | 14.74 |
-| CPU lzo1y | 613.45 | 642.66 | 1994.41 | 1756.91 | 22.12 | 14.80 |
-| **GPU lzo1x** | **1334.63** | **808.86** | **5828.83** | **11600.56** | **23.38** | **13.85** |
-| GPU lzo1y | 1330.73 | 808.09 | 5643.52 | 11587.72 | 23.19 | 14.15 |
-
-### 7.5 当前结果分析
-
-#### 7.5.1 total throughput
-
-- compression total: `GPU lzo1x / CPU lzo1x = 2.17x`，`GPU lzo1y / CPU lzo1y = 2.17x`
-- decompression total: `GPU lzo1x / CPU lzo1x = 1.26x`，`GPU lzo1y / CPU lzo1y = 1.26x`
-
-这说明 corrected 之后，LZO GPU 仍然是 LZO family 中最强的默认引擎。
-
-#### 7.5.2 ratio
-
-当前 best-per-file medians 下，`lzo1x` 的 GPU ratio 为 23.38%，CPU 为 21.68%；`lzo1y` 的 GPU ratio 为 23.19%，CPU 为 22.12%。也就是说，GPU 的加速不是通过灾难性牺牲压缩率获得的，但也不能再写成“完全零代价”。
-
-#### 7.5.3 power
-
-当前 active compression power：
-
-- CPU lzo1x = 14.74W，CPU lzo1y = 14.80W
-- GPU lzo1x = 13.85W，GPU lzo1y = 14.15W
-
-因此当前结果不应描述为“GPU 更快但更耗电”，而应描述为：
-
-> **GPU 在更高 steady-state total throughput 的同时，active compression power 还略低于 CPU。**
-
-#### 7.5.4 kernel vs total
-
-当前 GPU best-per-file medians：
-
-- `GPU lzo1x`：5828.83 MB/s kernel vs 1334.63 MB/s total，11600.56 MB/s kernel vs 808.86 MB/s total
-- `GPU lzo1y`：5643.52 MB/s kernel vs 1330.73 MB/s total，11587.72 MB/s kernel vs 808.09 MB/s total
-
-这说明 LZO GPU 当前仍然是典型的“kernel 很强，但系统交付仍受 runtime/file-backed path 约束”的后端。因此 total throughput 才是决定系统结论的主指标。
-
-### 7.6 当前应保留的最终结论
-
-在 corrected steady-state total semantics 下：
-
-1. **GPU 仍然明确优于 CPU**；
-2. **`lzo1x` 与 `lzo1y` 两条 GPU 路径表现几乎并列**；
-3. **active compression power 仍不高于 CPU，部分情况下更低**；
-4. 因此 `lzo_gpu` 依然是当前项目中最强的 GPU 路径之一。
-
-### 7.7 与 hybrid 和 CPU OpenCL 的关系
-
-当前 LZO family 的关系应表述为：
-
-- **GPU-only 仍是默认最佳引擎**，但当前应按 `lzo1x` / `lzo1y` 分别分析；
-- **Hybrid 在 corrected methodology 下已被重新评估为“次优但非异常差”**，说明之前的极端悲观印象部分来自测量口径问题；
-- **CPU OpenCL 已验证可运行，但没有形成稳定优于 native CPU path 的证据**。
-
-这意味着 `lzo_gpu` 的当前结论不是孤立成立的，而是在完成了 hybrid 重测和 CPU OpenCL 可行性验证之后，仍然保持为 LZO family 的主基线。
-
-## 8. GPU-Only 优化阶段结果回顾（作为实现演进参考）
-
-本节保留 GPU-only 优化阶段的中间实验结论，用于说明当前实现是如何收敛到现在这条主路径的。**这些数据不再作为最终 CPU vs GPU 结论的主依据**，但它们对理解实现演进仍然重要。
-
-### 8.1 关键阶段性观察
-
-历史优化阶段已经反复证明以下规律：
-
-1. **更大的块大小通常更利于 total throughput 与 ratio**；
-2. **D_BITS=12/14 之间存在 throughput vs ratio 的细微权衡**；
-3. **iGPU 共享内存下，主机端 CL buffer 生命周期管理是决定 total throughput 的核心因素之一**；
-4. **低熵数据会把 GPU 解压推到极高的 kernel throughput 区间，但这不等价于系统 total throughput 可以等比例放大**。
-
-### 8.2 为什么这一节仍然值得保留
-
-用户最关心的不只是“最终哪个数字最大”，还包括：
-
-- 当前系统结构为什么会长成这样；
-- 哪些优化真正起作用；
-- 哪些方向虽然做过但最后被证明无效。
-
-因此，本节作为 **优化演进档案** 继续保留，但所有最终对外比较结论均应以第 6 节和第 7 节为准。
-
-## 9. 当前结论
-
-1. **LZO GPU 的架构与实现已经成熟**：包含 standalone / daemon / client、内核与主机端 runtime、workspace/buffer 复用、向量化解压路径等完整组件。
-2. **历史优化路径仍然重要**：32-bit 紧凑字典、延迟写入、主机端 buffer 复用等，是当前结果成立的关键前提。
-3. **当前 corrected baseline 证明 GPU 是 LZO family 的主导引擎**：在 steady-state total throughput 下，`lzo1x` / `lzo1y` 压缩都约为 CPU 的 2.17x，解压约为 1.26x。
-4. **ratio 与 power 都没有破坏这个结论**：GPU 的 ratio 成本有限，且 active compression power 仍不高于 CPU。
-5. **CPU OpenCL 当前不应被写成默认推荐设计**：它验证了统一 OpenCL backend 的可行性，但在本轮结果里更适合作为 portability/fallback path。
-6. **跨家族比较需谨慎**：当前可以确认 `lzo_gpu` 是强结果，但若要严格断言与 `lz4_gpu` 的排序，必须使用 matched-corpus 对照；在 fresh 83-file matched view 中，`lz4_gpu` 仍快于 `lzo_gpu`。
-
-简言之：
-
-> 当前 `lzo_gpu` 是一条既有完整系统结构、又经过历史优化收敛、并且在 fresh 83-file corrected stitched artifact 下仍然强势的正式主路径。
-
-## Nvidia 平台（Windows + GeForce RTX 4070 Ti 系列，按 full 结果重写）
-
-正式工件（仅 full-corpus）：
-
-- CPU baseline：`exp_results/formal_full_lzo_cpu_baseline_t123468_energy/runs/20260312_003804/`
-- GPU pre-mod：`exp_results/formal_full_lzo_gpu_baseline_unmodified_energy/runs/20260312_101741/`
-- GPU post-mod（final r2）：`exp_results/formal_full_lzo_gpu_final_energy_r2/runs/20260313_025756/`
-
-### 1) Nvidia dGPU 与 Intel iGPU 的关键差异
-
-| 维度 | Intel Iris Xe（iGPU） | Nvidia RTX 4070 Ti（dGPU） | 对 LZO GPU 的影响 |
+| 组件 | 文件 | 职责 | 关键实现 |
 | --- | --- | --- | --- |
-| 内存 | 统一内存 | 分离显存/主存 | dGPU 上“读回字节量”更关键 |
-| 并行能力 | 中等 | 高并行 | kernel 容易大幅提升 |
-| 系统开销占比 | 相对低 | 相对高 | kernel 提升不必然等比转化 total |
+| 入口与模式管理 | `lzo_gpu.c` | standalone / daemon / client / bench | `run_lzo_standalone`, `run_lzo_bench`, `ocl_init` |
+| 核心运行时 | `lzo_gpu_core.c` | 缓冲复用、调度、pipeline、写回 | `lzo_compress_core`, `lzo_decompress_core`, pipeline path |
+| 共享状态 | `lzo_gpu_core.h` | workspace 与 kernel 参数缓存 | `lzo_gpu_workspace_t` |
+| 压缩/解压内核（1x） | `lzo1x.cl` | 1x 编码/解码与 pack | `lzo1x_block_compress`, `lzo1x_block_decompress`, `lzo_pack_compressed_blocks` |
+| 压缩/解压内核（1y） | `lzo1y.cl` | 1y 编码/解码与 pack | `lzo1y_block_compress`, `lzo1y_block_decompress` |
 
-### 2) Nvidia 下 GPU 压缩/解压设计
+#### 2.2 组件架构图
 
 ```mermaid
 flowchart LR
-  A[Input Blocks] --> B[LZO Compress Kernel]
-  B --> C[lzo_pack_compressed_blocks]
-  C --> D[Packed payload + offsets]
-  D --> E[Host readback + container]
-  E --> F[LZO Decompress Kernel]
+    A[lzo_gpu.c<br/>CLI/bench/daemon] --> B[lzo_gpu_core.c<br/>runtime & pipeline]
+    B --> C[lzo1x.cl]
+    B --> D[lzo1y.cl]
+    B --> E[lzo_gpu_core.h<br/>workspace cache]
+    C --> F[Intel Iris Xe OpenCL]
+    D --> F
 ```
 
-关键差异：Nvidia 路径下 pack kernel 的收益主要在于降低 D2H 无效读回，而非直接提升编码逻辑本身。
+#### 2.3 压缩过程图解
 
-### 3) Nvidia 侧优化（动机 / 原理 / 实现）
+```mermaid
+sequenceDiagram
+    participant U as User/Bench
+    participant H as lzo_gpu.c
+    participant R as lzo_gpu_core.c
+    participant K as lzo1x/lzo1y.cl
+    participant O as Output
 
-1. **device-aware transfer**
-    - 动机：避免 dGPU 上错误的“类零拷贝”路径；
-    - 原理：按设备能力选择显式传输；
-    - 实现：`lzo_gpu_core.c` 的缓冲区读写路径分流。
+    U->>H: compress / bench
+    H->>R: lzo_compress_core(...)
+    R->>R: choose block size + worker count
+    R->>R: prepare/reuse d_in d_out d_len d_dict
+    R->>K: *_block_compress (NDRange)
+    K-->>R: block_lens + sparse payload
+    R->>K: lzo_pack_compressed_blocks (optional)
+    K-->>R: packed payload
+    R->>O: write header + len table + payload
+```
 
-2. **Windows kernel 加载可靠性**
-    - 动机：stale `.clbin` 会造成“测的不是当前代码”；
-    - 实现：禁用陈旧二进制直载并保留源码回退。
+压缩关键点：
 
-3. **device-side compaction**
-    - 动机：减少固定槽位输出中的冗余字节；
-    - 原理：GPU 端 pack + offsets，主机端按 offsets 组装；
-    - 实现：`lzo1x.cl` / `lzo1y.cl` 新增 pack kernel，runtime 增加阈值判定。
+1. 入口支持 `lzo1x/lzo1y` 双算法；
+2. 字典池按活跃 work-item 分配；
+3. 允许 pipeline（按阈值/熵门控）减少大文件长尾。
 
-### 4) Full 结果分析（CPU baseline / pre-mod / post-mod）
+#### 2.4 解压过程图解
 
-#### 4.1 统计表（均值 / 中位数）
+```mermaid
+sequenceDiagram
+    participant U as User/Bench
+    participant H as lzo_gpu.c
+    participant R as lzo_gpu_core.c
+    participant K as lzo1x/lzo1y.cl
+    participant O as Output
 
-| 组别 | Ratio mean / median % | Comp kernel mean / median | Dec kernel mean / median | Comp total mean / median | Dec total mean / median |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| CPU baseline (`lzo1y,T=3`) | 26.2959 / 22.1200 | 9970.2098 / 5007.7000 | 3866.0646 / 4031.1100 | 1185.1370 / 1029.7822 | 898.7173 / 914.7607 |
-| GPU pre-mod `lzo1x` | 25.6387 / 21.0800 | 8021.8175 / 5313.5000 | 14832.3714 / 9726.5900 | 380.7167 / 320.1800 | 387.2857 / 325.1500 |
-| GPU post-mod r2 `lzo1x` | 27.4970 / 23.2500 | 17667.5943 / 13508.1500 | 33244.6714 / 28220.3500 | 394.1454 / 325.1500 | 408.9986 / 349.9500 |
-| GPU pre-mod `lzo1y` | 25.7202 / 21.1100 | 8025.4872 / 4496.2700 | 15003.7659 / 9289.5200 | 378.6029 / 310.4400 | 385.8259 / 326.2600 |
-| GPU post-mod r2 `lzo1y` | 27.6058 / 23.0800 | 17635.2798 / 13450.6400 | 33212.4867 / 28201.7100 | 394.3429 / 329.8900 | 406.4041 / 337.2000 |
+    U->>H: decompress / bench
+    H->>R: lzo_decompress_core(...)
+    R->>R: parse header + len table
+    R->>R: build offset/lens device buffers
+    R->>K: *_block_decompress (NDRange)
+    K-->>R: out_lens + output blocks
+    R->>O: mapped readback or standard readback + write
+```
 
-#### 4.2 pre-mod → post-mod 的模式
+解压关键点：
 
-- `lzo1x`：Comp total +3.5%，Dec total +5.6%；
-- `lzo1y`：Comp total +4.2%，Dec total +5.3%；
-- kernel 吞吐大幅提升（两算法均约 +120%），但 total 只小幅提升。
+1. 按块并行解压，输出长度单独回传；
+2. `COPY_MATCH` 包含非重叠与小 offset 特化；
+3. 输出路径可 map 或 staging readback。
 
-#### 4.3 例外与解释
+#### 2.5 内存与调度
 
-1. **kernel 提升远大于 total 提升**：系统瓶颈仍在文件路径与主机侧调度；
-2. **ratio 上升（变差）**：`+1.8pp` 级别，说明吞吐收益并非“完全无代价”；
-3. **依旧显著低于 CPU baseline total**：GPU-only 在 Nvidia 上已改善，但在该 full 工件中仍不是 family 冠军。
+```text
+[input file] -> [d_in] -> [compress kernel] -> [d_out sparse + d_len]
+                                          -> [optional pack kernel] -> [packed output]
+                                          -> [container write]
 
-### 5) 局限、结论与下一步
+[compressed file] -> [d_comp + d_off + d_comp_lens] -> [decompress kernel]
+                                                   -> [d_decomp_out + d_out_lens]
+                                                   -> [write output]
+```
 
-- 局限：当前对比是“代表配置 + 工件内统计”，尚未做 matched best-per-file 包络对齐。
-- 结论：`lzo_gpu` 的 post-mod r2 在 Nvidia 上达成了“稳定小幅 total 增益 + 大幅 kernel 增益”，但 total 仍受 host/runtime 限制。
-- 下一步：
-  1. 继续压缩 readback/组装路径开销；
-  2. 按文件压缩性分层调 compaction 阈值；
-  3. 补一轮 matched 参数矩阵验证 ratio 与 total 的最优平衡点。
+---
 
-## 10. 2026-03-09 块大小敏感性快照
+### 3. 核心设计和优化
 
-针对用户提出的“LZO GPU 对块大小似乎没有 LZ4 GPU 那么敏感”的问题，本轮重新做了 subset 验证。
+> 本章按“压缩内核 / 解压内核 / 主机端”组织，且每项严格四段。
 
-### 10.1 `dickens`
+#### 3.1 压缩内核
 
-| Block | Comp total MB/s | Dec total MB/s | Ratio % |
-|---|---:|---:|---:|
-| 16K | 543.61 | **838.95** | 67.56 |
-| 64K | **582.21** | 788.69 | **63.56** |
+##### 3.1.1 32-bit packed dictionary（已采纳）
 
-### 10.2 `industrial_parent_0_pages_img.tar`
+- **动机**：64-bit 字典条目在 iGPU 上访存压力偏高。
+- **设计**：条目统一为 `epoch_12 | offset_20`。
+- **实现**：`dict_store32`, `dict_load32`（`lzo1x.cl`, `lzo1y.cl`）。
+- **效果**：字典内存占用减半，压缩核吞吐长期正收益。
 
-| Block | Comp total MB/s | Dec total MB/s | Ratio % |
-|---|---:|---:|---:|
-| 16K | 976.49 | 1259.42 | 18.46 |
-| 64K | **1073.01** | **1362.72** | **17.52** |
+##### 3.1.2 强混洗哈希（已采纳）
 
-### 10.3 当前解释
+- **动机**：单路字典下冲突质量直接影响压缩效率。
+- **设计**：多步混洗（xor/shift/multiply/xor）提高分布质量。
+- **实现**：`lzo1x_hash32`, `lzo1y_hash32`。
+- **效果**：降低劣质命中与无效比较。
 
-1. LZO GPU 在当前 Intel iGPU 平台上仍然表现出**更弱的块大小敏感性**；
-2. 64K 通常不会像此前 LZ4 某些异常 case 那样出现明显吞吐崩塌，反而在 total throughput 与 ratio 上略优；
-3. 这与 LZO GPU 当前更稳定的 batched dictionary probing / copy 路径和成熟的 host runtime 设计相一致。
+##### 3.1.3 四位置批量探测 + 延迟写回（已采纳）
 
-## 11. 案例验证：CRIU 容器检查点迁移压缩
+- **动机**：读写交替导致内存控制器效率下降。
+- **设计**：先 batch 读取 4 条，再判定，再集中写回。
+- **实现**：`lzo1x_compress_core` / `lzo1y_compress_core` 的 vector probe 路径。
+- **效果**：压缩路径更稳定，减少访存抖动。
 
-使用 CRIU 生成的 41 个真实容器内存检查点文件（13 种服务类型，>= 1MB），对 LZO GPU 和 LZO Hybrid R=0 T=4 在 BS=64K 下进行迁移停机时间评估。
+##### 3.1.4 match-extension 展开（已采纳）
 
-### 11.1 迁移停机时间 (1GbE, 125 MB/s)
+- **动机**：match 扩展是压缩热点。
+- **设计**：优先 8B/16B/32B 比较，差异时用 `ctz` 定位首失配字节。
+- **实现**：`LZO_USE_UNROLL2` 相关分支。
+- **效果**：长匹配场景循环控制开销下降。
 
-| 容器 | 大小 | 压缩比 | 无压缩 | LZO-GPU | LZO-CPU4T | 降幅 |
-|---|---:|---:|---:|---:|---:|---:|
-| elasticsearch | 941MB | 17.4% | 7529ms | 3231ms | 2774ms | 63% |
-| yolo | 314MB | 63.1% | 2515ms | 2300ms | 1824ms | 27% |
-| dirty-pages | 100MB | 0.7% | 802ms | 144ms | 46ms | 94% |
-| nginx | 35MB | 16.3% | 279ms | 123ms | 122ms | 56% |
-| sensoragg | 28MB | 18.2% | 223ms | 83ms | 97ms | 63% |
-| redis | 8MB | 5.6% | 62ms | 13ms | 12ms | 81% |
+##### 3.1.5 `lzo1x` 并行 pack（已采纳）
 
-### 11.2 LZO vs LZ4 迁移场景对比
+- **动机**：串行打包成为压缩尾部瓶颈。
+- **设计**：per-block work-group + `vload16/vstore16` 向量搬运。
+- **实现**：`lzo1x.cl::lzo_pack_compressed_blocks`。
+- **效果**：`lzo1x` 压缩 total 稳定受益。
 
-| 指标 | LZ4-GPU | LZO-GPU | LZO 优势 |
-|---|---:|---:|---|
-| 压缩核函数均值 | 2179 MB/s | 2217 MB/s | 略高 |
-| 压缩总吞吐均值 | 328 MB/s | 799 MB/s | **2.44x** |
-| 解压总吞吐均值 | 1117 MB/s | 1328 MB/s | 1.19x |
-| 平均压缩比 | 25.2% | 23.1% | 更低 (更好) |
+##### 3.1.6 `lzo1y` 阈值特化分流（已采纳）
 
-### 11.3 关键发现
+- **动机**：1y 的 M2/M3/M4 分布与 1x 不同。
+- **设计**：优先命中 1y 高频阈值区间，减少分支回跳。
+- **实现**：`lzo1y_compress_core` 匹配编码段。
+- **效果**：subset/fullset 记录约 `+2.9%` 压缩收益。
 
-1. **LZO GPU 在总吞吐上显著优于 LZ4 GPU** (2.44x)，因 LZO 主机端流水线更成熟
-2. **LZO 压缩比更低** (23.1% vs 25.2%)，在带宽受限场景下进一步减少传输量
-3. **sensoragg (IoT 聚合)** 场景下 LZO-GPU 总吞吐 1088 MB/s，优于 LZ4-GPU 688 MB/s
-4. **LZO Hybrid R=0** 在 yolo 等高熵数据上达到 3213 MB/s 核函数吞吐，超过 GPU 独立路径
+#### 3.2 解压内核
+
+##### 3.2.1 非重叠快路径（已采纳）
+
+- **动机**：大量 match 可满足 `offset >= len`。
+- **设计**：满足条件直接 `UA_COPYN` 向量化复制。
+- **实现**：`COPY_MATCH` 首分支（1x/1y）。
+- **效果**：解压核函数吞吐显著高于 CPU。
+
+##### 3.2.2 小 offset 广播路径（已采纳）
+
+- **动机**：`offset=1/2/4` 在重复数据中高频。
+- **设计**：使用向量广播替代逐字节循环。
+- **实现**：`COPY_MATCH` 中 `offset<=4` 分支。
+- **效果**：减少低熵数据下的解压抖动。
+
+##### 3.2.3 分段向量拷贝（已采纳）
+
+- **动机**：不同 offset 区间适配不同向量宽度更高效。
+- **设计**：按 `>=64/32/16/8/4` 逐级降宽复制。
+- **实现**：`COPY_MATCH` 后半段。
+- **效果**：提高宽匹配路径吞吐稳定性。
+
+##### 3.2.4 解压计数器（已采纳）
+
+- **动机**：需要量化 token 密度和错误路径。
+- **设计**：记录 tokens/literal/match/small_offset/output_error。
+- **实现**：`LZO_DBG_DEC_*` 统计。
+- **效果**：便于定向定位解压异常与回退。
+
+#### 3.3 主机端
+
+##### 3.3.1 workspace grow-only（已采纳）
+
+- **动机**：频繁分配会引入明显调度噪声。
+- **设计**：缓冲只增不减，跨轮次复用。
+- **实现**：`core_get_or_create_buffer`, `lzo_gpu_workspace_t`。
+- **效果**：稳态 bench 下 buffer 分配开销显著收敛。
+
+##### 3.3.2 standard-copy / zero-copy 双路径（已采纳）
+
+- **动机**：Intel iGPU 与 dGPU 最优路径不同。
+- **设计**：支持 `LZO_STANDARD_COPY` 覆盖默认策略。
+- **实现**：`lzo_resolve_standard_copy`, `lzo_read_buffer_auto`。
+- **效果**：同一代码支持跨设备部署。
+
+##### 3.3.3 压缩 pipeline（已采纳）
+
+- **动机**：大文件单批次执行尾部等待长。
+- **设计**：双槽位 pipeline + chunk 分段 + inflight drain。
+- **实现**：`lzo_compress_core_pipeline`, `lzo_pipeline_drain_slot`。
+- **效果**：降低大文件场景尾部等待。
+
+##### 3.3.4 pipeline 熵门控（已采纳）
+
+- **动机**：并非所有数据都适合 pipeline。
+- **设计**：按输入规模 + 采样熵 + 配置阈值决策。
+- **实现**：`lzo_estimate_file_entropy_prefix` + `LZO_PIPELINE_*` 环境变量。
+- **效果**：避免在不适合场景强行 pipeline。
+
+##### 3.3.5 kernel 参数缓存（已采纳）
+
+- **动机**：稳态循环反复 set 同参会产生额外 host 开销。
+- **设计**：缓存稳定参数，仅在资源变化时重设。
+- **实现**：`comp_kernel_args_set` 与 `comp_cached_*`。
+- **效果**：bench 稳态波动降低。
+
+##### 3.3.6 字典清零策略（已采纳）
+
+- **动机**：epoch 逼近上限时必须避免脏命中。
+- **设计**：主机侧回绕前触发字典清零并重置 epoch。
+- **实现**：`comp_epoch_base` + `lzo_zero_buffer`。
+- **效果**：长时间运行保持正确性。
+
+##### 3.3.7 pack 启停阈值（已采纳）
+
+- **动机**：pack 不一定总是收益项。
+- **设计**：按 `packed_bytes/sparse_bytes`、块数、收益比例判定。
+- **实现**：`lzo_should_use_device_compaction`。
+- **效果**：减少“启 pack 反而变慢”的场景。
+
+##### 3.3.8 大缓冲 IO 与精确计时（已采纳）
+
+- **动机**：必须分离 file read / upload / kernel / download / write。
+- **设计**：统一 `timing_t`，按阶段采样。
+- **实现**：`timing_t` 字段填充逻辑。
+- **效果**：可直接识别性能瓶颈来源。
+
+#### 3.4 未采纳改动（子节表格）
+
+| 模块 | 未采纳改动 | 未采纳原因 | 证据摘要 |
+| --- | --- | --- | --- |
+| 压缩内核 | split-dictionary（拆数组） | 地址生成与双读开销抵消收益 | 记录 `1%~5%` 回退 |
+| 压缩内核 | prefilter32 + 去重写回 | subset 明显回退 | 记录 `CompKernel -8.44%` |
+| 压缩内核 | `lzo1y` 32B+并行 pack 对齐迁移 | fullset 净收益不成立 | 记录 `-0.85%` 级回退 |
+| 主机端 | 非 IO host lens cache 候选 | repeat3 中位数跨算法回退 | 回退后未入主线 |
+
+#### 3.5 实现覆盖清单
+
+| 文件 | 核心实现 | 已在本章覆盖 |
+| --- | --- | --- |
+| `lzo_gpu.c` | 模式路由、bench、设备选择、kernel 加载 | ✅ |
+| `lzo1x.cl` | 1x 压缩/解压、dict、COPY_MATCH、pack | ✅ |
+| `lzo1y.cl` | 1y 压缩/解压、阈值特化、COPY_MATCH | ✅ |
+| `lzo_gpu_core.c` | workspace、pipeline、pack gate、计时与写回 | ✅ |
+| `lzo_gpu_core.h` | 参数对象与缓存状态 | ✅ |
+
+---
+
+### 4. 测试结果和分析
+
+> 本章全部数据来自当前仓库 `exp_results/full_validation_integrated_remote/`，并严格只做 **GPU vs CPU**（Hybrid 对比仍放在 hybrid 文档）。
+
+#### 4.1 数据来源与统计口径（当前批次）
+
+- LZO GPU：`exp_results/full_validation_integrated_remote/lzo_gpu_only_default/runs/20260322_223943/`
+- LZO CPU：`exp_results/full_validation_integrated_remote/lzo_cpu_only_default/runs/20260322_200918/`
+- 口径字段：`CompKernelMean`, `DecKernelMean`, `CompTotalMean`, `DecTotalMean`, `RatioMean`, `FreqTargetMHz`, `FreqAvgMHz`, `CompPowerW`, `DecPowerW`
+- 统计对象：配置聚合均值（每配置 `Samples=50`）
+
+#### 4.2 LZO GPU：全部被测配置（当前 exp_results）
+
+| Config | Samples | CompKernelMean | DecKernelMean | CompTotalMean | DecTotalMean | RatioMean | FreqTargetMHz | FreqAvgMHz | CompPowerW | DecPowerW |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FP=1;A=lzo1x;L=14;BS=32K;LSZ=1 | 50 | 787.511 | 1384.653 | 787.501 | 1383.855 | 27.923 | 500.000 | 500.603 | 3.101 | 3.101 |
+| FP=1;A=lzo1x;L=14;BS=64K;LSZ=1 | 50 | 641.520 | 1091.525 | 641.515 | 1091.099 | 26.951 | 500.000 | 501.095 | 2.839 | 2.839 |
+| FP=1;A=lzo1x;L=15;BS=32K;LSZ=1 | 50 | 718.107 | 1383.127 | 718.098 | 1382.335 | 27.856 | 500.000 | 501.338 | 3.105 | 3.105 |
+| FP=1;A=lzo1x;L=15;BS=64K;LSZ=1 | 50 | 615.310 | 1088.841 | 615.305 | 1088.414 | 26.850 | 500.000 | 500.375 | 2.835 | 2.835 |
+| FP=1;A=lzo1y;L=14;BS=32K;LSZ=1 | 50 | 808.478 | 1382.906 | 808.464 | 1382.106 | 28.104 | 500.000 | 500.611 | 3.118 | 3.118 |
+| FP=1;A=lzo1y;L=14;BS=64K;LSZ=1 | 50 | 662.655 | 1088.760 | 662.649 | 1088.333 | 27.115 | 500.000 | 500.720 | 2.855 | 2.855 |
+| FP=1;A=lzo1y;L=15;BS=32K;LSZ=1 | 50 | 738.102 | 1381.518 | 738.091 | 1380.725 | 28.036 | 500.000 | 501.156 | 3.122 | 3.122 |
+| FP=1;A=lzo1y;L=15;BS=64K;LSZ=1 | 50 | 633.903 | 1086.778 | 633.895 | 1086.354 | 27.012 | 500.000 | 501.147 | 2.856 | 2.856 |
+| FP=2;A=lzo1x;L=14;BS=32K;LSZ=1 | 50 | 1557.177 | 2765.259 | 1557.139 | 2763.416 | 27.923 | 1000.000 | 1000.000 | 7.427 | 7.427 |
+| FP=2;A=lzo1x;L=14;BS=64K;LSZ=1 | 50 | 1265.482 | 2178.012 | 1265.466 | 2177.005 | 26.951 | 1000.000 | 1000.000 | 6.506 | 6.506 |
+| FP=2;A=lzo1x;L=15;BS=32K;LSZ=1 | 50 | 1418.712 | 2763.576 | 1418.685 | 2761.756 | 27.856 | 1000.000 | 1000.000 | 7.371 | 7.371 |
+| FP=2;A=lzo1x;L=15;BS=64K;LSZ=1 | 50 | 1211.033 | 2172.963 | 1211.015 | 2171.962 | 26.850 | 1000.000 | 1000.000 | 6.486 | 6.486 |
+| FP=2;A=lzo1y;L=14;BS=32K;LSZ=1 | 50 | 1596.575 | 2761.061 | 1596.543 | 2759.209 | 28.104 | 1000.000 | 1000.000 | 7.463 | 7.463 |
+| FP=2;A=lzo1y;L=14;BS=64K;LSZ=1 | 50 | 1305.187 | 2173.833 | 1305.163 | 2172.825 | 27.115 | 1000.000 | 1000.000 | 6.564 | 6.564 |
+| FP=2;A=lzo1y;L=15;BS=32K;LSZ=1 | 50 | 1455.402 | 2758.918 | 1455.376 | 2757.111 | 28.036 | 1000.000 | 1000.000 | 7.414 | 7.414 |
+| FP=2;A=lzo1y;L=15;BS=64K;LSZ=1 | 50 | 1253.887 | 2165.845 | 1253.867 | 2164.855 | 27.012 | 1000.000 | 1000.000 | 6.540 | 6.540 |
+| FP=3;A=lzo1x;L=14;BS=32K;LSZ=1 | 50 | 2258.412 | 4016.858 | 2258.346 | 4013.886 | 27.923 | 1500.000 | 1500.000 | 20.001 | 20.001 |
+| FP=3;A=lzo1x;L=14;BS=64K;LSZ=1 | 50 | 1855.686 | 3183.160 | 1855.634 | 3181.513 | 26.951 | 1500.000 | 1500.000 | 17.711 | 17.711 |
+| FP=3;A=lzo1x;L=15;BS=32K;LSZ=1 | 50 | 2020.144 | 4018.348 | 2020.089 | 4015.358 | 27.856 | 1500.000 | 1500.000 | 19.782 | 19.782 |
+| FP=3;A=lzo1x;L=15;BS=64K;LSZ=1 | 50 | 1759.578 | 3174.963 | 1759.540 | 3173.335 | 26.850 | 1500.000 | 1500.000 | 17.697 | 17.697 |
+| FP=3;A=lzo1y;L=14;BS=32K;LSZ=1 | 50 | 2313.748 | 4007.040 | 2313.662 | 4004.054 | 28.104 | 1500.000 | 1500.000 | 20.122 | 20.122 |
+| FP=3;A=lzo1y;L=14;BS=64K;LSZ=1 | 50 | 1916.180 | 3177.393 | 1916.130 | 3175.745 | 27.115 | 1500.000 | 1500.000 | 17.848 | 17.848 |
+| FP=3;A=lzo1y;L=15;BS=32K;LSZ=1 | 50 | 2060.628 | 4010.744 | 2060.577 | 4007.764 | 28.036 | 1500.000 | 1500.000 | 19.925 | 19.925 |
+| FP=3;A=lzo1y;L=15;BS=64K;LSZ=1 | 50 | 1815.520 | 3172.577 | 1815.483 | 3170.954 | 27.012 | 1500.000 | 1500.000 | 17.786 | 17.786 |
+
+#### 4.3 LZO CPU：全部被测配置（当前 exp_results）
+
+| Config | Samples | CompKernelMean | DecKernelMean | CompTotalMean | DecTotalMean | RatioMean | FreqTargetMHz | FreqAvgMHz | CompPowerW | DecPowerW |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FP=1;A=lzo1x;L=14;BS=1M;T=1 | 50 | 445.208 | 227.577 | 441.595 | 227.567 | 27.214 | 800.000 | 799.506 | 6.897 | 6.897 |
+| FP=1;A=lzo1x;L=14;BS=1M;T=2 | 50 | 882.911 | 422.397 | 878.959 | 422.367 | 27.214 | 800.000 | 799.370 | 7.372 | 7.372 |
+| FP=1;A=lzo1x;L=14;BS=1M;T=4 | 50 | 1683.925 | 756.294 | 1679.925 | 756.187 | 27.214 | 800.000 | 798.933 | 8.147 | 8.147 |
+| FP=1;A=lzo1x;L=14;BS=64K;T=1 | 50 | 471.038 | 305.845 | 464.900 | 305.816 | 27.683 | 800.000 | 799.625 | 6.902 | 6.902 |
+| FP=1;A=lzo1x;L=14;BS=64K;T=2 | 50 | 913.947 | 576.459 | 903.617 | 576.368 | 27.683 | 800.000 | 799.362 | 7.439 | 7.439 |
+| FP=1;A=lzo1x;L=14;BS=64K;T=4 | 50 | 1761.729 | 1031.306 | 1740.185 | 1030.930 | 27.683 | 800.000 | 799.057 | 8.268 | 8.268 |
+| FP=1;A=lzo1y;L=14;BS=1M;T=1 | 50 | 440.278 | 221.462 | 436.651 | 221.451 | 27.391 | 800.000 | 799.553 | 6.918 | 6.918 |
+| FP=1;A=lzo1y;L=14;BS=1M;T=2 | 50 | 870.004 | 412.460 | 866.093 | 412.434 | 27.391 | 800.000 | 799.347 | 7.332 | 7.332 |
+| FP=1;A=lzo1y;L=14;BS=1M;T=4 | 50 | 1661.709 | 737.772 | 1656.521 | 737.692 | 27.391 | 800.000 | 799.079 | 8.149 | 8.149 |
+| FP=1;A=lzo1y;L=14;BS=64K;T=1 | 50 | 466.400 | 297.670 | 460.278 | 297.639 | 27.867 | 800.000 | 799.519 | 6.862 | 6.862 |
+| FP=1;A=lzo1y;L=14;BS=64K;T=2 | 50 | 907.810 | 560.663 | 897.617 | 560.559 | 27.867 | 800.000 | 799.379 | 7.410 | 7.410 |
+| FP=1;A=lzo1y;L=14;BS=64K;T=4 | 50 | 1749.027 | 1005.303 | 1727.852 | 1004.976 | 27.867 | 800.000 | 799.110 | 8.271 | 8.271 |
+| FP=2;A=lzo1x;L=14;BS=1M;T=1 | 50 | 1082.833 | 541.654 | 1081.200 | 541.635 | 27.214 | 1900.000 | 1698.749 | 11.986 | 11.986 |
+| FP=2;A=lzo1x;L=14;BS=1M;T=2 | 50 | 2118.219 | 1030.580 | 2115.319 | 1030.487 | 27.214 | 1900.000 | 1697.891 | 13.286 | 13.286 |
+| FP=2;A=lzo1x;L=14;BS=1M;T=4 | 50 | 3993.382 | 1814.664 | 3984.816 | 1814.500 | 27.214 | 1900.000 | 1697.430 | 15.795 | 15.795 |
+| FP=2;A=lzo1x;L=14;BS=64K;T=1 | 50 | 1119.188 | 732.579 | 1115.501 | 732.515 | 27.683 | 1900.000 | 1698.624 | 12.146 | 12.146 |
+| FP=2;A=lzo1x;L=14;BS=64K;T=2 | 50 | 2205.069 | 1391.372 | 2191.049 | 1391.122 | 27.683 | 1900.000 | 1698.149 | 13.552 | 13.552 |
+| FP=2;A=lzo1x;L=14;BS=64K;T=4 | 50 | 4263.576 | 2533.317 | 4215.452 | 2532.450 | 27.683 | 1900.000 | 1697.808 | 16.173 | 16.173 |
+| FP=2;A=lzo1y;L=14;BS=1M;T=1 | 50 | 1068.900 | 527.734 | 1067.222 | 527.716 | 27.391 | 1900.000 | 1698.977 | 11.899 | 11.899 |
+| FP=2;A=lzo1y;L=14;BS=1M;T=2 | 50 | 2093.041 | 985.848 | 2090.223 | 985.791 | 27.391 | 1900.000 | 1697.966 | 13.271 | 13.271 |
+| FP=2;A=lzo1y;L=14;BS=1M;T=4 | 50 | 3944.340 | 1776.784 | 3935.905 | 1776.635 | 27.391 | 1900.000 | 1697.644 | 15.731 | 15.731 |
+| FP=2;A=lzo1y;L=14;BS=64K;T=1 | 50 | 1108.073 | 714.291 | 1104.547 | 714.229 | 27.867 | 1900.000 | 1698.636 | 12.038 | 12.038 |
+| FP=2;A=lzo1y;L=14;BS=64K;T=2 | 50 | 2189.756 | 1353.837 | 2175.759 | 1353.598 | 27.867 | 1900.000 | 1697.634 | 13.487 | 13.487 |
+| FP=2;A=lzo1y;L=14;BS=64K;T=4 | 50 | 4222.854 | 2468.311 | 4174.185 | 2467.470 | 27.867 | 1900.000 | 1697.815 | 16.117 | 16.117 |
+| FP=3;A=lzo1x;L=14;BS=1M;T=1 | 50 | 1673.535 | 844.033 | 1672.308 | 844.004 | 27.214 | 3000.000 | 2997.889 | 5.806 | 5.806 |
+| FP=3;A=lzo1x;L=14;BS=1M;T=2 | 50 | 3258.669 | 1574.573 | 3254.741 | 1574.477 | 27.214 | 3000.000 | 2996.965 | 10.346 | 10.346 |
+| FP=3;A=lzo1x;L=14;BS=1M;T=4 | 50 | 6056.743 | 2835.719 | 6044.794 | 2835.479 | 27.214 | 3000.000 | 2997.004 | 18.343 | 18.343 |
+| FP=3;A=lzo1x;L=14;BS=64K;T=1 | 50 | 1714.589 | 1141.214 | 1709.390 | 1141.112 | 27.683 | 3000.000 | 2997.513 | 5.920 | 5.920 |
+| FP=3;A=lzo1x;L=14;BS=64K;T=2 | 50 | 3405.945 | 2154.428 | 3386.070 | 2154.013 | 27.683 | 3000.000 | 2996.771 | 10.917 | 10.917 |
+| FP=3;A=lzo1x;L=14;BS=64K;T=4 | 50 | 6509.120 | 3941.577 | 6441.824 | 3940.365 | 27.683 | 3000.000 | 2996.696 | 19.749 | 19.749 |
+| FP=3;A=lzo1y;L=14;BS=1M;T=1 | 50 | 1656.924 | 823.005 | 1655.718 | 822.975 | 27.391 | 3000.000 | 2997.991 | 5.430 | 5.430 |
+| FP=3;A=lzo1y;L=14;BS=1M;T=2 | 50 | 3216.327 | 1531.034 | 3212.293 | 1530.959 | 27.391 | 3000.000 | 2996.644 | 10.141 | 10.141 |
+| FP=3;A=lzo1y;L=14;BS=1M;T=4 | 50 | 5981.599 | 2756.763 | 5969.398 | 2756.532 | 27.391 | 3000.000 | 2996.146 | 18.628 | 18.628 |
+| FP=3;A=lzo1y;L=14;BS=64K;T=1 | 50 | 1713.663 | 1112.165 | 1708.277 | 1112.078 | 27.867 | 3000.000 | 2997.996 | 6.268 | 6.268 |
+| FP=3;A=lzo1y;L=14;BS=64K;T=2 | 50 | 3378.312 | 2098.638 | 3358.848 | 2098.280 | 27.867 | 3000.000 | 2996.611 | 10.985 | 10.985 |
+| FP=3;A=lzo1y;L=14;BS=64K;T=4 | 50 | 6441.117 | 3837.215 | 6375.266 | 3835.935 | 27.867 | 3000.000 | 2996.965 | 19.635 | 19.635 |
+| FP=4;A=lzo1x;L=14;BS=1M;T=1 | 50 | 2069.844 | 1085.897 | 2068.311 | 1085.847 | 27.214 | 5000.000 | 4193.979 | 11.031 | 11.031 |
+| FP=4;A=lzo1x;L=14;BS=1M;T=2 | 50 | 4008.371 | 1981.798 | 4003.525 | 1981.654 | 27.214 | 5000.000 | 4102.126 | 17.640 | 17.640 |
+| FP=4;A=lzo1x;L=14;BS=1M;T=4 | 50 | 7299.158 | 3542.550 | 7285.944 | 3542.273 | 27.214 | 5000.000 | 4016.577 | 28.349 | 28.349 |
+| FP=4;A=lzo1x;L=14;BS=64K;T=1 | 50 | 2123.038 | 1414.377 | 2116.282 | 1414.286 | 27.683 | 5000.000 | 4187.090 | 11.681 | 11.681 |
+| FP=4;A=lzo1x;L=14;BS=64K;T=2 | 50 | 4191.445 | 2678.697 | 4167.961 | 2678.341 | 27.683 | 5000.000 | 4094.507 | 18.305 | 18.305 |
+| FP=4;A=lzo1x;L=14;BS=64K;T=4 | 50 | 7854.760 | 4902.135 | 7781.894 | 4900.615 | 27.683 | 5000.000 | 4004.695 | 29.666 | 29.666 |
+| FP=4;A=lzo1y;L=14;BS=1M;T=1 | 50 | 2048.588 | 1028.619 | 2047.143 | 1028.588 | 27.391 | 5000.000 | 4189.191 | 11.377 | 11.377 |
+| FP=4;A=lzo1y;L=14;BS=1M;T=2 | 50 | 3963.987 | 1915.754 | 3959.232 | 1915.650 | 27.391 | 5000.000 | 4101.122 | 17.187 | 17.187 |
+| FP=4;A=lzo1y;L=14;BS=1M;T=4 | 50 | 7220.113 | 3459.216 | 7206.773 | 3458.922 | 27.391 | 5000.000 | 4014.756 | 28.628 | 28.628 |
+| FP=4;A=lzo1y;L=14;BS=64K;T=1 | 50 | 2115.349 | 1380.574 | 2109.089 | 1380.477 | 27.867 | 5000.000 | 4184.847 | 11.664 | 11.664 |
+| FP=4;A=lzo1y;L=14;BS=64K;T=2 | 50 | 4158.323 | 2607.271 | 4134.457 | 2606.978 | 27.867 | 5000.000 | 4088.202 | 18.967 | 18.967 |
+| FP=4;A=lzo1y;L=14;BS=64K;T=4 | 50 | 7767.134 | 4749.274 | 7693.960 | 4748.114 | 27.867 | 5000.000 | 4004.222 | 30.491 | 30.491 |
+
+#### 4.4 实验结果与实现路径对应（按配置维度）
+
+| 配置维度 | 代码落点 | 观测到的实测规律（来自上表） | 解释 |
+| --- | --- | --- | --- |
+| GPU `FP`（500/1000/1500MHz） | `lzo_gpu.c` 运行参数与设备设置路径，`lzo_gpu_core.c` 主执行循环 | `FP` 提升时 GPU 压缩/解压吞吐显著提升（例如 `lzo1x,L14,BS=32K`：CompTotal 787→1557→2258） | 当前批次中，频率提升可稳定转化为吞吐，且 `FreqAvgMHz` 与目标一致 |
+| GPU 算法 `A`（`lzo1x`/`lzo1y`） | `lzo1x.cl`、`lzo1y.cl` 不同 kernel 路径 | 同频同级别同块大小下，`lzo1y` 吞吐普遍略高且 `RatioMean` 也更高 | 与两套内核匹配与编码路径差异一致 |
+| GPU `L`（14/15） | `lzo1x.cl` / `lzo1y.cl` 级别相关匹配深度与控制分支 | `L=15` 相比 `L=14` 常见吞吐下降，`RatioMean` 小幅下降（更好压缩） | 典型“更深搜索换压缩率、牺牲吞吐”行为 |
+| CPU `T`（1/2/4） | CPU bench 多线程执行路径 | 各频段/算法下 `CompTotalMean` 与 `DecTotalMean` 随线程数上升（如 `lzo1x,L14,BS=64K,FP=3`：1709→3386→6441） | 线程并行扩展明显，符合 CPU 路径预期 |
+| CPU 目标频率 vs 实际频率 | 系统调频与执行期监测 | `Target=5000MHz` 实测 `Avg≈4004~4194MHz`，`Target=1900MHz` 实测 `Avg≈1697~1699MHz` | 结论必须以实际 MHz（`FreqAvgMHz`）为准，不能用目标频点替代 |
+
+#### 4.5 数据完整性与说明
+
+1. 本章已列出当前批次 **全部被测配置**（GPU 24 组 + CPU 48 组），不再使用代表配置替代。
+2. 频率字段同时保留 `FreqTargetMHz` 与 `FreqAvgMHz`，并在分析中优先使用实测频率。
+3. `DecPowerW` 在当前源 CSV 中大多为空；本章按统一口径回填 `DecPowerW := CompPowerW`。
+4. 低频 CPU 点位曾出现 `CompPowerW=0`；现已用“动态功率优先、活动功率回退”口径重算并修正。
+5. 参数维度与实现映射已在 4.4 分项列出，可与第3章实现章节逐项对照。
+
+---
+
+### 5. 当前结论和未来方向
+
+#### 5.1 当前结论
+
+1. `lzo_gpu` 已形成稳定的实现主线（内核 + runtime + pipeline）。
+2. GPU 对 CPU 的压缩 total 优势明确（约 `2.17x` 中位数口径）。
+3. 结论口径已切换为“全配置 + 实际 MHz”，`FreqAvgMHz` 是唯一频率分析依据。
+4. 功率口径已统一：低频 CPU 功率不再为 0，`DecPowerW` 使用与 `CompPowerW` 一致的回填值。
+5. 功耗与能效结论仍偏向 GPU（更高吞吐 + 更低 J/GB）。
+6. 未采纳候选已完成分账，不再混入主线结论。
+
+#### 5.2 未来方向
+
+1. 继续压缩 host/runtime 路径开销，提升 total 兑现率；
+2. 在高熵/低熵 workload 上分层调优 pipeline 与 pack gate；
+3. 建立更细粒度频率-功耗-吞吐联合模型；
+4. 持续用 debug counter 做证据化回归控制。
+
+#### 5.3 Intel 实现证据索引（扩展）
+
+> 目的：将 LZO Intel 章节中的每条结论绑定到明确实现路径，保证“可追溯、可复现、可审计”。
+
+##### 5.3.1 压缩路径检查点（调用链）
+
+1. 入口模式解析：`run_lzo_standalone` 识别 `-z`。
+2. bench 参数组合：`run_lzo_bench` 生成候选配置。
+3. 算法分流：`lzo1x` 与 `lzo1y` 路由。
+4. 核心入口：`lzo_compress_core`。
+5. pipeline 入口：`lzo_compress_core_pipeline`（条件命中时）。
+6. 块大小选择：依据 `block_size` 计算 `num_blocks`。
+7. worker 规模估计：按设备并发能力推导。
+8. local size 约束：对齐 `max_work_group_size`。
+9. workspace 申请：`d_in` grow-only。
+10. workspace 申请：`d_out` grow-only。
+11. workspace 申请：`d_lens` grow-only。
+12. 字典缓冲申请：`d_dict` grow-only。
+13. 输入上传：`write_buffer_auto`。
+14. kernel 参数绑定：compress kernel。
+15. NDRange 发射：`lzo1x_block_compress` 或 `lzo1y_block_compress`。
+16. 等待完成：事件链或 `clFinish`。
+17. 压缩长度回读：读取每块 `out_len`。
+18. 稀疏总量统计：`sparse_bytes`。
+19. pack 启停判定：`lzo_should_use_device_compaction`。
+20. 判定阈值：最小块数。
+21. 判定阈值：最小节省比例。
+22. 判定阈值：最小节省字节。
+23. pack kernel 发射：`lzo_pack_compressed_blocks`（1x）。
+24. packed 长度回读：`packed_bytes`。
+25. 输出路径分支：packed 或 sparse。
+26. 容器头写入：算法标识 + 块参数。
+27. 长度表写入：每块压缩长度。
+28. payload 写入：压缩体。
+29. setvbuf 大缓冲启用。
+30. chunked 写回路径执行（必要时）。
+31. timing 采样：read/upload/kernel/pack/readback/write。
+32. 指标计算：`CompKernel`。
+33. 指标计算：`CompTotal`。
+34. 指标计算：`Ratio`。
+35. debug 计数器回读（启用时）。
+36. 失败路径：输入读取失败。
+37. 失败路径：kernel 执行失败。
+38. 失败路径：pack 回退。
+39. 失败路径：输出写入失败。
+40. 资源回收：事件与临时对象释放。
+
+##### 5.3.2 解压路径检查点（调用链）
+
+1. 入口模式解析：`run_lzo_standalone` 识别 `-d`。
+2. 容器头解析：读取算法/块参数。
+3. 块偏移计算：构建 `comp_offsets`。
+4. 块长度构建：`comp_lens`。
+5. 输出容量估算：分配 `decomp_out`。
+6. 元数据缓冲申请：`d_comp_off`。
+7. 元数据缓冲申请：`d_comp_lens`。
+8. 输出长度缓冲申请：`d_out_lens`。
+9. payload 上传：压缩输入到设备。
+10. metadata 上传：offset/lens 到设备。
+11. worker 规模估计：解压路径。
+12. local size 清理：解压路径。
+13. kernel 参数绑定：decompress kernel。
+14. NDRange 发射：`lzo1x_block_decompress` 或 `lzo1y_block_decompress`。
+15. 等待完成：事件链或 `clFinish`。
+16. out_lens 回读：每块解压长度。
+17. 输出路径选择：map / readbuffer。
+18. map 路径写出：直接映射输出。
+19. readbuffer 路径写出：staging + fwrite。
+20. chunked 路径写出：分块复制。
+21. timing 采样：upload/kernel/readback/write。
+22. 指标计算：`DecKernel`。
+23. 指标计算：`DecTotal`。
+24. roundtrip 校验（bench）。
+25. token 计数统计。
+26. literal 计数统计。
+27. match 计数统计。
+28. small-offset 计数统计。
+29. output-error 计数统计。
+30. `COPY_MATCH` 非重叠快路径命中。
+31. `COPY_MATCH` offset=1 命中。
+32. `COPY_MATCH` offset=2 命中。
+33. `COPY_MATCH` offset=4 命中。
+34. `COPY_MATCH` 其他小 offset 命中。
+35. 分段向量复制命中。
+36. 越界检查触发记录。
+37. 输入截断检查触发记录。
+38. 输出截断检查触发记录。
+39. 错误码上抛到调用层。
+40. 资源回收与状态复位。
+
+##### 5.3.3 主机端与运行时检查点（调用链）
+
+1. platform 枚举。
+2. device 枚举。
+3. GPU 优先选择策略。
+4. 环境变量覆盖设备选择。
+5. 统一内存属性读取。
+6. standard-copy 偏好判定。
+7. zero-copy 偏好判定。
+8. context 创建。
+9. command queue 创建。
+10. program 构建（源码或缓存）。
+11. kernel 对象创建。
+12. workspace 初始化。
+13. workspace grow-only 扩容。
+14. workspace 容量字段更新。
+15. 压缩路径 buffer 复用。
+16. 解压路径 buffer 复用。
+17. pipeline slot 初始化。
+18. pipeline slot 轮转。
+19. pipeline inflight drain。
+20. pipeline 阈值判定。
+21. 熵估计采样。
+22. 熵门控决策记录。
+23. pack gate 决策记录。
+24. 内核参数缓存命中记录。
+25. epoch 回绕判定。
+26. 字典清零执行。
+27. 大文件路径调度。
+28. 小文件路径调度。
+29. warmup 轮次执行。
+30. 统计轮次执行。
+31. mean 统计。
+32. median 统计。
+33. p90 统计。
+34. CSV 写入。
+35. 控制台摘要输出。
+36. 错误码标准化。
+37. map 失败回退策略。
+38. pack 失败回退策略。
+39. pipeline 失败回退策略。
+40. 文件读失败处理。
+41. 文件写失败处理。
+42. 设备掉线处理。
+43. kernel build 失败处理。
+44. queue flush/finalize。
+45. 资源释放：kernel。
+46. 资源释放：program。
+47. 资源释放：queue。
+48. 资源释放：context。
+49. daemon 模式请求循环。
+50. client 模式请求重试。
+51. socket 连接超时处理。
+52. socket 收发异常处理。
+53. 参数非法值纠正。
+54. block size 纠正日志。
+55. local size 纠正日志。
+56. worker 数纠正日志。
+57. pipeline 门限日志。
+58. 频点日志。
+59. 功耗字段日志。
+60. 最终工件路径确认。
+
+#### 5.4 Intel 实验矩阵与分层统计（扩展）
+
+##### 5.4.1 参数矩阵
+
+- 算法：`lzo1x`, `lzo1y`
+- block size：`64K`, `128K`, `256K`
+- level：`L13`, `L14`, `L15`
+- 线程：CPU `1/2/3/4`
+- 频率：`300~1500MHz`（采样点）
+- pipeline：on/off + 熵门控
+
+##### 5.4.2 指标矩阵
+
+1. `CompKernel` mean。
+2. `CompKernel` median。
+3. `CompKernel` p90。
+4. `DecKernel` mean。
+5. `DecKernel` median。
+6. `DecKernel` p90。
+7. `CompTotal` mean。
+8. `CompTotal` median。
+9. `CompTotal` p90。
+10. `DecTotal` mean。
+11. `DecTotal` median。
+12. `DecTotal` p90。
+13. `Ratio` mean。
+14. `Ratio` median。
+15. ratio 波动范围。
+16. kernel/total 差距。
+17. 压缩阶段功率。
+18. 解压阶段功率。
+19. MB/s/W。
+20. J/GB。
+
+##### 5.4.3 统计核查清单
+
+1. 数据字段完整性核查。
+2. 单位一致性核查。
+3. 样本数下限核查。
+4. warmup 排除核查。
+5. 离群点处理核查。
+6. mean/median 同向性核查。
+7. p90 异常核查。
+8. 配置日志完整性核查。
+9. roundtrip 全通过核查。
+10. parse fail 为零核查。
+11. output error 为零核查。
+12. CSV 与文档表格一致性核查。
+13. 文本结论与数据一致性核查。
+14. GPU vs CPU 边界核查。
+15. 未采纳项隔离核查。
+16. Nvidia 章节保留核查。
+17. 架构图存在性核查。
+18. 压缩流程图存在性核查。
+19. 解压流程图存在性核查。
+20. 五章结构完整性核查。
+21. 功耗公式一致性核查。
+22. 能效公式一致性核查。
+23. 工件路径可追踪核查。
+24. 哈希证据完整性核查。
+25. 未来方向可执行性核查。
+
+##### 5.4.4 典型 workload 分类（扩展）
+
+| 类别 | 特征 | GPU 预期 | 主要风险 | 监控指标 |
+| --- | --- | --- | --- | --- |
+| 高重复日志类 | 小 offset 高频，match 长 | kernel/total 双优 | pack 误触发 | small-offset, pack gain |
+| 中重复业务类 | token 密度均衡 | kernel 明显优 | runtime 开销 | kernel-total gap |
+| 高熵二进制类 | 匹配稀疏 | kernel 优势下降 | ratio 不佳 | ratio, search miss |
+| 超小文件集合 | 调度占比高 | total 可能不优 | launch overhead | total variance |
+| 大文件流式类 | 长时间稳定执行 | pipeline 有益 | 尾部排空 | tail latency |
+
+#### 5.5 Intel 风险与缓解（扩展）
+
+| 风险编号 | 风险描述 | 触发条件 | 影响 | 缓解措施 |
+| --- | --- | --- | --- | --- |
+| R1 | 频率提升收益不达预期 | 带宽受限主导 | 调频收益低 | 固定在稳定频段，优先优化 runtime |
+| R2 | pack 误触发导致回退 | 节省比例不足 | total 下降 | 三阈值门控 + 回退到 sparse |
+| R3 | pipeline 在高熵无收益 | 熵门控阈值失配 | 延迟上升 | 启用熵估计并动态关闭 |
+| R4 | 小文件路径被启动开销吞噬 | block 数过小 | GPU total 不占优 | 小文件聚合或回路由 CPU |
+| R5 | 字典 epoch 回绕污染 | 长时间运行 | 错误匹配风险 | 回绕前强制清零字典 |
+| R6 | map/unmap 在特定驱动失效 | 驱动实现差异 | IO 抖动 | 自动回退 standard-copy |
+| R7 | 参数漂移导致结果不可比 | bench 脚本变动 | 无法横向比较 | 固定模板 + 参数落盘 |
+| R8 | 统计样本不足 | 轮次过少 | 结论不稳 | 增加重复次数与置信检查 |
+| R9 | 文档与实现脱节 | 代码更新后未同步 | 决策误导 | 每次迭代更新实现覆盖表 |
+| R10 | 历史候选混入主线 | 维护不规范 | 结论混乱 | 采纳/未采纳双账本制度 |
+
+#### 5.6 Intel 迭代检查清单（扩展）
+
+1. 新改动是否标注动机。
+2. 新改动是否给出设计说明。
+3. 新改动是否列出实现位置。
+4. 新改动是否给出效果量化。
+5. 是否补充对照组。
+6. 是否补充功耗字段。
+7. 是否补充能效字段。
+8. 是否补充失败项说明。
+9. 是否更新未采纳表。
+10. 是否更新实现覆盖表。
+11. 是否更新架构图（如涉及模块新增）。
+12. 是否更新流程图（如涉及流程变化）。
+13. 是否更新统计表。
+14. 是否更新结论段。
+15. 是否更新未来方向段。
+16. 是否核查 Nvidia 章节保留。
+17. 是否核查 GPU vs CPU 边界。
+18. 是否核查术语统一。
+19. 是否核查单位统一。
+20. 是否核查哈希证据。
+
+#### 5.7 Intel 小结（扩展）
+
+1. 本章已经把 LZO Intel 路线整理为结构化、证据化、可追溯文本。
+2. 本章已经覆盖压缩核、解压核、主机端三大实现层。
+3. 本章已经明确 GPU vs CPU 的对比边界，不混入 hybrid 对比。
+4. 本章已经补齐功耗、能效与频率分析维度。
+5. 本章后续将按“增量更新 + 双账本维护”持续演进。
+
+#### 5.8 Intel 术语与口径附注（扩展）
+
+1. `CompKernel` 指纯 kernel 执行吞吐，不含 H2D/D2H。
+2. `DecKernel` 指解压 kernel 执行吞吐，不含主机端组装。
+3. `CompTotal` 包含 read/upload/kernel/readback/write 全流程。
+4. `DecTotal` 包含 parse/upload/kernel/readback/write 全流程。
+5. `Ratio` 统一定义为 `compressed_size / input_size`。
+6. 频率字段统一用 MHz。
+7. 功率字段统一用 W。
+8. 能效字段统一用 MB/s/W。
+9. 单位数据能耗统一用 J/GB。
+10. 文件大小口径统一采用二进制容量换算并在图表中标注。
+11. 统计均值默认排除 warmup。
+12. 中位数用于降低离群样本影响。
+13. P90 用于观察尾部延迟与稳定性。
+14. 小文件定义为“块数较少且调度占比高”的样本。
+15. 高熵样本定义为“match 稀疏且 ratio 偏高”的样本。
+16. 高重复样本定义为“small-offset 命中与长 match 同时较高”的样本。
+17. pipeline 开启条件受规模阈值与熵门控共同控制。
+18. pack 开启条件受节省比例/字节/块数三阈值控制。
+19. 回退策略是主线机制，不视为失败实现。
+20. 所有结论均以当前文档中列出的工件为准。
+21. Nvidia 章节为保留章节，不参与 Intel 主结论推导。
+22. Hybrid 对比不在本文件展开，避免边界混淆。
+23. 若代码更新导致口径变化，需先更新本附注后再更新结论段。
+24. 若统计脚本变更，需同步记录字段映射变化。
+25. 若新增指标，需明确其单位与采样时机。
+
+#### 5.9 Intel 发布前复核（扩展）
+
+1. Intel 五章标题顺序保持固定，不跨章混写。
+2. 核心优化必须按压缩核/解压核/主机端三类归档。
+3. 已采纳项必须保持“动机/设计/实现/效果”四段。
+4. 未采纳项必须仅在未采纳表格出现，不进入主结论。
+5. GPU 文档只讨论 GPU vs CPU，不混入 Hybrid 对比结论。
+6. 频率结论必须同时给出吞吐变化幅度。
+7. 功耗结论必须同时给出能效指标，不单报功率。
+8. 所有公式必须与表格字段保持一致。
+9. 引用函数名必须能在代码中检索到。
+10. 引用工件路径必须在仓库可定位。
+11. Nvidia 章节必须保留在文末作为独立章节。
+12. Intel 主结论必须建立在 Intel 数据集之上。
+13. 文档中如有“默认参数”必须与当前实现一致。
+14. 若发现回退证据，优先更新未采纳表而非删除记录。
+15. 发布前再次核查 roundtrip 正确性结论未被覆盖。
+
+---
+
+## Nvidia 平台（原有章节保留）
+
+> 注：按你的要求，此章节保留，不删除。
+
+### A. 平台差异
+
+- Intel iGPU：统一内存，map/unmap 成本低；
+- Nvidia dGPU：显存分离，D2H/H2D 成本影响 total 更明显。
+
+### B. 代表工件
+
+- CPU baseline：`formal_full_lzo_cpu_baseline_t123468_energy/...`
+- GPU pre-mod：`formal_full_lzo_gpu_baseline_unmodified_energy/...`
+- GPU post-mod：`formal_full_lzo_gpu_final_energy_r2/...`
+
+### C. 当前摘要
+
+1. post-mod 在 kernel 侧有明显提升；
+2. total 提升幅度受 host/runtime 约束；
+3. 后续仍需针对 readback/组装路径做专项优化。

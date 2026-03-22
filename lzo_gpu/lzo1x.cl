@@ -365,23 +365,28 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
         m_len = 4;
         /* Vectorized match check (unrolled if requested) */
 #ifdef LZO_USE_UNROLL2
-        while (ip + m_len + 16 <= ip_end) {
-            ulong ip_val = UA_GET_LE64(ip + m_len);
-            ulong mp_val = UA_GET_LE64(m_pos + m_len);
-
-            if (ip_val != mp_val) {
-                ulong diff = ip_val ^ mp_val;
-                m_len += (ctz(diff) >> 3);
+        while (ip + m_len + 32 <= ip_end) {
+            ulong diff0 = UA_GET_LE64(ip + m_len) ^ UA_GET_LE64(m_pos + m_len);
+            if (diff0 != 0) {
+                m_len += (ctz(diff0) >> 3);
                 goto m_len_done;
             }
-            ip_val = UA_GET_LE64(ip + m_len + 8);
-            mp_val = UA_GET_LE64(m_pos + m_len + 8);
-            if (ip_val != mp_val) {
-                ulong diff = ip_val ^ mp_val;
-                m_len += 8 + (ctz(diff) >> 3);
+            ulong diff1 = UA_GET_LE64(ip + m_len + 8) ^ UA_GET_LE64(m_pos + m_len + 8);
+            if (diff1 != 0) {
+                m_len += 8 + (ctz(diff1) >> 3);
                 goto m_len_done;
             }
-            m_len += 16;
+            ulong diff2 = UA_GET_LE64(ip + m_len + 16) ^ UA_GET_LE64(m_pos + m_len + 16);
+            if (diff2 != 0) {
+                m_len += 16 + (ctz(diff2) >> 3);
+                goto m_len_done;
+            }
+            ulong diff3 = UA_GET_LE64(ip + m_len + 24) ^ UA_GET_LE64(m_pos + m_len + 24);
+            if (diff3 != 0) {
+                m_len += 24 + (ctz(diff3) >> 3);
+                goto m_len_done;
+            }
+            m_len += 32;
         }
         while (ip + m_len + 8 <= ip_end) {
             ulong ip_val = UA_GET_LE64(ip + m_len);
@@ -816,13 +821,24 @@ __kernel void lzo_pack_compressed_blocks(__global const uchar* sparse_out,
                                          uint worst_blk,
                                          uint total_blocks)
 {
-    uint gid = get_global_id(0);
-    uint gsz = get_global_size(0);
-    for (uint idx = gid; idx < total_blocks; idx += gsz) {
-        uint len = block_lens[idx];
-        if (len == 0) continue;
-        uchar const* src = sparse_out + idx * worst_blk;
-        uchar* dst = packed_out + packed_offsets[idx];
-        for (uint i = 0; i < len; ++i) dst[i] = src[i];
+    uint blk = get_group_id(0);
+    uint lane = get_local_id(0);
+    uint lanes = get_local_size(0);
+
+    if (blk >= total_blocks) return;
+
+    {
+        uint len = block_lens[blk];
+        uint vec_end = len & ~15u;
+        __global const uchar* src = sparse_out + blk * worst_blk;
+        __global uchar* dst = packed_out + packed_offsets[blk];
+
+        for (uint pos = lane * 16u; pos < vec_end; pos += lanes * 16u) {
+            uchar16 c = vload16(0, src + pos);
+            vstore16(c, 0, dst + pos);
+        }
+        for (uint pos = vec_end + lane; pos < len; pos += lanes) {
+            dst[pos] = src[pos];
+        }
     }
 }

@@ -326,6 +326,15 @@ static double median_double(const double *vals, size_t n) {
     return out;
 }
 
+static double event_elapsed_us(cl_event ev) {
+    cl_ulong st = 0, en = 0;
+    if (!ev) return 0.0;
+    if (clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(st), &st, NULL) != CL_SUCCESS) return 0.0;
+    if (clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(en), &en, NULL) != CL_SUCCESS) return 0.0;
+    if (en <= st) return 0.0;
+    return (double)(en - st) / 1000.0;
+}
+
 static double elapsed_sec(const struct timespec *start, const struct timespec *end) {
     return (double)(end->tv_sec - start->tv_sec) +
            (double)(end->tv_nsec - start->tv_nsec) / 1000000000.0;
@@ -731,9 +740,6 @@ static int run_lzo_bench(const char *in_path,
             goto iter_cleanup;
         }
 
-        /* Time the total decompression (upload + kernel + verify) */
-        uint64_t dec_total_start = now_ns();
-
         /* Grow decompression CL buffers only when capacity is insufficient */
         if (nblk * sizeof(cl_uint) > bench_d_off_cap) {
             if (bench_d_off) clReleaseMemObject(bench_d_off);
@@ -835,18 +841,25 @@ static int run_lzo_bench(const char *in_path,
             bench_dec_kernel_set = 1;
         }
 
-        uint64_t td0 = now_ns();
         cl_event dec_kernel_evt = NULL;
         err = clEnqueueNDRangeKernel(q, krn_d, 1, NULL, &bench_dec_global, &bench_dec_local, 2, write_events, &dec_kernel_evt);
+        double dec_upload_us = 0.0;
+        for (int wi = 0; wi < 2; ++wi) {
+            if (write_events[wi]) {
+                clWaitForEvents(1, &write_events[wi]);
+                dec_upload_us += event_elapsed_us(write_events[wi]);
+            }
+        }
         if (write_events[0]) clReleaseEvent(write_events[0]);
         if (write_events[1]) clReleaseEvent(write_events[1]);
+        double dec_kernel_profile_us = 0.0;
         if (err == CL_SUCCESS && dec_kernel_evt) {
             clWaitForEvents(1, &dec_kernel_evt);
+            dec_kernel_profile_us = event_elapsed_us(dec_kernel_evt);
             clReleaseEvent(dec_kernel_evt);
             dec_kernel_evt = NULL;
         }
-        uint64_t td1 = now_ns();
-        dec_kernel_us = (double)(td1 - td0) / 1000.0;
+        dec_kernel_us = dec_kernel_profile_us;
         if (err != CL_SUCCESS) {
             verify_ok = 0;
             goto iter_cleanup;
@@ -867,11 +880,15 @@ static int run_lzo_bench(const char *in_path,
             }
         }
 
-        err = clEnqueueReadBuffer(q, bench_d_out_lens, CL_TRUE, 0, nblk * sizeof(cl_uint), bench_h_out_lens, 0, NULL, NULL);
+        cl_event read_lens_evt = NULL;
+        err = clEnqueueReadBuffer(q, bench_d_out_lens, CL_FALSE, 0, nblk * sizeof(cl_uint), bench_h_out_lens, 0, NULL, &read_lens_evt);
         if (err != CL_SUCCESS) {
             verify_ok = 0;
             goto iter_cleanup;
         }
+        clWaitForEvents(1, &read_lens_evt);
+        double dec_read_us = event_elapsed_us(read_lens_evt);
+        clReleaseEvent(read_lens_evt);
         size_t out_total = 0;
         for (size_t i = 0; i < nblk; ++i) {
             if (bench_h_out_lens[i] == 0xFFFFFFFFu) {
@@ -905,8 +922,7 @@ static int run_lzo_bench(const char *in_path,
             verify_ok = 0;
         }
         clEnqueueUnmapMemObject(q, bench_d_out, map_dec, 0, NULL, NULL);
-        uint64_t dec_total_end = now_ns();
-        double dec_total_us = (double)(dec_total_end - dec_total_start) / 1000.0;
+        double dec_total_us = dec_upload_us + dec_kernel_us + dec_read_us;
         if (!verify_ok) {
             goto iter_cleanup;
         }
@@ -939,15 +955,8 @@ static int run_lzo_bench(const char *in_path,
         comp_tp[n] = (tc.kernel_exec_us > 0) ? (in_mb * 1000000.0 / (double)tc.kernel_exec_us) : 0.0;
         dec_tp[n] = (dec_kernel_us > 0.0) ? (in_mb * 1000000.0 / dec_kernel_us) : 0.0;
         {
-            /* Exclude host file I/O from total throughput (keep device transfer + compute path). */
-            double comp_total_us = (double)time_us;
-            double io_read_us = (double)tc.file_read_us;
-            double io_write_us = (double)tc.file_write_us;
-            if (comp_total_us > io_read_us + io_write_us) {
-                comp_total_us -= (io_read_us + io_write_us);
-            } else {
-                comp_total_us = 0.0;
-            }
+            /* Total throughput = device upload + kernel + device download (exclude verify / wall-time). */
+            double comp_total_us = (double)tc.data_upload_us + (double)tc.kernel_exec_us + (double)tc.download_total_us;
             comp_total_tp[n] = (comp_total_us > 0.0) ? (in_mb * 1000000.0 / comp_total_us) : 0.0;
         }
         dec_total_tp[n] = (dec_total_us > 0.0) ? (in_mb * 1000000.0 / dec_total_us) : 0.0;

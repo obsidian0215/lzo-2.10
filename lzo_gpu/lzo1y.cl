@@ -376,15 +376,31 @@ m_len_done:
         ip += m_len;
         ii = ip;
 
-        uint is_m2 = (m_len <= M2_MAX_LEN) & (m_off <= M2_MAX_OFFSET);
-        uint is_m3 = (m_off <= M3_MAX_OFFSET) & !is_m2;
-
-        if (is_m2) {
+        if (m_off <= M2_MAX_OFFSET) {
             m_off -= 1;
-            *op++ = LZO_BYTE(((m_len + 1) << 4) | ((m_off & 3) << 2));
-            *op++ = LZO_BYTE(m_off >> 2);
+            if (m_len <= M2_MAX_LEN) {
+                *op++ = LZO_BYTE(((m_len + 1) << 4) | ((m_off & 3) << 2));
+                *op++ = LZO_BYTE(m_off >> 2);
+                goto next;
+            }
+
+            /* small-offset but long-match: direct M3 path for lzo1y */
+            if (m_len <= M3_MAX_LEN)
+                *op++ = LZO_BYTE(M3_MARKER | (m_len - 2));
+            else {
+                m_len -= M3_MAX_LEN;
+                *op++ = M3_MARKER | 0;
+                while(m_len > 255) {
+                    m_len -= 255;
+                    UA_SET1(op, 0);
+                    op++;
+                }
+                *op++ = LZO_BYTE(m_len);
+            }
+            *op++ = LZO_BYTE(m_off << 2);
+            *op++ = LZO_BYTE(m_off >> 6);
         }
-        else if (is_m3) {
+        else if (m_off <= M3_MAX_OFFSET) {
             m_off -= 1;
             if (m_len <= M3_MAX_LEN)
                 *op++ = LZO_BYTE(M3_MARKER | (m_len - 2));

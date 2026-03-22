@@ -606,7 +606,15 @@ static int lzo_pipeline_drain_slot(
                 {
                     cl_uint worst_blk_cl = (cl_uint)worst_blk;
                     cl_uint total_blocks_cl = (cl_uint)slot->block_count;
-                    size_t pack_global = slot->block_count ? slot->block_count : 1;
+                    size_t pack_local = (size_t)lzo_env_unsigned_value("LZO_GPU_PACK_LSZ", 64U);
+                    if (pack_local == 0) pack_local = 1;
+                    if (pack_local > 256) pack_local = 256;
+                    if (pack_local > slot->block_count && slot->block_count > 0) {
+                        size_t p2 = 1;
+                        while ((p2 << 1) <= slot->block_count) p2 <<= 1;
+                        pack_local = p2;
+                    }
+                    size_t pack_global = slot->block_count ? (slot->block_count * pack_local) : pack_local;
                     uint64_t t_pack_start = core_now_ns();
                     err  = clSetKernelArg(pack_kernel, 0, sizeof(cl_mem), &slot->d_out);
                     err |= clSetKernelArg(pack_kernel, 1, sizeof(cl_mem), &slot->d_len);
@@ -620,7 +628,7 @@ static int lzo_pipeline_drain_slot(
                         free(lens_chunk);
                         return -1;
                     }
-                    err = clEnqueueNDRangeKernel(queue, pack_kernel, 1, NULL, &pack_global, NULL, 0, NULL, NULL);
+                    err = clEnqueueNDRangeKernel(queue, pack_kernel, 1, NULL, &pack_global, &pack_local, 0, NULL, NULL);
                     if (err != CL_SUCCESS) {
                         free(packed_offsets);
                         free(packed_chunk);
