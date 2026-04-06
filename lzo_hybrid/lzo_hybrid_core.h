@@ -43,7 +43,6 @@ typedef struct {
     /* Hybrid split */
     hybrid_split_mode_t split_mode;
     double gpu_ratio;        /* GPU fraction [0.0, 1.0], default 0.8 */
-    int striped_split;       /* 0=prefix contiguous split (default), 1=distributed striped split */
     size_t adaptive_sample_blocks;
 
     /* CPU worker */
@@ -83,6 +82,12 @@ typedef struct {
     size_t comp_lens_cap;
     size_t decomp_out_cap;
     size_t out_lens_cap;
+
+    /* Adaptive ratio cache (per-process, reused in bench loops) */
+    int adaptive_ratio_cache_comp_valid;
+    double adaptive_ratio_cache_comp;
+    int adaptive_ratio_cache_dec_valid;
+    double adaptive_ratio_cache_dec;
 
 } hybrid_workspace_t;
 

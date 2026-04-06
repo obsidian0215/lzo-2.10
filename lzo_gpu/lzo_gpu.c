@@ -31,8 +31,9 @@
 #include "lzo_gpu_utils.h"
 #include "lzo_gpu_core.h"
 
-/* Forward declarations for daemon and client modules */
-#include "lzo_gpu_utils.h"
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 #define now_ns lzo_now_ns
 
@@ -113,6 +114,16 @@ static cl_device_type preferred_opencl_device_type(void)
     if (strcasecmp(pref, "DEFAULT") == 0) return CL_DEVICE_TYPE_DEFAULT;
     if (strcasecmp(pref, "ALL") == 0) return CL_DEVICE_TYPE_ALL;
     return CL_DEVICE_TYPE_GPU;
+}
+
+static int lzo_ocl_debug_enabled(void)
+{
+    return 0;
+}
+
+static int lzo_queue_profiling_enabled(void)
+{
+    return 1;
 }
 
 static cl_int lzo_try_get_device(cl_platform_id *platforms, cl_uint num_platforms, cl_device_type dtype, cl_device_id *out_dev, cl_platform_id *out_pf)
@@ -200,7 +211,7 @@ static void ocl_init(void)
         return;
     }
 
-    {
+    if (lzo_ocl_debug_enabled()) {
         char pfname[256] = {0};
         char devname[256] = {0};
         cl_device_type devtype = 0;
@@ -222,8 +233,9 @@ static void ocl_init(void)
         q = NULL;
         return;
     }
+    cl_queue_properties profiling_flag = lzo_queue_profiling_enabled() ? CL_QUEUE_PROFILING_ENABLE : 0;
     cl_queue_properties props[] = {
-        CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0
+        CL_QUEUE_PROPERTIES, profiling_flag, 0
     };
     q = clCreateCommandQueueWithProperties(ctx, dev, props, &err);
     if (err != CL_SUCCESS || q == NULL) {
@@ -262,24 +274,11 @@ void print_buildlog(cl_program program, cl_device_id device) {
     free(buff_erro);
     fprintf(stderr, "clBuildProgram failed\n");
 }
-
-
-/* Helper: load program from source file with D_BITS macro */
-static cl_program load_prog_with_dbits(const char* alg_name, int bits)
-{
-    char build_log[8192] = {0};
-    cl_program p = lzo_load_program_with_dbits(ctx, dev, alg_name, bits, build_log, sizeof(build_log));
-    if (!p) {
-        fprintf(stderr, "failed to load/compile kernel %s (D_BITS=%d): %s\n", alg_name, bits, build_log);
-    }
-    return p;
-}
-
 static inline void show_help(char *prog_name)
 {
     fprintf(stderr, "Unified LZO GPU Tool\n");
     fprintf(stderr, "Usage Modes:\n");
-    fprintf(stderr, "  1. Standalone:   %s [options] <input_file>\n", prog_name);
+    fprintf(stderr, "  1. Standalone:   %s [options] <input_file|->\n", prog_name);
     fprintf(stderr, "  2. Run Daemon:   %s --daemon [options]\n", prog_name);
     fprintf(stderr, "  3. Use Daemon:   %s --use-daemon [options] <input_file>\n", prog_name);
     fprintf(stderr, "  4. Stop Daemon:  %s --stop-daemon\n", prog_name);
@@ -294,6 +293,10 @@ static inline void show_help(char *prog_name)
     fprintf(stderr, "  -v, --verbose        Enable performance statistics\n");
     fprintf(stderr, "  --local N            Local work-group size (default: 1)\n");
     fprintf(stderr, "  --bench [N]          Stable benchmark (compress+decompress+verify), optional N seconds (default: 3)\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Streaming:\n");
+    fprintf(stderr, "  input '-'            Read input from stdin (standalone mode only)\n");
+    fprintf(stderr, "  output '-'           Write output to stdout (standalone mode only)\n");
     fprintf(stderr, "Detailed Help:\n");
     fprintf(stderr, "  %s --daemon -h           # Daemon-specific settings\n", prog_name);
     fprintf(stderr, "  %s --use-daemon -h       # Client-specific settings\n\n", prog_name);
@@ -341,9 +344,80 @@ static double elapsed_sec(const struct timespec *start, const struct timespec *e
 }
 
 static int lzo_debug_counters_enabled_cli(void) {
-    const char* env = getenv("LZO_GPU_DEBUG_COUNTERS");
-    if (!env || !*env) return 0;
-    return strcmp(env, "0") != 0;
+    return 0;
+}
+
+static int path_is_dash(const char* path) {
+    return path && strcmp(path, "-") == 0;
+}
+
+static int create_temp_path(char* path_buf, size_t path_buf_size, const char* templ) {
+    if (!path_buf || path_buf_size == 0 || !templ) return -1;
+#if defined(_WIN32) || defined(_WIN64)
+    (void)path_buf_size;
+    (void)templ;
+    return -1;
+#else
+    {
+        int fd;
+        size_t n = strlen(templ);
+        if (n + 1 > path_buf_size) return -1;
+        memcpy(path_buf, templ, n + 1);
+        fd = mkstemp(path_buf);
+        if (fd < 0) return -1;
+        close(fd);
+        unlink(path_buf);
+        return 0;
+    }
+#endif
+}
+
+static int copy_stream_to_path(FILE* in, const char* path) {
+    FILE* out;
+    unsigned char buf[1 << 20];
+    size_t nread;
+
+    if (!in || !path) return -1;
+    out = fopen(path, "wb");
+    if (!out) return -1;
+
+    while ((nread = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, nread, out) != nread) {
+            fclose(out);
+            return -1;
+        }
+    }
+    if (ferror(in)) {
+        fclose(out);
+        return -1;
+    }
+    if (fclose(out) != 0) return -1;
+    return 0;
+}
+
+static int copy_path_to_stream(const char* path, FILE* out) {
+    FILE* in;
+    unsigned char buf[1 << 20];
+    size_t nread;
+
+    if (!path || !out) return -1;
+    in = fopen(path, "rb");
+    if (!in) return -1;
+
+    while ((nread = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, nread, out) != nread) {
+            fclose(in);
+            return -1;
+        }
+    }
+    if (ferror(in)) {
+        fclose(in);
+        return -1;
+    }
+
+    if (fclose(in) != 0) return -1;
+    if (fflush(out) != 0) return -1;
+    return 0;
 }
 
 
@@ -357,6 +431,7 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
  */
 static int do_compress_mode(const char* in_path, const char* output_path, int output_explicit, int suppress_non_data, const char* alg_name, int comp_level)
 {
+    (void)output_explicit;
     if (!in_path) {
         fprintf(stderr, "error: missing input\n");
         return 1;
@@ -419,7 +494,8 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
     unsigned long overall_us = (unsigned long)((t_total_end - t_total_start) / 1000ULL);
 
     if (ret == 0) {
-        if (g_verbose) {
+        FILE* msg = suppress_non_data ? stderr : stdout;
+        if (g_verbose && !suppress_non_data) {
             response_t r = {0};
             r.status = 0;
             r.time_us = overall_us;
@@ -428,7 +504,13 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
             lzo_print_response_stats(&r, in_path, 'C', alg_id);
         } else {
             double ratio = (double)t_out.in_size / (t_out.out_size > 0 ? t_out.out_size : 1);
-            printf("%s : %zu -> %zu (%.2f:1) in %.2f ms\n", in_path, t_out.in_size, t_out.out_size, ratio, overall_us / 1000.0);
+            fprintf(msg,
+                    "%s : %zu -> %zu (%.2f:1) in %.2f ms\n",
+                    in_path,
+                    t_out.in_size,
+                    t_out.out_size,
+                    ratio,
+                    overall_us / 1000.0);
         }
     }
     if (pack_krn) clReleaseKernel(pack_krn);
@@ -441,6 +523,7 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
 
 static int do_decompress_mode(const char* lz_path, const char* output_path, int output_explicit, int suppress_non_data)
 {
+    (void)output_explicit;
     if (!lz_path) { fprintf(stderr, "error: missing input .lzo\n"); return 1; }
     int standard_copy = 0;
 
@@ -455,9 +538,9 @@ static int do_decompress_mode(const char* lz_path, const char* output_path, int 
     int debug_counters = lzo_debug_counters_enabled_cli();
     char decomp_base[64];
     if (debug_counters)
-        snprintf(decomp_base, sizeof(decomp_base), "%s_debug", alg_name);
+        snprintf(decomp_base, sizeof(decomp_base), "%s_decomp_debug", alg_name);
     else
-        snprintf(decomp_base, sizeof(decomp_base), "%s", alg_name);
+        snprintf(decomp_base, sizeof(decomp_base), "%s_decomp", alg_name);
 
     uint64_t t_total_start = now_ns();
 
@@ -508,7 +591,8 @@ static int do_decompress_mode(const char* lz_path, const char* output_path, int 
     uint64_t t_total_end = now_ns();
     unsigned long overall_us = (unsigned long)((t_total_end - t_total_start) / 1000ULL);
     if (rc == 0) {
-        if (g_verbose) {
+        FILE* msg = suppress_non_data ? stderr : stdout;
+        if (g_verbose && !suppress_non_data) {
             response_t r = {0};
             r.status = 0;
             r.time_us = overall_us;
@@ -516,7 +600,12 @@ static int do_decompress_mode(const char* lz_path, const char* output_path, int 
             r.timing = t_out;
             lzo_print_response_stats(&r, lz_path, 'D', (strcmp(alg_name, "lzo1y") == 0) ? 1 : 0);
         } else {
-            printf("%s : %zu -> %zu in %.2f ms\n", lz_path, t_out.in_size, t_out.out_size, overall_us / 1000.0);
+            fprintf(msg,
+                    "%s : %zu -> %zu in %.2f ms\n",
+                    lz_path,
+                    t_out.in_size,
+                    t_out.out_size,
+                    overall_us / 1000.0);
         }
     }
     lzo_gpu_workspace_free(&ws);
@@ -582,11 +671,11 @@ static int run_lzo_bench(const char *in_path,
     if (err != CL_SUCCESS || !pack_krn) pack_krn = NULL;
 
     char decomp_base[64];
-    /* For 99/999 we don't have debug-specific decompressor sources, use base algorithm name. */
+    /* For decompression path, use decomp-only marker to skip unnecessary comp-kernel validation. */
     if (debug_counters && comp_level != 999 && comp_level != 99)
-        snprintf(decomp_base, sizeof(decomp_base), "%s_debug", alg_name);
+        snprintf(decomp_base, sizeof(decomp_base), "%s_decomp_debug", alg_name);
     else
-        snprintf(decomp_base, sizeof(decomp_base), "%s", alg_name);
+        snprintf(decomp_base, sizeof(decomp_base), "%s_decomp", alg_name);
     int decomp_bits = (comp_level == 999 || comp_level == 99) ? LZO_DEFAULT_COMP_LEVEL : comp_level;
     cl_program prog_d = lzo_load_program_with_dbits(ctx, dev, decomp_base, decomp_bits, build_log, sizeof(build_log));
     if (!prog_d) {
@@ -664,6 +753,11 @@ static int run_lzo_bench(const char *in_path,
     /* Reusable host arrays (grown if needed) */
     cl_uint *bench_h_lens = NULL, *bench_h_off = NULL, *bench_h_out_lens = NULL;
     size_t bench_h_lens_cap = 0, bench_h_off_cap = 0, bench_h_out_lens_cap = 0;
+    cl_uint *bench_prev_lens = NULL, *bench_prev_off = NULL;
+    size_t bench_prev_lens_cap = 0, bench_prev_off_cap = 0;
+    int bench_prev_meta_valid = 0;
+    unsigned char* bench_verify_out = NULL;
+    size_t bench_verify_out_cap = 0;
     /* Decompression kernel args that stay constant across iterations */
     int bench_dec_kernel_set = 0;
     /* Cached decompression dispatch sizes */
@@ -719,15 +813,19 @@ static int run_lzo_bench(const char *in_path,
             goto iter_cleanup;
         }
 
-        void* map_len = clEnqueueMapBuffer(q, ws.d_len, CL_TRUE, CL_MAP_READ,
-                                           0, nblk * sizeof(cl_uint),
-                                           0, NULL, NULL, &err);
-        if (err != CL_SUCCESS || !map_len) {
+        err = clEnqueueReadBuffer(q,
+                                  ws.d_len,
+                                  CL_TRUE,
+                                  0,
+                                  nblk * sizeof(cl_uint),
+                                  bench_h_lens,
+                                  0,
+                                  NULL,
+                                  NULL);
+        if (err != CL_SUCCESS) {
             verify_ok = 0;
             goto iter_cleanup;
         }
-        memcpy(bench_h_lens, map_len, nblk * sizeof(cl_uint));
-        clEnqueueUnmapMemObject(q, ws.d_len, map_len, 0, NULL, NULL);
 
         for (size_t i = 0; i < nblk; ++i) {
             if ((size_t)bench_h_lens[i] > worst_blk) {
@@ -740,6 +838,8 @@ static int run_lzo_bench(const char *in_path,
             goto iter_cleanup;
         }
 
+        int dec_meta_buffers_recreated = 0;
+
         /* Grow decompression CL buffers only when capacity is insufficient */
         if (nblk * sizeof(cl_uint) > bench_d_off_cap) {
             if (bench_d_off) clReleaseMemObject(bench_d_off);
@@ -747,6 +847,7 @@ static int run_lzo_bench(const char *in_path,
             if (err != CL_SUCCESS || !bench_d_off) { bench_d_off = NULL; bench_d_off_cap = 0; verify_ok = 0; goto iter_cleanup; }
             bench_d_off_cap = nblk * sizeof(cl_uint);
             bench_dec_kernel_set = 0;
+            dec_meta_buffers_recreated = 1;
         }
         if (nblk * sizeof(cl_uint) > bench_d_comp_lens_cap) {
             if (bench_d_comp_lens) clReleaseMemObject(bench_d_comp_lens);
@@ -754,6 +855,7 @@ static int run_lzo_bench(const char *in_path,
             if (err != CL_SUCCESS || !bench_d_comp_lens) { bench_d_comp_lens = NULL; bench_d_comp_lens_cap = 0; verify_ok = 0; goto iter_cleanup; }
             bench_d_comp_lens_cap = nblk * sizeof(cl_uint);
             bench_dec_kernel_set = 0;
+            dec_meta_buffers_recreated = 1;
         }
         if (in_size > bench_d_out_cap) {
             if (bench_d_out) clReleaseMemObject(bench_d_out);
@@ -770,14 +872,58 @@ static int run_lzo_bench(const char *in_path,
             bench_dec_kernel_set = 0;
         }
 
+        size_t meta_bytes = nblk * sizeof(cl_uint);
+        int dec_meta_changed = 1;
+        if (!dec_meta_buffers_recreated &&
+            bench_prev_meta_valid &&
+            bench_prev_lens &&
+            bench_prev_off &&
+            bench_prev_lens_cap >= meta_bytes &&
+            bench_prev_off_cap >= meta_bytes &&
+            bench_dec_prev_nblk == nblk &&
+            bench_dec_prev_blk == blk &&
+            bench_dec_prev_in_size == in_size &&
+            memcmp(bench_prev_lens, bench_h_lens, meta_bytes) == 0 &&
+            memcmp(bench_prev_off, bench_h_off, meta_bytes) == 0) {
+            dec_meta_changed = 0;
+        }
+
+        if (dec_meta_changed) {
+            if (bench_prev_lens_cap < meta_bytes) {
+                cl_uint *nlens = (cl_uint*)realloc(bench_prev_lens, meta_bytes);
+                if (!nlens) {
+                    verify_ok = 0;
+                    goto iter_cleanup;
+                }
+                bench_prev_lens = nlens;
+                bench_prev_lens_cap = meta_bytes;
+            }
+            if (bench_prev_off_cap < meta_bytes) {
+                cl_uint *noff = (cl_uint*)realloc(bench_prev_off, meta_bytes);
+                if (!noff) {
+                    verify_ok = 0;
+                    goto iter_cleanup;
+                }
+                bench_prev_off = noff;
+                bench_prev_off_cap = meta_bytes;
+            }
+            memcpy(bench_prev_lens, bench_h_lens, meta_bytes);
+            memcpy(bench_prev_off, bench_h_off, meta_bytes);
+            bench_prev_meta_valid = 1;
+        }
+
         cl_event write_events[2] = { NULL, NULL };
-        cl_int err_w0 = clEnqueueWriteBuffer(q, bench_d_off, CL_FALSE, 0, nblk * sizeof(cl_uint), bench_h_off, 0, NULL, &write_events[0]);
-        cl_int err_w1 = clEnqueueWriteBuffer(q, bench_d_comp_lens, CL_FALSE, 0, nblk * sizeof(cl_uint), bench_h_lens, 0, NULL, &write_events[1]);
-        if (err_w0 != CL_SUCCESS || err_w1 != CL_SUCCESS) {
-            if (write_events[0]) clReleaseEvent(write_events[0]);
-            if (write_events[1]) clReleaseEvent(write_events[1]);
-            verify_ok = 0;
-            goto iter_cleanup;
+        cl_uint write_event_count = 0;
+        if (dec_meta_changed) {
+            cl_int err_w0 = clEnqueueWriteBuffer(q, bench_d_off, CL_FALSE, 0, meta_bytes, bench_h_off, 0, NULL, &write_events[0]);
+            cl_int err_w1 = clEnqueueWriteBuffer(q, bench_d_comp_lens, CL_FALSE, 0, meta_bytes, bench_h_lens, 0, NULL, &write_events[1]);
+            if (err_w0 != CL_SUCCESS || err_w1 != CL_SUCCESS) {
+                if (write_events[0]) clReleaseEvent(write_events[0]);
+                if (write_events[1]) clReleaseEvent(write_events[1]);
+                verify_ok = 0;
+                goto iter_cleanup;
+            }
+            write_event_count = 2;
         }
 
         /* Force kernel arg reset when compression parameters changed between iterations. */
@@ -828,7 +974,6 @@ static int run_lzo_bench(const char *in_path,
 
             /* Compute dispatch sizes once */
             bench_dec_local = (g_cli_local_size > 0) ? g_cli_local_size : 1;
-            if (bench_dec_local > nblk) bench_dec_local = 1;
             size_t target_items = (size_t)nblk;
             if (target_items == 0) target_items = 1;
             if (bench_dec_local > target_items) bench_dec_local = 1;
@@ -842,7 +987,10 @@ static int run_lzo_bench(const char *in_path,
         }
 
         cl_event dec_kernel_evt = NULL;
-        err = clEnqueueNDRangeKernel(q, krn_d, 1, NULL, &bench_dec_global, &bench_dec_local, 2, write_events, &dec_kernel_evt);
+        err = clEnqueueNDRangeKernel(q, krn_d, 1, NULL, &bench_dec_global, &bench_dec_local,
+                         write_event_count,
+                         (write_event_count > 0) ? write_events : NULL,
+                         &dec_kernel_evt);
         double dec_upload_us = 0.0;
         for (int wi = 0; wi < 2; ++wi) {
             if (write_events[wi]) {
@@ -903,15 +1051,33 @@ static int run_lzo_bench(const char *in_path,
             goto iter_cleanup;
         }
 
-        void* map_dec = clEnqueueMapBuffer(q, bench_d_out, CL_TRUE, CL_MAP_READ, 0, in_size, 0, NULL, NULL, &err);
-        if (err != CL_SUCCESS || !map_dec) {
+        if (in_size > bench_verify_out_cap) {
+            unsigned char* nbuf = (unsigned char*)realloc(bench_verify_out, in_size);
+            if (!nbuf) {
+                verify_ok = 0;
+                goto iter_cleanup;
+            }
+            bench_verify_out = nbuf;
+            bench_verify_out_cap = in_size;
+        }
+
+        err = clEnqueueReadBuffer(q,
+                                  bench_d_out,
+                                  CL_TRUE,
+                                  0,
+                                  in_size,
+                                  bench_verify_out,
+                                  0,
+                                  NULL,
+                                  NULL);
+        if (err != CL_SUCCESS) {
             verify_ok = 0;
             goto iter_cleanup;
         }
-        if (memcmp(map_dec, input_ref, in_size) != 0) {
+        if (memcmp(bench_verify_out, input_ref, in_size) != 0) {
             fprintf(stderr, "[BENCH] content mismatch level=%d nblk=%zu in_size=%zu\n", comp_level, nblk, in_size);
             size_t mpos = 0;
-            unsigned char* mdata = (unsigned char*)map_dec;
+            unsigned char* mdata = bench_verify_out;
             for (size_t i = 0; i < in_size; ++i) {
                 if (mdata[i] != input_ref[i]) {
                     mpos = i;
@@ -921,7 +1087,6 @@ static int run_lzo_bench(const char *in_path,
             fprintf(stderr, "[BENCH] first mismatch at offset %zu: got %02x expected %02x\n", mpos, mdata[mpos], input_ref[mpos]);
             verify_ok = 0;
         }
-        clEnqueueUnmapMemObject(q, bench_d_out, map_dec, 0, NULL, NULL);
         double dec_total_us = dec_upload_us + dec_kernel_us + dec_read_us;
         if (!verify_ok) {
             goto iter_cleanup;
@@ -980,6 +1145,9 @@ static int run_lzo_bench(const char *in_path,
     free(bench_h_lens);
     free(bench_h_off);
     free(bench_h_out_lens);
+    free(bench_prev_lens);
+    free(bench_prev_off);
+    free(bench_verify_out);
 
     clock_gettime(CLOCK_MONOTONIC, &ts1);
     double sec = elapsed_sec(&ts0, &ts1);
@@ -1041,9 +1209,17 @@ int run_lzo_standalone(int argc, char** argv)
     int bench_mode = 0;
     double bench_seconds = 3.0;
     int comp_level = -1; /* -1 means adaptive (not explicitly specified by user) */
-    int comp_level_specified = 0;
     const char *alg_name = "lzo1x";
-    int alg_specified = 0;
+    const char *effective_in_path = NULL;
+    const char *effective_lz_path = NULL;
+    const char *effective_output_path = NULL;
+    char temp_input_path[PATH_MAX] = {0};
+    char temp_output_path[PATH_MAX] = {0};
+    int input_from_stdin = 0;
+    int output_to_stdout = 0;
+    int have_temp_input = 0;
+    int have_temp_output = 0;
+    int rc = 1;
 
     /* parse options and positionals */
     for (int i = 1; i < argc; ++i) {
@@ -1080,7 +1256,6 @@ int run_lzo_standalone(int argc, char** argv)
             }
             const char* level_arg = argv[++i];
             comp_level = atoi(level_arg);
-            comp_level_specified = 1;
             if (comp_level != 999 && comp_level != 99 && (comp_level < 11 || comp_level > 15)) {
                 fprintf(stderr, "error: dictionary size must be between 11 and 15 bits (got %d)\n", comp_level);
                 return 1;
@@ -1093,7 +1268,6 @@ int run_lzo_standalone(int argc, char** argv)
                 return 1;
             }
             alg_name = argv[++i];
-            alg_specified = 1;
             if (strcmp(alg_name, "1x") == 0 || strcmp(alg_name, "lzo1x") == 0)
                 alg_name = "lzo1x";
             else if (strcmp(alg_name, "1y") == 0 || strcmp(alg_name, "lzo1y") == 0)
@@ -1141,7 +1315,7 @@ int run_lzo_standalone(int argc, char** argv)
             continue;
         }
         /* positional or error */
-        if (arg[0] == '-') {
+        if (arg[0] == '-' && strcmp(arg, "-") != 0) {
             fprintf(stderr, "Error: Unknown option %s\n", arg);
             fprintf(stderr, "Tips: Use -h or --help for help. Standard positional usage: %s <input> [output]\n", argv[0]);
             return 1;
@@ -1162,44 +1336,102 @@ int run_lzo_standalone(int argc, char** argv)
         fprintf(stderr, "Error: --bench only supports compress mode input (it runs compress+decompress internally)\n");
         return 1;
     }
+
+    input_from_stdin = decompress_mode ? path_is_dash(lz_path) : path_is_dash(in_path);
+
     /* Set default output names if not specified */
     char default_output[512];
     if (output_explicit == 0 || output_path == NULL) {
         if (decompress_mode) {
             if (lz_path) {
-                size_t ilen = strlen(lz_path);
-                const char *suf = ".lzo";
-                size_t suf_len = strlen(suf);
-                if (ilen > suf_len && strcmp(lz_path + ilen - suf_len, suf) == 0) {
-                    /* strip suffix */
-                    size_t n = (ilen - suf_len < sizeof(default_output) - 1) ? ilen - suf_len : sizeof(default_output) - 1;
-                    memcpy(default_output, lz_path, n);
-                    default_output[n] = '\0';
+                if (path_is_dash(lz_path)) {
+                    snprintf(default_output, sizeof(default_output), "-");
                 } else {
-                    /* append .dec */
-                    snprintf(default_output, sizeof(default_output), "%s.dec", lz_path);
+                    size_t ilen = strlen(lz_path);
+                    const char *suf = ".lzo";
+                    size_t suf_len = strlen(suf);
+                    if (ilen > suf_len && strcmp(lz_path + ilen - suf_len, suf) == 0) {
+                        /* strip suffix */
+                        size_t n = (ilen - suf_len < sizeof(default_output) - 1) ? ilen - suf_len : sizeof(default_output) - 1;
+                        memcpy(default_output, lz_path, n);
+                        default_output[n] = '\0';
+                    } else {
+                        /* append .dec */
+                        snprintf(default_output, sizeof(default_output), "%s.dec", lz_path);
+                    }
                 }
                 output_path = default_output;
             }
         } else {
             if (in_path) {
-                snprintf(default_output, sizeof(default_output), "%s.lzo", in_path);
+                if (path_is_dash(in_path)) {
+                    snprintf(default_output, sizeof(default_output), "-");
+                } else {
+                    snprintf(default_output, sizeof(default_output), "%s.lzo", in_path);
+                }
                 output_path = default_output;
             }
         }
     }
 
-    /* Decompress mode */
-    if (decompress_mode) {
-        return do_decompress_mode(lz_path, output_path, output_explicit, suppress_non_data);
-    }
+    output_to_stdout = path_is_dash(output_path);
+    if (output_to_stdout) suppress_non_data = 1;
 
     if (bench_mode) {
+        if (input_from_stdin) {
+            fprintf(stderr, "Error: --bench does not support stdin input ('-')\n");
+            return 1;
+        }
         return run_lzo_bench(in_path, alg_name, comp_level, bench_seconds);
     }
 
-    /* Compress path (simple, fast) */
-    return do_compress_mode(in_path, output_path, output_explicit, suppress_non_data, alg_name, comp_level);
+    effective_in_path = in_path;
+    effective_lz_path = lz_path;
+    effective_output_path = output_path;
+
+    if (input_from_stdin) {
+        if (create_temp_path(temp_input_path, sizeof(temp_input_path), "/tmp/lzo_gpu_stdin_XXXXXX") != 0) {
+            fprintf(stderr, "Error: failed to create temporary input path for stdin stream\n");
+            return 1;
+        }
+        if (copy_stream_to_path(stdin, temp_input_path) != 0) {
+            fprintf(stderr, "Error: failed to capture stdin into temporary input file\n");
+            remove(temp_input_path);
+            return 1;
+        }
+        have_temp_input = 1;
+        if (decompress_mode) effective_lz_path = temp_input_path;
+        else effective_in_path = temp_input_path;
+    }
+
+    if (output_to_stdout) {
+        if (create_temp_path(temp_output_path, sizeof(temp_output_path), "/tmp/lzo_gpu_stdout_XXXXXX") != 0) {
+            fprintf(stderr, "Error: failed to create temporary output path for stdout stream\n");
+            if (have_temp_input) remove(temp_input_path);
+            return 1;
+        }
+        have_temp_output = 1;
+        effective_output_path = temp_output_path;
+    }
+
+    /* Decompress mode */
+    if (decompress_mode) {
+        rc = do_decompress_mode(effective_lz_path, effective_output_path, output_explicit, suppress_non_data);
+    } else {
+        /* Compress path (simple, fast) */
+        rc = do_compress_mode(effective_in_path, effective_output_path, output_explicit, suppress_non_data, alg_name, comp_level);
+    }
+
+    if (rc == 0 && output_to_stdout) {
+        if (copy_path_to_stream(effective_output_path, stdout) != 0) {
+            fprintf(stderr, "Error: failed to emit streamed output to stdout\n");
+            rc = 1;
+        }
+    }
+
+    if (have_temp_input) remove(temp_input_path);
+    if (have_temp_output) remove(temp_output_path);
+    return rc;
 }
 
 

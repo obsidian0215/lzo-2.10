@@ -184,7 +184,16 @@ static inline uint lzo1x_hash32(uint dv)
     return dv;
 }
 
+static inline uint lzo1x_hash32_alt(uint dv)
+{
+    dv ^= dv >> 11;
+    dv *= 0x85ebca6bu;
+    dv ^= dv >> 13;
+    return dv;
+}
+
 #define DINDEX(dv,p)        ((lzo1x_hash32(dv)) >> (32 - D_BITS))
+#define DINDEX_ALT(dv,p)    ((lzo1x_hash32_alt(dv)) >> (32 - D_BITS))
 
 /* 32-bit packed dictionary: epoch_12 (bits 31:20) | offset_20 (bits 19:0) */
 #define DICT_EPOCH_SHIFT 20
@@ -310,9 +319,17 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
             dv = UA_GET_LE32(ip);
             lzo_uint ip_off = pd(ip, in);
             dindex = DINDEX(dv,ip);
+            lzo_uint dindex_alt = DINDEX_ALT(dv,ip);
 
             uint valid = 0;
+            uint valid_alt = 0;
+            uint m_off_alt = 0;
+
             m_off = dict_load32(dict, dindex, epoch, &valid);
+            if (dindex_alt != dindex) {
+                m_off_alt = dict_load32(dict, dindex_alt, epoch, &valid_alt);
+            }
+
             if (valid && m_off != 0) {
                 if (ip_off > m_off && (ip_off - m_off) <= M4_MAX_OFFSET) {
                     m_pos = in + m_off;
@@ -323,7 +340,20 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
                 }
             }
 
-            dict_store32(dict, dindex, (uint)ip_off, epoch);
+            if (valid_alt && m_off_alt != 0) {
+                if (ip_off > m_off_alt && (ip_off - m_off_alt) <= M4_MAX_OFFSET) {
+                    m_pos = in + m_off_alt;
+                    if (dv == UA_GET_LE32(m_pos)) {
+                        saved_dindex = dindex_alt;
+                        goto match_found;
+                    }
+                }
+            }
+
+            {
+                uint store_idx = (((ip_off >> 3) & 1u) && dindex_alt != dindex) ? dindex_alt : dindex;
+                dict_store32(dict, store_idx, (uint)ip_off, epoch);
+            }
 
             goto literal;
         }
@@ -811,15 +841,17 @@ __kernel void lzo1x_block_decompress(
     uint out_off = gid * blk_sz;
     uint out_len = (out_off + blk_sz <= orig_size) ? blk_sz : (orig_size - out_off);
     lzo1x_decompress(in_buf + in_off, in_len, out_buf + out_off, &out_len, NULL);
-    out_lens[gid] = out_len;
+    if (out_lens) {
+        out_lens[gid] = out_len;
+    }
 }
 
 __kernel void lzo_pack_compressed_blocks(__global const uchar* sparse_out,
-                                         __global const uint* block_lens,
-                                         __global uchar* packed_out,
-                                         __global const uint* packed_offsets,
-                                         uint worst_blk,
-                                         uint total_blocks)
+                                          __global const uint* block_lens,
+                                          __global uchar* packed_out,
+                                          __global const uint* packed_offsets,
+                                          uint worst_blk,
+                                          uint total_blocks)
 {
     uint blk = get_group_id(0);
     uint lane = get_local_id(0);
@@ -829,15 +861,65 @@ __kernel void lzo_pack_compressed_blocks(__global const uchar* sparse_out,
 
     {
         uint len = block_lens[blk];
-        uint vec_end = len & ~15u;
         __global const uchar* src = sparse_out + blk * worst_blk;
         __global uchar* dst = packed_out + packed_offsets[blk];
 
-        for (uint pos = lane * 16u; pos < vec_end; pos += lanes * 16u) {
+        if (len == 0) return;
+
+        // Bucket-based parallel copy with better workgroup utilization
+        // Small bucket (1-32 bytes): optimized scalar path with lane 0
+        if (len <= 32u) {
+            if (lane == 0) {
+                uint pos = 0;
+                if (len >= 16u) {
+                    uchar16 c16 = vload16(0, src);
+                    vstore16(c16, 0, dst);
+                    pos = 16u;
+                }
+                if (len - pos >= 8u) {
+                    uchar8 c8 = vload8(0, src + pos);
+                    vstore8(c8, 0, dst + pos);
+                    pos += 8u;
+                }
+                for (; pos < len; ++pos) dst[pos] = src[pos];
+            }
+            return;
+        }
+
+        // Medium bucket (33-128 bytes): parallel copies using multiple lanes
+        if (len <= 128u) {
+            uint vec16_end = len & ~15u;
+            // First: parallel 16-byte vector loads
+            for (uint pos = lane * 16u; pos < vec16_end; pos += lanes * 16u) {
+                uchar16 c = vload16(0, src + pos);
+                vstore16(c, 0, dst + pos);
+            }
+            // Then: remaining bytes handled by all lanes in parallel
+            for (uint pos = vec16_end + lane; pos < len; pos += lanes) {
+                dst[pos] = src[pos];
+            }
+            return;
+        }
+
+        // Large bucket (>128 bytes): fully vectorized parallel copy
+        // Use 32-byte chunks with all lanes
+        uint vec32_end = len & ~31u;
+        for (uint pos = lane * 32u; pos < vec32_end; pos += lanes * 32u) {
+            uchar16 c0 = vload16(0, src + pos);
+            uchar16 c1 = vload16(0, src + pos + 16u);
+            vstore16(c0, 0, dst + pos);
+            vstore16(c1, 0, dst + pos + 16u);
+        }
+
+        // 16-byte vectorized
+        uint vec16_end = len & ~15u;
+        for (uint pos = vec32_end + lane * 16u; pos < vec16_end; pos += lanes * 16u) {
             uchar16 c = vload16(0, src + pos);
             vstore16(c, 0, dst + pos);
         }
-        for (uint pos = vec_end + lane; pos < len; pos += lanes) {
+
+        // Tail: scalar per-lane
+        for (uint pos = vec16_end + lane; pos < len; pos += lanes) {
             dst[pos] = src[pos];
         }
     }

@@ -4,6 +4,8 @@ import subprocess
 import re
 import csv
 import hashlib
+import json
+import shutil
 import statistics
 import socket
 import sys
@@ -41,6 +43,7 @@ LZO_DAEMON_SOCKET_PATH = str(TEMP_DIR / "lzo_gpu_daemon.sock")
 LZO_DAEMON_PID_PATH = str(TEMP_DIR / "lzo_gpu_daemon.pid")
 CPU_CONTROL_SCRIPT = str(REPO_ROOT / "tools" / "cpu_control.sh")
 GPU_CONTROL_SCRIPT = str(REPO_ROOT / "tools" / "gpu_control.sh")
+BASELINE_DIR = REPO_ROOT / "exp_results" / "baseline"
 
 ALGS = ["lzo1x", "lzo1y"]
 CPU_BLOCK_SIZES = ["64K", "1M"]
@@ -55,7 +58,7 @@ HYBRID_LOCAL_SIZES = [1]
 HYBRID_GPU_RATIOS = [0.0, 0.3, 0.5, 0.7, 1.0]
 HYBRID_CPU_THREADS = [1, 2, 4]
 HYBRID_SPLIT_MODES = ["adaptive"]
-HYBRID_SPLIT_LAYOUTS = ["prefix", "striped"]
+HYBRID_SPLIT_LAYOUTS = ["prefix"]
 
 # Default frequency configs (for intel iGPU)
 DEFAULT_CPU_FREQ_MHZ = "800,1900,3000,5000"
@@ -64,6 +67,110 @@ DEFAULT_GPU_FREQ_MHZ = "500,1000,1500"
 BASELINE_IDLE_PKG_W = None
 BASELINE_IDLE_CORE_W = None
 BASELINE_IDLE_GPU_W = None
+
+BASELINE_FILE_HEADER = [
+    "File",
+    "Rows",
+    "CompTotalMean_MBps",
+    "CompTotalMedian_MBps",
+    "DecTotalMean_MBps",
+    "DecTotalMedian_MBps",
+    "RatioMean_pct",
+    "RatioMedian_pct",
+    "CompPowerMean_W",
+    "DecPowerMean_W",
+    "CompEffMean_MBpsPerW",
+    "DecEffMean_MBpsPerW",
+]
+
+ENGINE_SUMMARY_HEADER = [
+    "Engine",
+    "Rows",
+    "CompTotalMean_MBps",
+    "CompTotalMedian_MBps",
+    "DecTotalMean_MBps",
+    "DecTotalMedian_MBps",
+    "RatioMean_pct",
+    "RatioMedian_pct",
+    "CompPowerMean_W",
+    "DecPowerMean_W",
+    "CompEffMean_MBpsPerW",
+    "DecEffMean_MBpsPerW",
+]
+
+ENGINE_VS_CPU_HEADER = [
+    "File",
+    "CPU_CompTotalMean",
+    "CPU_DecTotalMean",
+    "CPU_RatioMean",
+    "GPU_CompDelta_pct",
+    "GPU_DecDelta_pct",
+    "GPU_RatioDelta_pctpt",
+    "HYB_CompDelta_pct",
+    "HYB_DecDelta_pct",
+    "HYB_RatioDelta_pctpt",
+]
+
+
+def refresh_idle_baseline(telemetry, duration_s=2.0, label=""):
+    global BASELINE_IDLE_PKG_W, BASELINE_IDLE_CORE_W, BASELINE_IDLE_GPU_W
+    if telemetry is None:
+        return
+    sec = float(duration_s if duration_s and duration_s > 0 else 2.0)
+    BASELINE_IDLE_PKG_W = telemetry.measure_idle_pkg_power_w(sec)
+    BASELINE_IDLE_CORE_W = telemetry.measure_idle_core_power_w(sec)
+    BASELINE_IDLE_GPU_W = telemetry.measure_idle_gpu_power_w(sec)
+    tag = f"[{label}] " if label else ""
+    print(
+        f"[TelemetryBaseline] {tag}"
+        f"cpu_pkg_idle={BASELINE_IDLE_PKG_W:.3f}W "
+        f"cpu_core_idle={BASELINE_IDLE_CORE_W:.3f}W "
+        f"gpu_idle={BASELINE_IDLE_GPU_W:.3f}W"
+    )
+
+
+def build_freq_target_env(cpu_freq_target, gpu_freq_target, use_mhz_mode):
+    env = {}
+    if use_mhz_mode:
+        if cpu_freq_target is not None:
+            env["HYBRID_CPU_FREQ_TARGET_MHZ"] = str(cpu_freq_target)
+            env["LZO_HYBRID_CPU_FREQ_TARGET_MHZ"] = str(cpu_freq_target)
+        if gpu_freq_target is not None:
+            env["HYBRID_GPU_FREQ_TARGET_MHZ"] = str(gpu_freq_target)
+            env["LZO_HYBRID_GPU_FREQ_TARGET_MHZ"] = str(gpu_freq_target)
+    else:
+        if cpu_freq_target is not None:
+            env["HYBRID_CPU_FREQ_TARGET_PCT"] = str(cpu_freq_target)
+            env["LZO_HYBRID_CPU_FREQ_TARGET_PCT"] = str(cpu_freq_target)
+        if gpu_freq_target is not None:
+            env["HYBRID_GPU_FREQ_TARGET_PCT"] = str(gpu_freq_target)
+            env["LZO_HYBRID_GPU_FREQ_TARGET_PCT"] = str(gpu_freq_target)
+    return env
+
+
+def freq_cfg_prefix(cpu_freq_target, gpu_freq_target, use_mhz_mode):
+    if use_mhz_mode:
+        c = "NA" if cpu_freq_target is None else f"{cpu_freq_target}MHz"
+        g = "NA" if gpu_freq_target is None else f"{gpu_freq_target}MHz"
+    else:
+        c = "NA" if cpu_freq_target is None else f"{cpu_freq_target}%"
+        g = "NA" if gpu_freq_target is None else f"{gpu_freq_target}%"
+    return f"CF={c};GF={g}"
+
+
+class _DropFreqPointWriter:
+    def __init__(self, base_writer):
+        self._base = base_writer
+
+    def writerow(self, row):
+        data = list(row)
+        if len(data) > 1:
+            del data[1]
+        self._base.writerow(data)
+
+    def writerows(self, rows):
+        for row in rows:
+            self.writerow(row)
 
 
 
@@ -474,6 +581,410 @@ def prepare_results_paths(results_root, csv_name, summary_name):
     return run_dir, str(run_dir / csv_name), str(run_dir / summary_name)
 
 
+def path_is_under(path, ancestor):
+    try:
+        Path(path).resolve().relative_to(Path(ancestor).resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _to_float(value):
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _fmt6(value):
+    return f"{float(value):.6f}"
+
+
+def _roundtrip_yes(row):
+    return str(row.get("Roundtrip_OK", "")).strip().lower() == "yes"
+
+
+def _read_csv_rows(csv_path):
+    rows = []
+    with open(csv_path, newline="") as f:
+        for row in csv.DictReader(f):
+            rows.append(row)
+    return rows
+
+
+def _hybrid_mode_of_row(row):
+    token = str(row.get("Threads_LSZ", "") or "").strip().lower()
+    if token.startswith("adaptive:") or "adaptive" in token:
+        return "adaptive"
+    return "fixed"
+
+
+def _select_engine_rows(rows, engine, hybrid_mode=None):
+    out = []
+    for row in rows:
+        if str(row.get("Engine", "")).strip().upper() != engine:
+            continue
+        if engine == "HYBRID" and hybrid_mode:
+            if _hybrid_mode_of_row(row) != hybrid_mode:
+                continue
+        out.append(row)
+    return out
+
+
+def _prefer_roundtrip_rows(rows):
+    yes_rows = [r for r in rows if _roundtrip_yes(r)]
+    if yes_rows:
+        return yes_rows, "roundtrip_yes"
+    return rows, "fallback_all_rows"
+
+
+def _aggregate_baseline_records(rows):
+    per_file = {}
+    for row in rows:
+        file_name = str(row.get("File", "") or "").strip()
+        if not file_name:
+            continue
+        per_file.setdefault(file_name, []).append(row)
+
+    records = []
+    for file_name in sorted(per_file.keys()):
+        fr = per_file[file_name]
+        comp_total = [_to_float(r.get("CompTotalMBs")) for r in fr]
+        dec_total = [_to_float(r.get("DecTotalMBs")) for r in fr]
+        ratio_vals = [_to_float(r.get("Ratio%")) for r in fr]
+        comp_power = [_to_float(r.get("CompCPUPower_W")) for r in fr]
+        dec_power = [_to_float(r.get("DecCPUPower_W")) for r in fr]
+        comp_eff = [_to_float(r.get("CompEff_MBpsPerW")) for r in fr]
+        dec_eff = [_to_float(r.get("DecEff_MBpsPerW")) for r in fr]
+
+        comp_total = [v for v in comp_total if v is not None]
+        dec_total = [v for v in dec_total if v is not None]
+        ratio_vals = [v for v in ratio_vals if v is not None]
+        comp_power = [v for v in comp_power if v is not None]
+        dec_power = [v for v in dec_power if v is not None]
+        comp_eff = [v for v in comp_eff if v is not None]
+        dec_eff = [v for v in dec_eff if v is not None]
+
+        records.append({
+            "File": file_name,
+            "Rows": len(fr),
+            "CompTotalMean_MBps": safe_mean(comp_total),
+            "CompTotalMedian_MBps": safe_median(comp_total),
+            "DecTotalMean_MBps": safe_mean(dec_total),
+            "DecTotalMedian_MBps": safe_median(dec_total),
+            "RatioMean_pct": safe_mean(ratio_vals),
+            "RatioMedian_pct": safe_median(ratio_vals),
+            "CompPowerMean_W": safe_mean(comp_power),
+            "DecPowerMean_W": safe_mean(dec_power),
+            "CompEffMean_MBpsPerW": safe_mean(comp_eff),
+            "DecEffMean_MBpsPerW": safe_mean(dec_eff),
+        })
+    return records
+
+
+def _write_baseline_records_csv(out_path, records):
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(BASELINE_FILE_HEADER)
+        for rec in records:
+            writer.writerow([
+                rec["File"],
+                int(rec["Rows"]),
+                _fmt6(rec["CompTotalMean_MBps"]),
+                _fmt6(rec["CompTotalMedian_MBps"]),
+                _fmt6(rec["DecTotalMean_MBps"]),
+                _fmt6(rec["DecTotalMedian_MBps"]),
+                _fmt6(rec["RatioMean_pct"]),
+                _fmt6(rec["RatioMedian_pct"]),
+                _fmt6(rec["CompPowerMean_W"]),
+                _fmt6(rec["DecPowerMean_W"]),
+                _fmt6(rec["CompEffMean_MBpsPerW"]),
+                _fmt6(rec["DecEffMean_MBpsPerW"]),
+            ])
+    return len(records)
+
+
+def _copy_file(src, dst):
+    src_path = Path(src)
+    dst_path = Path(dst)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_path, dst_path)
+
+
+def _pct_delta(new_v, base_v):
+    if base_v is None or abs(float(base_v)) < 1e-12:
+        return 0.0
+    return ((float(new_v) - float(base_v)) / float(base_v)) * 100.0
+
+
+def _aggregate_engine_stats(rows):
+    comp_total = [_to_float(r.get("CompTotalMBs")) for r in rows]
+    dec_total = [_to_float(r.get("DecTotalMBs")) for r in rows]
+    ratio_vals = [_to_float(r.get("Ratio%")) for r in rows]
+    comp_power = [_to_float(r.get("CompCPUPower_W")) for r in rows]
+    dec_power = [_to_float(r.get("DecCPUPower_W")) for r in rows]
+    comp_eff = [_to_float(r.get("CompEff_MBpsPerW")) for r in rows]
+    dec_eff = [_to_float(r.get("DecEff_MBpsPerW")) for r in rows]
+
+    comp_total = [v for v in comp_total if v is not None]
+    dec_total = [v for v in dec_total if v is not None]
+    ratio_vals = [v for v in ratio_vals if v is not None]
+    comp_power = [v for v in comp_power if v is not None]
+    dec_power = [v for v in dec_power if v is not None]
+    comp_eff = [v for v in comp_eff if v is not None]
+    dec_eff = [v for v in dec_eff if v is not None]
+
+    return {
+        "Rows": len(rows),
+        "CompTotalMean_MBps": safe_mean(comp_total),
+        "CompTotalMedian_MBps": safe_median(comp_total),
+        "DecTotalMean_MBps": safe_mean(dec_total),
+        "DecTotalMedian_MBps": safe_median(dec_total),
+        "RatioMean_pct": safe_mean(ratio_vals),
+        "RatioMedian_pct": safe_median(ratio_vals),
+        "CompPowerMean_W": safe_mean(comp_power),
+        "DecPowerMean_W": safe_mean(dec_power),
+        "CompEffMean_MBpsPerW": safe_mean(comp_eff),
+        "DecEffMean_MBpsPerW": safe_mean(dec_eff),
+    }
+
+
+def _write_engine_summary_csv(out_path, engine_rows):
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    order = ["CPU", "GPU", "HYBRID"]
+    written = 0
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(ENGINE_SUMMARY_HEADER)
+        for eng in order:
+            rows = engine_rows.get(eng) or []
+            if not rows:
+                continue
+            stats = _aggregate_engine_stats(rows)
+            writer.writerow([
+                eng,
+                int(stats["Rows"]),
+                _fmt6(stats["CompTotalMean_MBps"]),
+                _fmt6(stats["CompTotalMedian_MBps"]),
+                _fmt6(stats["DecTotalMean_MBps"]),
+                _fmt6(stats["DecTotalMedian_MBps"]),
+                _fmt6(stats["RatioMean_pct"]),
+                _fmt6(stats["RatioMedian_pct"]),
+                _fmt6(stats["CompPowerMean_W"]),
+                _fmt6(stats["DecPowerMean_W"]),
+                _fmt6(stats["CompEffMean_MBpsPerW"]),
+                _fmt6(stats["DecEffMean_MBpsPerW"]),
+            ])
+            written += 1
+    return written
+
+
+def _per_file_means(rows):
+    grouped = {}
+    for row in rows:
+        fn = str(row.get("File", "") or "").strip()
+        if not fn:
+            continue
+        grouped.setdefault(fn, []).append(row)
+
+    out = {}
+    for fn, rr in grouped.items():
+        comp_total = [_to_float(r.get("CompTotalMBs")) for r in rr]
+        dec_total = [_to_float(r.get("DecTotalMBs")) for r in rr]
+        ratio_vals = [_to_float(r.get("Ratio%")) for r in rr]
+        comp_total = [v for v in comp_total if v is not None]
+        dec_total = [v for v in dec_total if v is not None]
+        ratio_vals = [v for v in ratio_vals if v is not None]
+        out[fn] = {
+            "comp_total_mean": safe_mean(comp_total),
+            "dec_total_mean": safe_mean(dec_total),
+            "ratio_mean": safe_mean(ratio_vals),
+        }
+    return out
+
+
+def _write_engine_vs_cpu_file_summary(out_path, cpu_rows, gpu_rows, hybrid_rows):
+    cpu_map = _per_file_means(cpu_rows)
+    gpu_map = _per_file_means(gpu_rows) if gpu_rows else {}
+    hyb_map = _per_file_means(hybrid_rows) if hybrid_rows else {}
+    if not cpu_map:
+        return 0
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(ENGINE_VS_CPU_HEADER)
+        for fn in sorted(cpu_map.keys()):
+            cpu = cpu_map[fn]
+            gpu = gpu_map.get(fn)
+            hyb = hyb_map.get(fn)
+            writer.writerow([
+                fn,
+                _fmt6(cpu["comp_total_mean"]),
+                _fmt6(cpu["dec_total_mean"]),
+                _fmt6(cpu["ratio_mean"]),
+                "" if gpu is None else _fmt6(_pct_delta(gpu["comp_total_mean"], cpu["comp_total_mean"])),
+                "" if gpu is None else _fmt6(_pct_delta(gpu["dec_total_mean"], cpu["dec_total_mean"])),
+                "" if gpu is None else _fmt6(gpu["ratio_mean"] - cpu["ratio_mean"]),
+                "" if hyb is None else _fmt6(_pct_delta(hyb["comp_total_mean"], cpu["comp_total_mean"])),
+                "" if hyb is None else _fmt6(_pct_delta(hyb["dec_total_mean"], cpu["dec_total_mean"])),
+                "" if hyb is None else _fmt6(hyb["ratio_mean"] - cpu["ratio_mean"]),
+            ])
+            written += 1
+    return written
+
+
+def run_baseline_generation(strict_csv, history_tag=""):
+    strict_csv_path = Path(strict_csv).resolve()
+    if not strict_csv_path.exists():
+        print(f"[Baseline] skip: strict csv not found: {strict_csv_path}")
+        return
+
+    rows = _read_csv_rows(strict_csv_path)
+    if not rows:
+        print(f"[Baseline] skip: strict csv empty: {strict_csv_path}")
+        return
+
+    strict_total_rows = len(rows)
+    strict_roundtrip_yes_rows = sum(1 for r in rows if _roundtrip_yes(r))
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    tag = (history_tag or "").strip() or strict_csv_path.parent.name
+
+    baseline_dir = BASELINE_DIR
+    manifests_dir = baseline_dir / "manifests"
+    history_root = baseline_dir / "history" / tag
+    manifests_dir.mkdir(parents=True, exist_ok=True)
+    history_root.mkdir(parents=True, exist_ok=True)
+
+    outputs = []
+    history_copies = []
+    filter_modes = {}
+
+    def register_output(key, path_obj, records_count):
+        p = Path(path_obj).resolve()
+        outputs.append({
+            "key": key,
+            "path": str(p),
+            "sha256": compute_sha256(str(p)),
+            "rows": int(records_count),
+        })
+
+        if path_is_under(p, baseline_dir):
+            rel = p.relative_to(baseline_dir.resolve())
+            hist_path = history_root / rel
+            _copy_file(p, hist_path)
+            history_copies.append({"from": str(p), "to": str(hist_path.resolve())})
+
+    cpu_rows_all = _select_engine_rows(rows, "CPU")
+    gpu_rows_all = _select_engine_rows(rows, "GPU")
+    hyb_rows_all = _select_engine_rows(rows, "HYBRID")
+    hyb_fixed_all = _select_engine_rows(rows, "HYBRID", hybrid_mode="fixed")
+    hyb_adaptive_all = _select_engine_rows(rows, "HYBRID", hybrid_mode="adaptive")
+
+    cpu_rows_final = []
+    gpu_rows_final = []
+    hyb_rows_final = []
+
+    if cpu_rows_all:
+        cpu_rows_final, filter_modes["cpu_latest"] = _prefer_roundtrip_rows(cpu_rows_all)
+        cpu_records = _aggregate_baseline_records(cpu_rows_final)
+        cpu_latest = baseline_dir / "cpu" / "latest" / "baseline.csv"
+        n = _write_baseline_records_csv(cpu_latest, cpu_records)
+        register_output("cpu_latest", cpu_latest, n)
+
+        cpu_compat = baseline_dir / "cpu_baseline.csv"
+        _copy_file(cpu_latest, cpu_compat)
+        register_output("cpu_compat", cpu_compat, n)
+
+    if gpu_rows_all:
+        gpu_rows_final, filter_modes["gpu_latest"] = _prefer_roundtrip_rows(gpu_rows_all)
+        gpu_records = _aggregate_baseline_records(gpu_rows_final)
+        gpu_latest = baseline_dir / "gpu" / "latest" / "baseline.csv"
+        n = _write_baseline_records_csv(gpu_latest, gpu_records)
+        register_output("gpu_latest", gpu_latest, n)
+
+        gpu_compat = baseline_dir / "gpu_baseline.csv"
+        _copy_file(gpu_latest, gpu_compat)
+        register_output("gpu_compat", gpu_compat, n)
+
+    if hyb_rows_all:
+        hyb_rows_final, filter_modes["hybrid_latest"] = _prefer_roundtrip_rows(hyb_rows_all)
+        hyb_records = _aggregate_baseline_records(hyb_rows_final)
+        hyb_latest = baseline_dir / "hybrid" / "latest" / "baseline.csv"
+        n = _write_baseline_records_csv(hyb_latest, hyb_records)
+        register_output("hybrid_latest", hyb_latest, n)
+
+        hyb_compat = baseline_dir / "hybrid_baseline.csv"
+        _copy_file(hyb_latest, hyb_compat)
+        register_output("hybrid_compat", hyb_compat, n)
+
+    if hyb_fixed_all:
+        hyb_fixed_rows, filter_modes["hybrid_fixed_latest"] = _prefer_roundtrip_rows(hyb_fixed_all)
+        fixed_records = _aggregate_baseline_records(hyb_fixed_rows)
+        fixed_latest = baseline_dir / "hybrid" / "fixed" / "latest" / "baseline.csv"
+        n = _write_baseline_records_csv(fixed_latest, fixed_records)
+        register_output("hybrid_fixed_latest", fixed_latest, n)
+
+    if hyb_adaptive_all:
+        hyb_adaptive_rows, filter_modes["hybrid_adaptive_latest"] = _prefer_roundtrip_rows(hyb_adaptive_all)
+        adaptive_records = _aggregate_baseline_records(hyb_adaptive_rows)
+        adaptive_latest = baseline_dir / "hybrid" / "adaptive" / "latest" / "baseline.csv"
+        n = _write_baseline_records_csv(adaptive_latest, adaptive_records)
+        register_output("hybrid_adaptive_latest", adaptive_latest, n)
+
+    engine_rows = {
+        "CPU": cpu_rows_final,
+        "GPU": gpu_rows_final,
+        "HYBRID": hyb_rows_final,
+    }
+    if any(engine_rows.values()):
+        engine_summary = baseline_dir / "lzo_baseline_engine_summary.csv"
+        written = _write_engine_summary_csv(engine_summary, engine_rows)
+        if written > 0:
+            register_output("engine_summary", engine_summary, written)
+
+    if cpu_rows_final and (gpu_rows_final or hyb_rows_final):
+        vs_cpu_summary = baseline_dir / "lzo_engine_vs_cpu_file_summary.csv"
+        written = _write_engine_vs_cpu_file_summary(vs_cpu_summary, cpu_rows_final, gpu_rows_final, hyb_rows_final)
+        if written > 0:
+            register_output("engine_vs_cpu_summary", vs_cpu_summary, written)
+
+    manifest = {
+        "repo_root": str(REPO_ROOT.resolve()),
+        "generated_at": timestamp,
+        "history_tag": tag,
+        "strict_csv": str(strict_csv_path),
+        "strict_csv_sha256": compute_sha256(str(strict_csv_path)),
+        "strict_total_rows": strict_total_rows,
+        "strict_roundtrip_yes_rows": strict_roundtrip_yes_rows,
+        "filters": filter_modes,
+        "outputs": outputs,
+        "history_copies": history_copies,
+    }
+
+    manifest_path = manifests_dir / f"baseline_update_{tag}.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    latest_manifest_path = manifests_dir / "latest.json"
+    _copy_file(manifest_path, latest_manifest_path)
+
+    print(
+        f"[Baseline] generated: tag={tag} strict_rows={strict_total_rows} "
+        f"roundtrip_yes={strict_roundtrip_yes_rows} outputs={len(outputs)}"
+    )
+    print(f"[Baseline] manifest={manifest_path}")
+
+
 def resolve_single_sample(single_file, samples_root, discovered_samples):
     if not single_file:
         return discovered_samples
@@ -663,16 +1174,25 @@ def _clamp01(v):
     return x
 
 
+def _derive_active_power(avg_power_w, energy_j, elapsed_s, peak_power_w):
+    avg_v = float(avg_power_w or 0.0)
+    if avg_v > 0.0:
+        return avg_v
+    energy_v = float(energy_j or 0.0)
+    if energy_v > 0.0 and elapsed_s > 0.0:
+        return energy_v / elapsed_s
+    peak_v = float(peak_power_w or 0.0)
+    if peak_v > 0.0:
+        return peak_v * 0.6
+    return 0.0
+
+
 def apply_wall_energy(stats, tel_window, comp_elapsed_s, dec_elapsed_s, energy_source,
                       file_size_mb=0.0, idle_pkg_power_w=0.0, idle_core_power_w=0.0,
                       idle_gpu_power_w=0.0, gpu_share_hint=0.0):
     stats['cpu_freq_avg_mhz'] = float(tel_window.get('cpu_freq_avg_mhz', 0.0) or 0.0)
     stats['gpu_freq_avg_mhz'] = float(tel_window.get('gpu_freq_avg_mhz', 0.0) or 0.0)
     elapsed_s = float(tel_window.get('elapsed_s', 0.0) or 0.0)
-    pkg_energy_j = float(tel_window.get('cpu_energy_j', 0.0) or 0.0)
-    core_energy_j = float(tel_window.get('core_energy_j', 0.0) or 0.0)
-    gpu_energy_j = float(tel_window.get('gpu_energy_j', 0.0) or 0.0)
-
     if elapsed_s <= 0.0:
         stats['cpu_energy_j'] = 0.0
         stats['gpu_energy_j'] = 0.0
@@ -687,43 +1207,96 @@ def apply_wall_energy(stats, tel_window, comp_elapsed_s, dec_elapsed_s, energy_s
         stats['energy_source'] = energy_source
         return
 
-    cpu_avg_power_w = float(tel_window.get('cpu_pkg_avg_power_w', 0.0) or 0.0)
-    if cpu_avg_power_w <= 0.0:
-        cpu_avg_power_w = float(tel_window.get('cpu_core_avg_power_w', 0.0) or 0.0)
-    if cpu_avg_power_w <= 0.0 and core_energy_j > 0.0:
-        cpu_avg_power_w = core_energy_j / elapsed_s
-    if cpu_avg_power_w <= 0.0 and pkg_energy_j > 0.0:
-        cpu_avg_power_w = pkg_energy_j / elapsed_s
-    if cpu_avg_power_w <= 0.0:
-        cpu_avg_power_w = float(tel_window.get('cpu_core_peak_power_w', 0.0) or 0.0)
-    if cpu_avg_power_w <= 0.0:
-        cpu_avg_power_w = float(tel_window.get('cpu_pkg_peak_power_w', 0.0) or 0.0)
+    pkg_total_energy = float(tel_window.get('cpu_energy_j', 0.0) or 0.0)
+    core_total_energy = float(tel_window.get('core_energy_j', 0.0) or 0.0)
+    gpu_total_energy = float(tel_window.get('gpu_energy_j', 0.0) or 0.0)
 
+    pkg_peak_power_w = float(tel_window.get('cpu_pkg_peak_power_w', 0.0) or 0.0)
+    core_peak_power_w = float(tel_window.get('cpu_core_peak_power_w', 0.0) or 0.0)
+    gpu_peak_power_w = float(tel_window.get('gpu_peak_power_w', 0.0) or 0.0)
+
+    pkg_avg_power_w = float(tel_window.get('cpu_pkg_avg_power_w', 0.0) or 0.0)
+    core_avg_power_w = float(tel_window.get('cpu_core_avg_power_w', 0.0) or 0.0)
     gpu_avg_power_w = float(tel_window.get('gpu_avg_power_w', 0.0) or 0.0)
-    if gpu_avg_power_w <= 0.0 and gpu_energy_j > 0.0:
-        gpu_avg_power_w = gpu_energy_j / elapsed_s
-    if gpu_avg_power_w <= 0.0:
-        gpu_avg_power_w = float(tel_window.get('gpu_peak_power_w', 0.0) or 0.0)
-    if gpu_avg_power_w <= 0.0:
-        gpu_hint = _clamp01(gpu_share_hint)
-        if gpu_hint > 0.0 and cpu_avg_power_w > 0.0:
-            gpu_avg_power_w = cpu_avg_power_w * gpu_hint
 
-    cpu_idle_power_w = float(idle_core_power_w or idle_pkg_power_w or 0.0)
-    gpu_idle_power_w = float(idle_gpu_power_w or 0.0)
-    cpu_peak_power_w = float(tel_window.get('cpu_core_peak_power_w', 0.0) or tel_window.get('cpu_pkg_peak_power_w', 0.0) or cpu_avg_power_w)
-    gpu_peak_power_w = float(tel_window.get('gpu_peak_power_w', 0.0) or gpu_avg_power_w)
+    pkg_active_power_w = _derive_active_power(pkg_avg_power_w, pkg_total_energy, elapsed_s, pkg_peak_power_w)
+    core_active_power_w = _derive_active_power(core_avg_power_w, core_total_energy, elapsed_s, core_peak_power_w)
+    gpu_active_power_w = _derive_active_power(gpu_avg_power_w, gpu_total_energy, elapsed_s, gpu_peak_power_w)
 
-    # 功率口径修正：优先输出“动态功率(Active-Idle)”，
-    # 若因计量域不一致导致为负/不可用，再回退到活动功率，避免低频点为 0。
-    cpu_active_power_w = max(0.0, cpu_avg_power_w, cpu_peak_power_w)
-    gpu_active_power_w = max(0.0, gpu_avg_power_w, gpu_peak_power_w)
-    cpu_dynamic_power_w = max(0.0, cpu_avg_power_w - cpu_idle_power_w, cpu_peak_power_w - cpu_idle_power_w)
-    gpu_dynamic_power_w = max(0.0, gpu_avg_power_w - gpu_idle_power_w, gpu_peak_power_w - gpu_idle_power_w)
-    cpu_export_power_w = cpu_dynamic_power_w if cpu_dynamic_power_w > 3.0 else cpu_active_power_w
-    gpu_export_power_w = gpu_dynamic_power_w if gpu_dynamic_power_w > 0.0 else gpu_active_power_w
+    has_pkg = (pkg_total_energy > 0.0) or (pkg_avg_power_w > 0.0) or (pkg_peak_power_w > 0.0)
+    has_core = (core_total_energy > 0.0) or (core_avg_power_w > 0.0) or (core_peak_power_w > 0.0)
 
-    # 兼容现有 CSV 字段：旧 Energy 列改为 Idle/Active Power
+    gpu_hint = _clamp01(gpu_share_hint)
+    inferred_gpu_active_w = 0.0
+    if pkg_active_power_w > 0.0 and core_active_power_w > 0.0:
+        inferred_gpu_active_w = max(0.0, pkg_active_power_w - core_active_power_w)
+
+    if has_pkg and has_core:
+        if gpu_active_power_w <= 0.0:
+            if inferred_gpu_active_w > 0.0:
+                gpu_active_power_w = inferred_gpu_active_w
+            elif gpu_hint > 0.0:
+                gpu_active_power_w = pkg_active_power_w * min(0.40, max(0.10, gpu_hint * 0.45))
+
+        if pkg_active_power_w > 0.0:
+            max_gpu_w = pkg_active_power_w * 0.45
+            if gpu_active_power_w > max_gpu_w:
+                gpu_active_power_w = max_gpu_w
+
+        cpu_active_power_w = max(core_active_power_w, pkg_active_power_w - gpu_active_power_w)
+        cpu_idle_power_w = float(idle_core_power_w or idle_pkg_power_w or 0.0)
+        inferred_gpu_idle_w = max(0.0, float(idle_pkg_power_w or 0.0) - float(idle_core_power_w or 0.0))
+        gpu_idle_power_w = float(idle_gpu_power_w if idle_gpu_power_w and idle_gpu_power_w > 0.0 else inferred_gpu_idle_w)
+        cpu_peak_power_w = core_peak_power_w if core_peak_power_w > 0.0 else max(pkg_peak_power_w - gpu_peak_power_w, cpu_active_power_w)
+    elif has_pkg:
+        if gpu_active_power_w <= 0.0 and gpu_hint > 0.0:
+            gpu_active_power_w = pkg_active_power_w * min(0.40, max(0.10, gpu_hint * 0.45))
+        if pkg_active_power_w > 0.0 and gpu_active_power_w > pkg_active_power_w * 0.45:
+            gpu_active_power_w = pkg_active_power_w * 0.45
+        cpu_active_power_w = max(0.0, pkg_active_power_w - gpu_active_power_w)
+        cpu_idle_power_w = float(idle_pkg_power_w or idle_core_power_w or 0.0)
+        gpu_idle_power_w = float(idle_gpu_power_w or 0.0)
+        cpu_peak_power_w = pkg_peak_power_w if pkg_peak_power_w > 0.0 else cpu_active_power_w
+    elif has_core:
+        if gpu_active_power_w <= 0.0 and gpu_hint > 0.0:
+            gpu_active_power_w = core_active_power_w * min(0.35, max(0.08, gpu_hint * 0.40))
+        if gpu_active_power_w > core_active_power_w * 0.90:
+            gpu_active_power_w = core_active_power_w * 0.90
+        cpu_active_power_w = max(core_active_power_w, gpu_active_power_w * 1.05)
+        cpu_idle_power_w = float(idle_core_power_w or idle_pkg_power_w or 0.0)
+        gpu_idle_power_w = float(idle_gpu_power_w or 0.0)
+        cpu_peak_power_w = core_peak_power_w if core_peak_power_w > 0.0 else cpu_active_power_w
+    else:
+        cpu_active_power_w = 0.0
+        cpu_idle_power_w = float(idle_pkg_power_w or idle_core_power_w or 0.0)
+        gpu_idle_power_w = float(idle_gpu_power_w or 0.0)
+        cpu_peak_power_w = 0.0
+
+    if gpu_hint <= 0.01:
+        gpu_active_power_w = 0.0
+
+    if cpu_active_power_w > 0.0 and gpu_active_power_w >= cpu_active_power_w:
+        gpu_active_power_w = cpu_active_power_w * 0.90
+
+    if gpu_peak_power_w <= 0.0 and pkg_peak_power_w > 0.0 and core_peak_power_w > 0.0:
+        gpu_peak_power_w = max(0.0, pkg_peak_power_w - core_peak_power_w)
+    if gpu_peak_power_w <= 0.0:
+        gpu_peak_power_w = gpu_active_power_w
+
+    cpu_dynamic_power_w = max(0.0, cpu_active_power_w - cpu_idle_power_w)
+    gpu_dynamic_power_w = max(0.0, gpu_active_power_w - gpu_idle_power_w)
+    cpu_export_power_w = max(cpu_active_power_w, cpu_idle_power_w)
+    gpu_export_power_w = min(
+        max(gpu_active_power_w if gpu_active_power_w > 0.0 else gpu_dynamic_power_w, 0.0),
+        cpu_export_power_w * 0.95 if cpu_export_power_w > 0.0 else float("inf")
+    )
+
+    comp_phase_s = max(0.0, float(comp_elapsed_s or 0.0))
+    dec_phase_s = max(0.0, float(dec_elapsed_s or 0.0))
+    if comp_phase_s <= 0.0 and dec_phase_s <= 0.0:
+        comp_phase_s = elapsed_s
+
+    # 兼容现有 CSV 字段：保留列名不变，但承载 idle/peak 功率
     stats['cpu_energy_j'] = cpu_idle_power_w
     stats['gpu_energy_j'] = gpu_idle_power_w
     stats['dec_cpu_energy_j'] = cpu_peak_power_w
@@ -738,14 +1311,15 @@ def apply_wall_energy(stats, tel_window, comp_elapsed_s, dec_elapsed_s, energy_s
     stats['gpu_peak_power_w'] = gpu_peak_power_w
     stats['cpu_idle_power_w'] = cpu_idle_power_w
     stats['gpu_idle_power_w'] = gpu_idle_power_w
-    stats['cpu_active_power_w'] = cpu_avg_power_w
-    stats['gpu_active_power_w'] = gpu_avg_power_w
+    stats['cpu_active_power_w'] = cpu_active_power_w
+    stats['gpu_active_power_w'] = gpu_active_power_w
 
-    total_power = max(0.0, cpu_export_power_w + gpu_export_power_w)
+    comp_total_power = max(0.0, cpu_export_power_w + gpu_export_power_w)
+    dec_total_power = comp_total_power
     comp_total_mbs = float(stats.get('comp_total_mbs', 0.0) or 0.0)
     dec_total_mbs = float(stats.get('dec_total_mbs', 0.0) or 0.0)
-    stats['comp_eff_mbps_per_w'] = (comp_total_mbs / total_power) if total_power > 0.0 and comp_total_mbs > 0.0 else 0.0
-    stats['dec_eff_mbps_per_w'] = (dec_total_mbs / total_power) if total_power > 0.0 and dec_total_mbs > 0.0 else 0.0
+    stats['comp_eff_mbps_per_w'] = (comp_total_mbs / comp_total_power) if comp_total_power > 0.0 and comp_total_mbs > 0.0 else 0.0
+    stats['dec_eff_mbps_per_w'] = (dec_total_mbs / dec_total_power) if dec_total_power > 0.0 and dec_total_mbs > 0.0 else 0.0
     stats['energy_source'] = energy_source
 
 
@@ -932,17 +1506,38 @@ def apply_total_throughput_from_elapsed(stats, input_bytes, comp_elapsed_s, dec_
 
 
 def parse_adaptive_bench_info(output):
+    text = output or ""
+
     m = re.search(
         r"Bench\s+Adaptive\s*:\s*gpu_ratio=([0-9]+(?:\.[0-9]+)?)\s*objective=([^\s]+)",
-        output or "",
+        text,
         re.IGNORECASE,
     )
-    if not m:
-        return None
-    return {
-        "gpu_ratio": float(m.group(1)),
-        "objective": m.group(2),
-    }
+    if m:
+        return {
+            "gpu_ratio": float(m.group(1)),
+            "objective": m.group(2),
+        }
+
+    m = re.search(
+        r"Bench\s+Adaptive\s*:\s*gpu_ratio_mean=([0-9]+(?:\.[0-9]+)?)\s+min=([0-9]+(?:\.[0-9]+)?)\s+max=([0-9]+(?:\.[0-9]+)?)\s+samples=(\d+)",
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        return {
+            "gpu_ratio": float(m.group(1)),
+            "objective": "perf_energy_ratio",
+        }
+
+    ratios = re.findall(r"effective_gpu_ratio=([0-9]+(?:\.[0-9]+)?)", text, re.IGNORECASE)
+    if ratios:
+        return {
+            "gpu_ratio": float(ratios[-1]),
+            "objective": "runtime_trace",
+        }
+
+    return None
 
 
 def warm_lzo_gpu_daemon(file_path, alg, level, bs_arg, lsz):
@@ -980,7 +1575,7 @@ def warm_lzo_gpu_daemon(file_path, alg, level, bs_arg, lsz):
         safe_remove(warm_dec)
 
 
-def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=None, bench_seconds=3.0):
+def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=None, bench_seconds=3.0, run_env=None):
     # Mapping "lzo1x" to "1x" for CPU tool
     alg_short = alg.replace("lzo", "")
     sample_path = str(file_path.resolve())
@@ -1036,7 +1631,7 @@ def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=No
                 idle_pkg_power_w = telemetry.measure_idle_pkg_power_w(0.2)
                 idle_core_power_w = telemetry.measure_idle_core_power_w(0.2)
                 idle_gpu_power_w = telemetry.measure_idle_gpu_power_w(0.2)
-        res, tel_window = run_command_with_telemetry(cmd, telemetry=telemetry)
+        res, tel_window = run_command_with_telemetry(cmd, telemetry=telemetry, env=run_env)
         output = (res.stdout or "") + (res.stderr or "")
 
         stable = parse_stable_bench_output(output)
@@ -1069,7 +1664,7 @@ def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=No
                     sample_path,
                 ]
                 t0 = time.perf_counter()
-                comp_total_res, _ = run_command_with_telemetry(cmd_comp_total, telemetry=None)
+                comp_total_res, _ = run_command_with_telemetry(cmd_comp_total, telemetry=None, env=run_env)
                 comp_elapsed_s = max(0.0, time.perf_counter() - t0)
 
                 cmd_dec_total = [
@@ -1081,7 +1676,7 @@ def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=No
                     tmp_comp,
                 ]
                 t1 = time.perf_counter()
-                dec_total_res, _ = run_command_with_telemetry(cmd_dec_total, telemetry=None)
+                dec_total_res, _ = run_command_with_telemetry(cmd_dec_total, telemetry=None, env=run_env)
                 dec_elapsed_s = max(0.0, time.perf_counter() - t1)
 
                 expected_hash = orig_hash if orig_hash else compute_sha256(sample_path)
@@ -1119,7 +1714,7 @@ def run_lzo_cpu(file_path, alg, level, bs, threads, orig_hash=None, telemetry=No
     return stats
 
 
-def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench_seconds=3.0, use_daemon=False):
+def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench_seconds=3.0, use_daemon=False, run_env=None):
     print(f"Bench_GPU: {file_path.name} A={alg} L={level} BS={bs} LSZ={lsz}")
     sample_path = str(file_path.resolve())
     bs_arg = str(bs).lower()
@@ -1165,6 +1760,10 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                 idle_gpu_power_w = telemetry.measure_idle_gpu_power_w(10)
         gpu_dir = str(Path(LZO_GPU_BIN).resolve().parent)
 
+        gpu_env = build_gpu_subprocess_env()
+        if run_env:
+            gpu_env.update(run_env)
+
         bench_cmd = [
             LZO_GPU_BIN,
             "--bench", str(bench_seconds),
@@ -1174,7 +1773,7 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
             "--local", str(lsz),
             sample_path,
         ]
-        bench_res, tel_window = run_command_with_telemetry_cwd(bench_cmd, cwd=gpu_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
+        bench_res, tel_window = run_command_with_telemetry_cwd(bench_cmd, cwd=gpu_dir, telemetry=telemetry, env=gpu_env)
         bench_output = (bench_res.stdout or "") + (bench_res.stderr or "")
         stable = parse_stable_bench_output(bench_output)
         if stable:
@@ -1216,7 +1815,7 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                     "-o", local_tmp_comp,
                     sample_path,
                 ])
-                comp_total_res, comp_total_tel = run_command_with_telemetry_cwd(cmd_comp_total, cwd=gpu_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
+                comp_total_res, comp_total_tel = run_command_with_telemetry_cwd(cmd_comp_total, cwd=gpu_dir, telemetry=telemetry, env=gpu_env)
 
                 cmd_dec_total = [LZO_GPU_BIN]
                 if use_daemon:
@@ -1227,7 +1826,7 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                     "-o", local_tmp_dec,
                     local_tmp_comp,
                 ])
-                dec_total_res, dec_total_tel = run_command_with_telemetry_cwd(cmd_dec_total, cwd=gpu_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
+                dec_total_res, dec_total_tel = run_command_with_telemetry_cwd(cmd_dec_total, cwd=gpu_dir, telemetry=telemetry, env=gpu_env)
 
                 comp_elapsed_s = float(comp_total_tel.get('elapsed_s', 0.0) or 0.0)
                 dec_elapsed_s = float(dec_total_tel.get('elapsed_s', 0.0) or 0.0)
@@ -1302,7 +1901,7 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
     return stats
 
 
-def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_hash=None, telemetry=None, bench_seconds=3.0, split_mode="adaptive", split_layout="prefix", sample_blocks=8, level=14):
+def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_hash=None, telemetry=None, bench_seconds=3.0, split_mode="adaptive", split_layout="prefix", sample_blocks=8, level=14, run_env=None):
     if split_mode == "adaptive":
         print(f"Bench_HYBRID: {file_path.name} A={alg} L={level} BS={bs} mode={split_mode} layout={split_layout} T={cpu_threads} LSZ={local_size}")
     else:
@@ -1352,6 +1951,9 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_
                 idle_core_power_w = telemetry.measure_idle_core_power_w(5)
                 idle_gpu_power_w = telemetry.measure_idle_gpu_power_w(5)
         hybrid_dir = str(Path(LZO_HYBRID_BIN).resolve().parent)
+        hybrid_env = build_gpu_subprocess_env()
+        if run_env:
+            hybrid_env.update(run_env)
 
         bench_cmd = [
             LZO_HYBRID_BIN,
@@ -1368,7 +1970,7 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_
         else:
             bench_cmd[1:1] = ["--gpu-ratio", str(gpu_ratio)]
         bench_cmd[1:1] = ["--split-striped" if split_layout == "striped" else "--split-prefix"]
-        bench_res, tel_window = run_command_with_telemetry_cwd(bench_cmd, cwd=hybrid_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
+        bench_res, tel_window = run_command_with_telemetry_cwd(bench_cmd, cwd=hybrid_dir, telemetry=telemetry, env=hybrid_env)
         bench_output = (bench_res.stdout or "") + (bench_res.stderr or "")
         stable = parse_stable_bench_output(bench_output)
         if stable:
@@ -1386,6 +1988,9 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_
             if adaptive_info:
                 stats['adaptive_gpu_ratio'] = adaptive_info['gpu_ratio']
                 stats['adaptive_objective'] = adaptive_info['objective']
+            elif split_mode == 'adaptive':
+                stats['adaptive_gpu_ratio'] = 0.0
+                stats['adaptive_objective'] = 'fallback_cpu_only_or_no_trace'
             total_ok = False
             total_tel = {}
             tmp_comp = make_temp_file_path("lzo_hybrid_verify_tmp", ".lzo")
@@ -1406,7 +2011,7 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_
                 else:
                     cmd_comp_total[1:1] = ["--gpu-ratio", str(gpu_ratio)]
                 cmd_comp_total[1:1] = ["--split-striped" if split_layout == "striped" else "--split-prefix"]
-                comp_total_res, comp_total_tel = run_command_with_telemetry_cwd(cmd_comp_total, cwd=hybrid_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
+                comp_total_res, comp_total_tel = run_command_with_telemetry_cwd(cmd_comp_total, cwd=hybrid_dir, telemetry=telemetry, env=hybrid_env)
 
                 cmd_dec_total = [
                     LZO_HYBRID_BIN,
@@ -1419,7 +2024,7 @@ def run_lzo_hybrid(file_path, alg, bs, gpu_ratio, cpu_threads, local_size, orig_
                 else:
                     cmd_dec_total[1:1] = ["--gpu-ratio", str(gpu_ratio), "--cpu-threads", str(cpu_threads)]
                 cmd_dec_total[1:1] = ["--split-striped" if split_layout == "striped" else "--split-prefix"]
-                dec_total_res, dec_total_tel = run_command_with_telemetry_cwd(cmd_dec_total, cwd=hybrid_dir, telemetry=telemetry, env=build_gpu_subprocess_env())
+                dec_total_res, dec_total_tel = run_command_with_telemetry_cwd(cmd_dec_total, cwd=hybrid_dir, telemetry=telemetry, env=hybrid_env)
 
                 comp_elapsed_s = float(comp_total_tel.get('elapsed_s', 0.0) or 0.0)
                 dec_elapsed_s = float(dec_total_tel.get('elapsed_s', 0.0) or 0.0)
@@ -1502,10 +2107,13 @@ def main():
     parser.add_argument('--cpu-freq-points', default=DEFAULT_CPU_FREQ_MHZ, help='CPU frequency points in MHz, comma-separated (default: %(default)s)')
     parser.add_argument('--gpu-freq-points', default=DEFAULT_GPU_FREQ_MHZ, help='GPU frequency points in MHz, comma-separated (default: %(default)s)')
     parser.add_argument('--hybrid-freq-pairs', default='', help='Hybrid CPU+GPU freq pairs in MHz, semicolon-separated (e.g. "800,300;800,1500;5000,300;5000,1500")')
+    parser.add_argument('--no-freq-scan', action='store_true', help='Disable frequency sweep and run a single baseline point with default clocks')
     parser.add_argument('--single-file', default='', help='Only benchmark one file (path or basename under samples dir)')
     parser.add_argument('--no-telemetry', action='store_true', help='Disable freq/power telemetry collection')
     parser.add_argument('--bench-seconds', type=float, default=3.0, help='Benchmark duration in seconds for timed bench paths (default: 3.0)')
     parser.add_argument('--results-dir', default=RESULTS_DIR, help='Directory for benchmark outputs')
+    parser.add_argument('--baseline', action='store_true', help='Generate baseline latest/history/manifests directly from this run\'s CSV')
+    parser.add_argument('--baseline-history-tag', default='', help='Override history tag for --baseline snapshots')
     args = parser.parse_args()
 
     if args.cpu_only and args.gpu_only:
@@ -1551,7 +2159,7 @@ def main():
         ])
         f.flush()
 
-        gpu_cfg_label = f"FP={point_idx};A={alg};L={level};BS={bs};LSZ={lsz}"
+        gpu_cfg_label = f"{freq_cfg_prefix(cpu_freq_target, gpu_freq_target, use_mhz_mode)};A={alg};L={level};BS={bs};LSZ={lsz}"
         emit_case_average(sample.name, "GPU", gpu_cfg_label, hybrid_stats)
         if hybrid_stats.get("roundtrip_verified", False):
             summary_records.append(build_summary_record("GPU", gpu_cfg_label, hybrid_stats))
@@ -1583,7 +2191,16 @@ def main():
             parts = pair_str.strip().split(',')
             if len(parts) == 2:
                 hybrid_freq_pairs.append((int(parts[0].strip()), int(parts[1].strip())))
+
+    if args.no_freq_scan:
+        freq_points = [None]
+        cpu_freq_mhz_points = [None]
+        gpu_freq_mhz_points = [None]
+        hybrid_freq_pairs = []
+        print("[FreqControl] --no-freq-scan enabled: using single default clock point.")
+
     use_mhz_mode = (cpu_freq_mhz_points != [None] or gpu_freq_mhz_points != [None] or len(hybrid_freq_pairs) > 0)
+
     if use_mhz_mode:
         freq_points = [None]
 
@@ -1599,16 +2216,7 @@ def main():
     telemetry = None if args.no_telemetry else TelemetryProbe()
     if telemetry is not None:
         print(f"Telemetry sources: {telemetry.describe_sources()}")
-        print("[TelemetryBaseline] measuring idle for 10s (one-time)...")
-        BASELINE_IDLE_PKG_W = telemetry.measure_idle_pkg_power_w(10.0)
-        BASELINE_IDLE_CORE_W = telemetry.measure_idle_core_power_w(10.0)
-        BASELINE_IDLE_GPU_W = telemetry.measure_idle_gpu_power_w(10.0)
-        print(
-            "[TelemetryBaseline] "
-            f"cpu_pkg_idle={BASELINE_IDLE_PKG_W:.3f}W "
-            f"cpu_core_idle={BASELINE_IDLE_CORE_W:.3f}W "
-            f"gpu_idle={BASELINE_IDLE_GPU_W:.3f}W"
-        )
+        refresh_idle_baseline(telemetry, duration_s=3.0, label="startup")
 
     os.makedirs(args.results_dir, exist_ok=True)
     run_dir, results_csv, results_summary_csv = prepare_results_paths(
@@ -1647,7 +2255,7 @@ def main():
             print(f"[Daemon] LZO GPU daemon state: {daemon_state}")
 
         with open(results_csv, 'w', newline='') as f:
-            writer = csv.writer(f)
+            writer = _DropFreqPointWriter(csv.writer(f))
             writer.writerow([
                 "File", "FreqPoint", "CPUFreqTarget_MHz" if use_mhz_mode else "CPUFreqTargetPct", "GPUFreqTarget_MHz" if use_mhz_mode else "GPUFreqTargetPct",
                 "Engine", "Alg", "Level", "BlockSize", "Threads_LSZ",
@@ -1670,6 +2278,8 @@ def main():
                         gpu_freq_target = None
                         point_idx += 1
                         cpu_freq_apply = apply_freq_mhz(CPU_CONTROL_SCRIPT, cpu_freq_target)
+                        point_env = build_freq_target_env(cpu_freq_target, gpu_freq_target, use_mhz_mode)
+                        refresh_idle_baseline(telemetry, duration_s=2.0, label=f"CF={cpu_freq_target}MHz")
                         print(f"[FreqPoint {point_idx}] CPU={cpu_freq_target}MHz apply={cpu_freq_apply}; GPU=N/A apply=skipped")
 
                         for sample in samples:
@@ -1682,7 +2292,7 @@ def main():
                                 for level in cpu_levels:
                                     for bs in cpu_block_sizes:
                                         for t in cpu_threads:
-                                            cpu_stats = run_lzo_cpu(sample, alg, level, bs, t, orig_hash=orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds)
+                                            cpu_stats = run_lzo_cpu(sample, alg, level, bs, t, orig_hash=orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds, run_env=point_env)
                                             writer.writerow([
                                                 sample.name,
                                                 point_idx,
@@ -1715,7 +2325,7 @@ def main():
                                             f.flush()
 
                                             cpu_cfg_label = (
-                                                f"FP={point_idx};A={alg};L={level};BS={bs};T={t}"
+                                                f"{freq_cfg_prefix(cpu_freq_target, gpu_freq_target, use_mhz_mode)};A={alg};L={level};BS={bs};T={t}"
                                             )
                                             emit_case_average(sample.name, "CPU", cpu_cfg_label, cpu_stats)
                                             if cpu_stats.get("roundtrip_verified", False):
@@ -1727,6 +2337,8 @@ def main():
                         cpu_freq_target = None
                         point_idx += 1
                         gpu_freq_apply = apply_freq_mhz(GPU_CONTROL_SCRIPT, gpu_freq_target)
+                        point_env = build_freq_target_env(cpu_freq_target, gpu_freq_target, use_mhz_mode)
+                        refresh_idle_baseline(telemetry, duration_s=2.0, label=f"GF={gpu_freq_target}MHz")
                         print(f"[FreqPoint {point_idx}] CPU=N/A apply=skipped; GPU={gpu_freq_target}MHz apply={gpu_freq_apply}")
 
                         for sample in samples:
@@ -1739,7 +2351,7 @@ def main():
                                 for level in gpu_levels:
                                     for bs in gpu_block_sizes:
                                         for lsz in gpu_local_sizes:
-                                            gpu_stats = run_lzo_gpu(sample, alg, level, bs, lsz, orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds, use_daemon=use_gpu_daemon)
+                                            gpu_stats = run_lzo_gpu(sample, alg, level, bs, lsz, orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds, use_daemon=use_gpu_daemon, run_env=point_env)
                                             writer.writerow([
                                                 sample.name,
                                                 point_idx,
@@ -1772,7 +2384,7 @@ def main():
                                             f.flush()
 
                                             gpu_cfg_label = (
-                                                f"FP={point_idx};A={alg};L={level};BS={bs};LSZ={lsz}"
+                                                f"{freq_cfg_prefix(cpu_freq_target, gpu_freq_target, use_mhz_mode)};A={alg};L={level};BS={bs};LSZ={lsz}"
                                             )
                                             emit_case_average(sample.name, "GPU", gpu_cfg_label, gpu_stats)
                                             if gpu_stats.get("roundtrip_verified", False):
@@ -1781,14 +2393,24 @@ def main():
                 if run_hybrid:
                     if hybrid_freq_pairs:
                         hybrid_combos = hybrid_freq_pairs
+                    elif freq_points != [None]:
+                        hybrid_combos = [(fp, fp) for fp in freq_points]
                     else:
                         hybrid_combos = [(c, g) for c in cpu_freq_mhz_points for g in gpu_freq_mhz_points]
                     print(f"[Phase 3/3] Hybrid freq sweep ({len(hybrid_combos)} points)")
                     for cpu_freq_target, gpu_freq_target in hybrid_combos:
                         point_idx += 1
-                        cpu_freq_apply = apply_freq_mhz(CPU_CONTROL_SCRIPT, cpu_freq_target)
-                        gpu_freq_apply = apply_freq_mhz(GPU_CONTROL_SCRIPT, gpu_freq_target)
-                        print(f"[FreqPoint {point_idx}] CPU={cpu_freq_target}MHz apply={cpu_freq_apply}; GPU={gpu_freq_target}MHz apply={gpu_freq_apply}")
+                        if freq_points != [None]:
+                            cpu_freq_apply = apply_freq_percent(CPU_CONTROL_SCRIPT, cpu_freq_target)
+                            gpu_freq_apply = apply_freq_percent(GPU_CONTROL_SCRIPT, gpu_freq_target)
+                            print(f"[FreqPoint {point_idx}] CPU={cpu_freq_target}% apply={cpu_freq_apply}; GPU={gpu_freq_target}% apply={gpu_freq_apply}")
+                        else:
+                            cpu_freq_apply = apply_freq_mhz(CPU_CONTROL_SCRIPT, cpu_freq_target)
+                            gpu_freq_apply = apply_freq_mhz(GPU_CONTROL_SCRIPT, gpu_freq_target)
+                            print(f"[FreqPoint {point_idx}] CPU={cpu_freq_target}MHz apply={cpu_freq_apply}; GPU={gpu_freq_target}MHz apply={gpu_freq_apply}")
+                        point_env = build_freq_target_env(cpu_freq_target, gpu_freq_target, use_mhz_mode)
+                        label_unit = "MHz" if use_mhz_mode else "%"
+                        refresh_idle_baseline(telemetry, duration_s=2.0, label=f"CF={cpu_freq_target}{label_unit};GF={gpu_freq_target}{label_unit}")
 
                         for sample in samples:
                             sample_key = str(sample)
@@ -1813,6 +2435,7 @@ def main():
                                                                 split_mode=split_mode,
                                                                 split_layout=split_layout,
                                                                 level=level,
+                                                                run_env=point_env,
                                                             )
                                                             ratio_label = "auto" if split_mode == "adaptive" else str(ratio)
                                                             writer.writerow([
@@ -1848,7 +2471,7 @@ def main():
                                                             f.flush()
 
                                                             hybrid_cfg_label = (
-                                                                f"FP={point_idx};A={alg};LVL={level};BS={bs};M={split_mode};SL={split_layout};R={ratio_label};T={ht};LSZ={hlsz}"
+                                                                f"{freq_cfg_prefix(cpu_freq_target, gpu_freq_target, use_mhz_mode)};A={alg};LVL={level};BS={bs};M={split_mode};SL={split_layout};R={ratio_label};T={ht};LSZ={hlsz}"
                                                             )
                                                             emit_case_average(sample.name, "HYBRID", hybrid_cfg_label, hybrid_stats)
                                                             if hybrid_stats.get("roundtrip_verified", False):
@@ -1861,6 +2484,8 @@ def main():
                 for point_idx, (cpu_freq_target, gpu_freq_target) in enumerate(freq_combos, start=1):
                     cpu_freq_apply = apply_freq_percent(CPU_CONTROL_SCRIPT, cpu_freq_target)
                     gpu_freq_apply = apply_freq_percent(GPU_CONTROL_SCRIPT, gpu_freq_target)
+                    point_env = build_freq_target_env(cpu_freq_target, gpu_freq_target, use_mhz_mode)
+                    refresh_idle_baseline(telemetry, duration_s=2.0, label=f"CF={cpu_freq_target}%;GF={gpu_freq_target}%")
                     print(f"[FreqPoint {point_idx}] CPU={cpu_freq_target}% apply={cpu_freq_apply}; GPU={gpu_freq_target}% apply={gpu_freq_apply}")
 
                     for sample in samples:
@@ -1875,7 +2500,7 @@ def main():
                                 for level in cpu_levels:
                                     for bs in cpu_block_sizes:
                                         for t in cpu_threads:
-                                            cpu_stats = run_lzo_cpu(sample, alg, level, bs, t, orig_hash=orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds)
+                                            cpu_stats = run_lzo_cpu(sample, alg, level, bs, t, orig_hash=orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds, run_env=point_env)
                                             writer.writerow([
                                                 sample.name,
                                                 point_idx,
@@ -1908,7 +2533,7 @@ def main():
                                             f.flush()
 
                                             cpu_cfg_label = (
-                                                f"FP={point_idx};A={alg};L={level};BS={bs};T={t}"
+                                                f"{freq_cfg_prefix(cpu_freq_target, gpu_freq_target, use_mhz_mode)};A={alg};L={level};BS={bs};T={t}"
                                             )
                                             emit_case_average(sample.name, "CPU", cpu_cfg_label, cpu_stats)
                                             if cpu_stats.get("roundtrip_verified", False):
@@ -1920,7 +2545,7 @@ def main():
                                 for level in gpu_levels:
                                     for bs in gpu_block_sizes:
                                         for lsz in gpu_local_sizes:
-                                            gpu_stats = run_lzo_gpu(sample, alg, level, bs, lsz, orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds, use_daemon=use_gpu_daemon)
+                                            gpu_stats = run_lzo_gpu(sample, alg, level, bs, lsz, orig_hash, telemetry=telemetry, bench_seconds=args.bench_seconds, use_daemon=use_gpu_daemon, run_env=point_env)
                                             writer.writerow([
                                                 sample.name,
                                                 point_idx,
@@ -1953,7 +2578,7 @@ def main():
                                             f.flush()
 
                                             gpu_cfg_label = (
-                                                f"FP={point_idx};A={alg};L={level};BS={bs};LSZ={lsz}"
+                                                f"{freq_cfg_prefix(cpu_freq_target, gpu_freq_target, use_mhz_mode)};A={alg};L={level};BS={bs};LSZ={lsz}"
                                             )
                                             emit_case_average(sample.name, "GPU", gpu_cfg_label, gpu_stats)
                                             if gpu_stats.get("roundtrip_verified", False):
@@ -1978,6 +2603,7 @@ def main():
                                                                 split_mode=split_mode,
                                                                 split_layout=split_layout,
                                                                 level=level,
+                                                                run_env=point_env,
                                                             )
                                                             ratio_label = "auto" if split_mode == "adaptive" else str(ratio)
                                                             writer.writerow([
@@ -2013,7 +2639,7 @@ def main():
                                                             f.flush()
 
                                                             hybrid_cfg_label = (
-                                                                f"FP={point_idx};A={alg};LVL={level};BS={bs};M={split_mode};SL={split_layout};R={ratio_label};T={ht};LSZ={hlsz}"
+                                                                f"{freq_cfg_prefix(cpu_freq_target, gpu_freq_target, use_mhz_mode)};A={alg};LVL={level};BS={bs};M={split_mode};SL={split_layout};R={ratio_label};T={ht};LSZ={hlsz}"
                                                             )
                                                             emit_case_average(sample.name, "HYBRID", hybrid_cfg_label, hybrid_stats)
                                                             if hybrid_stats.get("roundtrip_verified", False):
@@ -2023,6 +2649,8 @@ def main():
 
         print_and_save_config_summary(summary_records, results_summary_csv)
         print_split_layout_summary(summary_records)
+        if args.baseline:
+            run_baseline_generation(results_csv, history_tag=args.baseline_history_tag)
     finally:
         if use_gpu_daemon:
             stop_state = stop_daemon(LZO_GPU_BIN)

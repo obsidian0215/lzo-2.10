@@ -98,6 +98,29 @@ typedef struct {
 
 static daemon_state_t g_state = {0};
 
+static int worker_matches_backend_pref(int worker_idx, int standard_copy)
+{
+    if (standard_copy != 0 && standard_copy != 1) return 1;
+    if (standard_copy == 1) {
+        return (worker_idx & 1) == 1;
+    }
+    return (worker_idx & 1) == 0;
+}
+
+static int daemon_append_suffix(char* out, size_t out_sz, const char* input, const char* suffix)
+{
+    size_t ilen;
+    size_t slen;
+    if (!out || !input || !suffix || out_sz == 0) return -1;
+    ilen = strlen(input);
+    slen = strlen(suffix);
+    if (ilen + slen >= out_sz) return -1;
+    memcpy(out, input, ilen);
+    memcpy(out + ilen, suffix, slen);
+    out[ilen + slen] = '\0';
+    return 0;
+}
+
 /* Forward declarations */
 static int create_pidfile(void);
 static void remove_pidfile(void);
@@ -373,7 +396,11 @@ int handle_compress_request(request_t* req, response_t* resp, worker_res_t* work
 {
     /* If output_path is empty, generate a default one: input + ".lzo" */
     if (req->output_path[0] == '\0') {
-        snprintf(req->output_path, sizeof(req->output_path), "%s.lzo", req->input_path);
+        if (daemon_append_suffix(req->output_path, sizeof(req->output_path), req->input_path, ".lzo") != 0) {
+            resp->status = -1;
+            snprintf(resp->message, sizeof(resp->message), "output path too long");
+            return -1;
+        }
     }
 
     printf("[DAEMON] 处理压缩请求: %s -> %s (level=%d)\n",
@@ -491,7 +518,11 @@ int handle_decompress_request(request_t* req, response_t* resp, worker_res_t* wo
             req->output_path[ilen - suf_len] = '\0';
         } else {
             /* append .dec */
-            snprintf(req->output_path, sizeof(req->output_path), "%s.dec", req->input_path);
+            if (daemon_append_suffix(req->output_path, sizeof(req->output_path), req->input_path, ".dec") != 0) {
+                resp->status = -1;
+                snprintf(resp->message, sizeof(resp->message), "output path too long");
+                return -1;
+            }
         }
     }
 
@@ -847,8 +878,14 @@ static void* worker_thread(void* arg) {
 
     // 2. Find an available worker resource
     worker_res_t* worker = NULL;
+    int prefer_backend = (req.standard_copy == 0 || req.standard_copy == 1) ? req.standard_copy : -1;
+    int spin_round = 0;
     while (g_state.running) {
+        int strict_pref = (prefer_backend >= 0 && spin_round < 4);
         for (int i = 0; i < MAX_WORKERS; i++) {
+            if (strict_pref && !worker_matches_backend_pref(i, prefer_backend)) {
+                continue;
+            }
             if (pthread_mutex_trylock(&g_state.workers[i].lock) == 0) {
                 if (!g_state.workers[i].in_use) {
                     g_state.workers[i].in_use = 1;
@@ -860,6 +897,7 @@ static void* worker_thread(void* arg) {
             }
         }
         if (worker) break;
+        spin_round++;
         struct timespec ts = {0, 1000000}; // 1ms
         nanosleep(&ts, NULL);
     }

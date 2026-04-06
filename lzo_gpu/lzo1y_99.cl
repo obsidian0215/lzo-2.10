@@ -671,19 +671,71 @@ __kernel void lzo1y_block_decompress(
 }
 
 __kernel void lzo_pack_compressed_blocks(__global const uchar* sparse_out,
-                                         __global const uint* block_lens,
-                                         __global uchar* packed_out,
-                                         __global const uint* packed_offsets,
-                                         uint worst_blk,
-                                         uint total_blocks)
+                                          __global const uint* block_lens,
+                                          __global uchar* packed_out,
+                                          __global const uint* packed_offsets,
+                                          uint worst_blk,
+                                          uint total_blocks)
 {
-    uint gid = get_global_id(0);
-    uint gsz = get_global_size(0);
-    for (uint idx = gid; idx < total_blocks; idx += gsz) {
-        uint len = block_lens[idx];
-        if (len == 0) continue;
-        uchar const* src = sparse_out + idx * worst_blk;
-        uchar* dst = packed_out + packed_offsets[idx];
-        for (uint i = 0; i < len; ++i) dst[i] = src[i];
+    uint blk = get_group_id(0);
+    uint lane = get_local_id(0);
+    uint lanes = get_local_size(0);
+
+    if (blk >= total_blocks) return;
+
+    {
+        uint len = block_lens[blk];
+        __global const uchar* src = sparse_out + blk * worst_blk;
+        __global uchar* dst = packed_out + packed_offsets[blk];
+
+        if (len == 0) return;
+
+        if (len <= 32u) {
+            if (lane == 0) {
+                uint pos = 0;
+                if (len >= 16u) {
+                    uchar16 c16 = vload16(0, src);
+                    vstore16(c16, 0, dst);
+                    pos = 16u;
+                }
+                if (len - pos >= 8u) {
+                    uchar8 c8 = vload8(0, src + pos);
+                    vstore8(c8, 0, dst + pos);
+                    pos += 8u;
+                }
+                for (; pos < len; ++pos) dst[pos] = src[pos];
+            }
+            return;
+        }
+
+        if (len <= 128u) {
+            uint vec16_end = len & ~15u;
+            for (uint pos = lane * 16u; pos < vec16_end; pos += lanes * 16u) {
+                uchar16 c = vload16(0, src + pos);
+                vstore16(c, 0, dst + pos);
+            }
+            for (uint pos = vec16_end + lane; pos < len; pos += lanes) {
+                dst[pos] = src[pos];
+            }
+            return;
+        }
+
+        uint vec32_end = len & ~31u;
+        for (uint pos = lane * 32u; pos < vec32_end; pos += lanes * 32u) {
+            uchar16 c0 = vload16(0, src + pos);
+            uchar16 c1 = vload16(0, src + pos + 16u);
+            vstore16(c0, 0, dst + pos);
+            vstore16(c1, 0, dst + pos + 16u);
+        }
+
+        uint vec16_end = len & ~15u;
+        for (uint pos = vec32_end + lane * 16u; pos < vec16_end; pos += lanes * 16u) {
+            uchar16 c = vload16(0, src + pos);
+            vstore16(c, 0, dst + pos);
+        }
+
+        for (uint pos = vec16_end + lane; pos < len; pos += lanes) {
+            dst[pos] = src[pos];
+        }
     }
 }

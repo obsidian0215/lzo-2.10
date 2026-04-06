@@ -26,6 +26,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#include <math.h>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -73,6 +74,32 @@ static size_t block_input_size(size_t total_size, size_t block_size, size_t bloc
     }
 }
 
+static size_t hybrid_parse_size_bytes_env(const char* s, size_t defv) {
+    char* end = NULL;
+    unsigned long long v;
+    if (!s || !*s) return defv;
+    v = strtoull(s, &end, 10);
+    if (!end || end == s) return defv;
+    if (*end == 'k' || *end == 'K') v *= 1024ULL;
+    else if (*end == 'm' || *end == 'M') v *= 1024ULL * 1024ULL;
+    else if (*end == 'g' || *end == 'G') v *= 1024ULL * 1024ULL * 1024ULL;
+    if (v == 0ULL) return defv;
+    if (v > (unsigned long long)SIZE_MAX) return defv;
+    return (size_t)v;
+}
+
+static size_t adaptive_min_block_size_bytes(const hybrid_params_t* params) {
+    size_t v;
+    if (!params) return 0;
+    if (params->block_size > 0) return 0;
+    if (params->cpu_threads <= 0) return 0;
+
+    v = 240U * 1024U;
+    if (v < LZO_MIN_BLOCK_BYTES_DEFAULT) v = LZO_MIN_BLOCK_BYTES_DEFAULT;
+    if (v > LZO_MAX_BLOCK_BYTES_DEFAULT) v = LZO_MAX_BLOCK_BYTES_DEFAULT;
+    return v;
+}
+
 static size_t sampled_block_index(size_t sample_pos, size_t sample_count, size_t num_blocks) {
     if (num_blocks == 0) return 0;
     if (sample_count <= 1 || num_blocks <= 1) return 0;
@@ -112,6 +139,8 @@ static void ensure_lzo_init(void);
 static cl_mem grow_buffer(cl_context ctx, cl_mem* buf, size_t* cap,
                           size_t needed, cl_mem_flags flags, cl_int* err);
 static int zero_buffer(cl_command_queue q, cl_mem buf, size_t sz);
+static void lzo_hybrid_metrics_reset(void);
+static void lzo_hybrid_metrics_record_adaptive(double ratio);
 
 typedef struct {
     double cpu_throughput;    /* single-thread CPU throughput (bytes/s) */
@@ -137,6 +166,18 @@ static uint64_t lzo_read_rapl_energy_uj(const char* domain_path) {
     uint64_t val = 0;
     if (f) { if (fscanf(f, "%lu", &val) != 1) val = 0; fclose(f); }
     return val;
+}
+
+static double lzo_read_env_double_or_neg(const char* name) {
+    const char* v;
+    char* endp = NULL;
+    double out;
+    if (!name) return -1.0;
+    v = getenv(name);
+    if (!v || !*v) return -1.0;
+    out = strtod(v, &endp);
+    if (!endp || endp == v) return -1.0;
+    return out;
 }
 
 static double lzo_read_cpu_availability(void) {
@@ -170,6 +211,187 @@ static double lzo_read_gpu_availability(void) {
     if (busy < 0.0) return 1.0;
     if (busy > 100.0) busy = 100.0;
     return 1.0 - busy / 100.0;
+}
+
+static double lzo_read_cpu_freq_scale(void) {
+    double max_f = lzo_read_sysfs_double("/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq");
+    double cur = lzo_read_sysfs_double("/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq");
+    double target_mhz = -1.0;
+    double target_pct = -1.0;
+    double s;
+
+    target_mhz = lzo_read_env_double_or_neg("LZO_HYBRID_CPU_FREQ_TARGET_MHZ");
+    if (target_mhz <= 0.0) target_mhz = lzo_read_env_double_or_neg("HYBRID_CPU_FREQ_TARGET_MHZ");
+    target_pct = lzo_read_env_double_or_neg("LZO_HYBRID_CPU_FREQ_TARGET_PCT");
+    if (target_pct <= 0.0) target_pct = lzo_read_env_double_or_neg("HYBRID_CPU_FREQ_TARGET_PCT");
+
+    if (target_mhz > 0.0 && max_f > 0.0) {
+        s = (target_mhz * 1000.0) / max_f;
+    } else if (target_pct > 0.0) {
+        s = target_pct / 100.0;
+    } else if (cur > 0.0 && max_f > 0.0) {
+        s = cur / max_f;
+    } else {
+        s = 1.0;
+    }
+
+    {
+        if (s < 0.30) s = 0.30;
+        if (s > 1.20) s = 1.20;
+        return s;
+    }
+}
+
+static double lzo_read_gpu_freq_scale(void) {
+    double cur = lzo_read_sysfs_double("/sys/class/drm/card0/gt_cur_freq_mhz");
+    double max_f = lzo_read_sysfs_double("/sys/class/drm/card0/gt_max_freq_mhz");
+    double target_mhz = -1.0;
+    double target_pct = -1.0;
+    double s;
+    if (cur <= 0.0 || max_f <= 0.0) {
+        cur = lzo_read_sysfs_double("/sys/class/drm/card1/gt_cur_freq_mhz");
+        max_f = lzo_read_sysfs_double("/sys/class/drm/card1/gt_max_freq_mhz");
+    }
+
+    target_mhz = lzo_read_env_double_or_neg("LZO_HYBRID_GPU_FREQ_TARGET_MHZ");
+    if (target_mhz <= 0.0) target_mhz = lzo_read_env_double_or_neg("HYBRID_GPU_FREQ_TARGET_MHZ");
+    target_pct = lzo_read_env_double_or_neg("LZO_HYBRID_GPU_FREQ_TARGET_PCT");
+    if (target_pct <= 0.0) target_pct = lzo_read_env_double_or_neg("HYBRID_GPU_FREQ_TARGET_PCT");
+
+    if (target_mhz > 0.0 && max_f > 0.0) {
+        s = target_mhz / max_f;
+    } else if (target_pct > 0.0) {
+        s = target_pct / 100.0;
+    } else if (cur > 0.0 && max_f > 0.0) {
+        s = cur / max_f;
+    } else {
+        s = 1.0;
+    }
+
+    {
+        if (s < 0.30) s = 0.30;
+        if (s > 1.20) s = 1.20;
+        return s;
+    }
+}
+
+static void lzo_adaptive_choose_objective_weights(double input_mb,
+                                                  double sample_entropy,
+                                                  double cpu_avail,
+                                                  double gpu_avail,
+                                                  double thread_util,
+                                                  double cpu_freq_scale,
+                                                  double gpu_freq_scale,
+                                                  double* perf_weight_pct,
+                                                  double* energy_weight_pct,
+                                                  double* ratio_weight_pct,
+                                                  double* dec_host_penalty_pct) {
+    double perf = 66.0;
+    double energy = 22.0;
+    double ratio = 12.0;
+    double dec_penalty = 3.5;
+
+    if (input_mb <= 8.0) {
+        perf += 8.0;
+        energy -= 4.0;
+        ratio -= 4.0;
+    } else if (input_mb >= 256.0) {
+        perf -= 2.0;
+        energy += 4.0;
+        ratio += 4.0;
+    }
+
+    if (sample_entropy > 6.5) {
+        perf += 3.0;
+        ratio -= 2.0;
+    } else if (sample_entropy > 0.0 && sample_entropy < 4.8) {
+        ratio += 5.0;
+        perf -= 1.5;
+    }
+
+    if (thread_util >= 0.75) {
+        energy += 6.0;
+        perf -= 2.0;
+    } else if (thread_util <= 0.35) {
+        perf += 4.0;
+        energy -= 2.0;
+    }
+
+    if (cpu_freq_scale < 0.80 && gpu_freq_scale > cpu_freq_scale) {
+        perf += 4.0;
+        energy += 3.0;
+        ratio -= 2.0;
+        dec_penalty -= 1.5;
+    }
+    if (gpu_freq_scale < 0.75 && cpu_freq_scale >= gpu_freq_scale) {
+        perf -= 3.0;
+        energy += 2.0;
+        ratio += 2.0;
+        dec_penalty += 2.0;
+    }
+
+    if (cpu_avail < 0.35) dec_penalty += 2.0;
+    if (gpu_avail < 0.35) dec_penalty -= 1.0;
+
+    if (ratio < 2.0) ratio = 2.0;
+    if (energy < 10.0) energy = 10.0;
+    if (perf < 20.0) perf = 20.0;
+    if (dec_penalty < 0.0) dec_penalty = 0.0;
+    if (dec_penalty > 14.0) dec_penalty = 14.0;
+
+    {
+        double sum = perf + energy + ratio;
+        if (sum <= 0.0) {
+            perf = 66.0;
+            energy = 22.0;
+            ratio = 12.0;
+            sum = 100.0;
+        }
+        perf = perf * 100.0 / sum;
+        energy = energy * 100.0 / sum;
+        ratio = ratio * 100.0 / sum;
+    }
+
+    if (perf_weight_pct) *perf_weight_pct = perf;
+    if (energy_weight_pct) *energy_weight_pct = energy;
+    if (ratio_weight_pct) *ratio_weight_pct = ratio;
+    if (dec_host_penalty_pct) *dec_host_penalty_pct = dec_penalty;
+}
+
+static double lzo_adaptive_ratio_guard_cap(double mean_entropy,
+                                           long thread_count,
+                                           double thread_util,
+                                           double cpu_freq_scale,
+                                           double gpu_freq_scale,
+                                           size_t total_input_sz,
+                                           size_t nblk) {
+    double cap;
+    if (mean_entropy <= 0.0) return 0.85;
+
+    if (mean_entropy < 4.2) cap = 0.55;
+    else if (mean_entropy < 5.4) cap = 0.68;
+    else if (mean_entropy < 6.4) cap = 0.78;
+    else cap = 0.90;
+
+    if (thread_util >= 0.75) cap += 0.08;
+    else if (thread_util <= 0.35) cap += 0.03;
+
+    if (cpu_freq_scale < 0.80 && gpu_freq_scale > cpu_freq_scale) cap += 0.10;
+    if (gpu_freq_scale < 0.70 && cpu_freq_scale >= gpu_freq_scale) cap -= 0.10;
+
+    if (thread_count >= 2) cap -= 0.02;
+    if (thread_count >= 4) cap -= 0.05;
+    if (thread_count >= 8) cap -= 0.03;
+
+    if (thread_count >= 2 && nblk >= 512U) cap -= 0.03;
+    if (thread_count >= 4 && nblk >= 1024U) cap -= 0.05;
+    if (thread_count >= 2 && total_input_sz >= (128U * 1024U * 1024U)) cap -= 0.03;
+
+    if (total_input_sz < (16U * 1024U * 1024U) || nblk < 64U) cap += 0.05;
+
+    if (cap < 0.42) cap = 0.42;
+    if (cap > 0.96) cap = 0.96;
+    return cap;
 }
 
 static void lzo_calibrate_device_profile(cl_context ctx, cl_command_queue queue,
@@ -378,6 +600,10 @@ static void ensure_lzo_init(void) {
 void hybrid_workspace_init(hybrid_workspace_t* ws) {
     memset(ws, 0, sizeof(*ws));
     ws->comp_epoch_base = 1;
+    ws->adaptive_ratio_cache_comp_valid = 0;
+    ws->adaptive_ratio_cache_comp = 0.0;
+    ws->adaptive_ratio_cache_dec_valid = 0;
+    ws->adaptive_ratio_cache_dec = 0.0;
 }
 
 void hybrid_workspace_free(hybrid_workspace_t* ws) {
@@ -427,50 +653,55 @@ static int zero_buffer_range(cl_command_queue q, cl_mem buf, size_t offset, size
     return -1;
 }
 
-static int hybrid_env_flag_value(const char* name, int* is_set) {
-    const char* env = getenv(name);
-    if (is_set) *is_set = 0;
-    if (!env || !*env) return 0;
-    if (is_set) *is_set = 1;
-    if (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0 || strcasecmp(env, "yes") == 0 || strcasecmp(env, "on") == 0) return 1;
-    if (strcmp(env, "0") == 0 || strcasecmp(env, "false") == 0 || strcasecmp(env, "no") == 0 || strcasecmp(env, "off") == 0) return 0;
-    return atoi(env) != 0;
-}
+static size_t hybrid_adaptive_adjust_gpu_blocks(size_t nblk, double gpu_ratio, int* collapsed_out) {
+    size_t gpu_blocks;
+    const unsigned min_mixed = 8U;
+    const unsigned quantum = 4U;
+    const int collapse_small = 1;
 
-static unsigned hybrid_env_unsigned_value(const char* name, unsigned defv) {
-    const char* env = getenv(name);
-    char* end = NULL;
-    unsigned long parsed;
-    if (!env || !*env) return defv;
-    parsed = strtoul(env, &end, 10);
-    if (end == env || *end != '\0' || parsed > UINT32_MAX) return defv;
-    return (unsigned)parsed;
+    if (collapsed_out) *collapsed_out = 0;
+    if (nblk == 0) return 0;
+    if (gpu_ratio <= 0.0) return 0;
+    if (gpu_ratio >= 1.0) return nblk;
+
+    gpu_blocks = (size_t)((double)nblk * gpu_ratio + 0.5);
+    if (gpu_blocks > nblk) gpu_blocks = nblk;
+
+    if (min_mixed > 0) {
+        if (nblk <= (size_t)min_mixed * 2U) {
+            if (collapse_small && gpu_blocks > 0 && gpu_blocks < nblk) {
+                gpu_blocks = (gpu_blocks * 2 >= nblk) ? nblk : 0;
+                if (collapsed_out) *collapsed_out = 1;
+            }
+        } else {
+            if (gpu_blocks > 0 && gpu_blocks < (size_t)min_mixed) gpu_blocks = (size_t)min_mixed;
+            if (gpu_blocks < nblk && (nblk - gpu_blocks) < (size_t)min_mixed) {
+                gpu_blocks = nblk - (size_t)min_mixed;
+            }
+        }
+    }
+
+    if (quantum > 1 && gpu_blocks > 0 && gpu_blocks < nblk) {
+        size_t rounded = ((gpu_blocks + (size_t)quantum / 2U) / (size_t)quantum) * (size_t)quantum;
+        if (min_mixed > 0 && rounded < (size_t)min_mixed) rounded = (size_t)min_mixed;
+        if (min_mixed > 0 && rounded > nblk - (size_t)min_mixed) rounded = nblk - (size_t)min_mixed;
+        if (rounded == 0) rounded = 1;
+        if (rounded >= nblk) rounded = nblk - 1;
+        gpu_blocks = rounded;
+    }
+
+    return gpu_blocks;
 }
 
 static int hybrid_should_use_device_compaction(size_t packed_bytes,
                                                size_t sparse_bytes,
                                                size_t num_blocks,
                                                cl_kernel pack_kernel) {
-    int force_set = 0;
-    int force_value = hybrid_env_flag_value("LZO_HYBRID_FORCE_COMPACTION", &force_set);
-    unsigned min_blocks;
-    unsigned min_gain_pct;
+    const unsigned min_blocks = 8U;
+    const unsigned min_gain_pct = 5U;
 
-    if (!force_set) {
-        force_value = hybrid_env_flag_value("LZO_GPU_FORCE_COMPACTION", &force_set);
-    }
     if (!pack_kernel) return 0;
-    if (force_set) return force_value;
     if (packed_bytes == 0 || sparse_bytes == 0 || packed_bytes >= sparse_bytes) return 0;
-
-    min_blocks = hybrid_env_unsigned_value(
-        "LZO_HYBRID_COMPACTION_MIN_BLOCKS",
-        hybrid_env_unsigned_value("LZO_GPU_COMPACTION_MIN_BLOCKS", 8U)
-    );
-    min_gain_pct = hybrid_env_unsigned_value(
-        "LZO_HYBRID_COMPACTION_MIN_GAIN_PCT",
-        hybrid_env_unsigned_value("LZO_GPU_COMPACTION_MIN_GAIN_PCT", 5U)
-    );
     if (num_blocks < (size_t)min_blocks) return 0;
 
     return (sparse_bytes - packed_bytes) * 100U >= sparse_bytes * (size_t)min_gain_pct;
@@ -487,6 +718,7 @@ typedef struct {
     size_t nblk;
     size_t worst_blk;
     const size_t* block_indices;
+    size_t block_index_base;
     size_t num_assigned;
     int alg_id;
     int rc;
@@ -499,50 +731,92 @@ typedef struct {
     _Atomic uint64_t max_worker_us;
 } cpu_compress_pool_t;
 
+typedef struct {
+    cpu_compress_pool_t* pool;
+    void* wrkmem;
+} cpu_compress_worker_ctx_t;
+
 static void* cpu_compress_worker(void* arg) {
-    cpu_compress_pool_t* pool = (cpu_compress_pool_t*)arg;
+    cpu_compress_worker_ctx_t* ctx = (cpu_compress_worker_ctx_t*)arg;
+    cpu_compress_pool_t* pool = ctx->pool;
     cpu_compress_job_t* job = pool->job;
     uint64_t t0 = hybrid_now_ns();
 
-    /* Per-thread work memory for LZO */
-    void* wrkmem = NULL;
-    size_t wrkmem_sz = (job->alg_id == 1) ? LZO1Y_MEM_COMPRESS : LZO1X_1_MEM_COMPRESS;
-    if (lzo_aligned_alloc_portable(&wrkmem, 64, wrkmem_sz) != 0) {
-        wrkmem = malloc(wrkmem_sz);
-    }
+    /* Per-thread work memory comes from top-level pool allocation */
+    void* wrkmem = ctx->wrkmem;
     if (!wrkmem) {
         job->rc = -1;
         return NULL;
     }
-    memset(wrkmem, 0, wrkmem_sz);
 
-    for (;;) {
-        size_t wi = atomic_fetch_add(&pool->next_idx, 1);
-        if (wi >= job->num_assigned) break;
+    if (job->block_indices) {
+        for (;;) {
+            size_t wi = atomic_fetch_add(&pool->next_idx, 1);
+            size_t blk_idx;
+            size_t offset;
+            size_t this_blk;
+            const unsigned char* src;
+            unsigned char* dst;
+            lzo_uint dst_len;
+            int rc;
 
-        size_t blk_idx = job->block_indices[wi];
-        size_t offset = blk_idx * job->block_size;
-        size_t this_blk = job->block_size;
-        if (offset + this_blk > job->in_size) this_blk = job->in_size - offset;
+            if (wi >= job->num_assigned) break;
 
-        const unsigned char* src = job->input + offset;
-        unsigned char* dst = job->output + blk_idx * job->worst_blk;
-        lzo_uint dst_len = (lzo_uint)job->worst_blk;
+            blk_idx = job->block_indices[wi];
+            offset = blk_idx * job->block_size;
+            this_blk = job->block_size;
+            if (offset + this_blk > job->in_size) this_blk = job->in_size - offset;
 
-        int rc;
-        if (job->alg_id == 1) {
-            rc = lzo1y_1_compress(src, (lzo_uint)this_blk, dst, &dst_len, wrkmem);
-        } else {
-            rc = lzo1x_1_compress(src, (lzo_uint)this_blk, dst, &dst_len, wrkmem);
+            src = job->input + offset;
+            dst = job->output + blk_idx * job->worst_blk;
+            dst_len = (lzo_uint)job->worst_blk;
+
+            if (job->alg_id == 1) {
+                rc = lzo1y_1_compress(src, (lzo_uint)this_blk, dst, &dst_len, wrkmem);
+            } else {
+                rc = lzo1x_1_compress(src, (lzo_uint)this_blk, dst, &dst_len, wrkmem);
+            }
+
+            if (rc != LZO_E_OK) {
+                job->rc = -1;
+            }
+            job->lengths[blk_idx] = (uint32_t)dst_len;
         }
+    } else {
+        const size_t base = job->block_index_base;
+        for (;;) {
+            size_t wi = atomic_fetch_add(&pool->next_idx, 1);
+            size_t blk_idx;
+            size_t offset;
+            size_t this_blk;
+            const unsigned char* src;
+            unsigned char* dst;
+            lzo_uint dst_len;
+            int rc;
 
-        if (rc != LZO_E_OK) {
-            job->rc = -1;
+            if (wi >= job->num_assigned) break;
+
+            blk_idx = base + wi;
+            offset = blk_idx * job->block_size;
+            this_blk = job->block_size;
+            if (offset + this_blk > job->in_size) this_blk = job->in_size - offset;
+
+            src = job->input + offset;
+            dst = job->output + blk_idx * job->worst_blk;
+            dst_len = (lzo_uint)job->worst_blk;
+
+            if (job->alg_id == 1) {
+                rc = lzo1y_1_compress(src, (lzo_uint)this_blk, dst, &dst_len, wrkmem);
+            } else {
+                rc = lzo1x_1_compress(src, (lzo_uint)this_blk, dst, &dst_len, wrkmem);
+            }
+
+            if (rc != LZO_E_OK) {
+                job->rc = -1;
+            }
+            job->lengths[blk_idx] = (uint32_t)dst_len;
         }
-        job->lengths[blk_idx] = (uint32_t)dst_len;
     }
-
-    lzo_aligned_free_portable(wrkmem);
 
     {
         uint64_t elapsed_us = (hybrid_now_ns() - t0) / 1000ULL;
@@ -561,11 +835,11 @@ typedef struct {
     const uint32_t* offsets;
     const uint32_t* comp_lengths;
     unsigned char* output;
-    uint32_t* out_lengths;
     size_t block_size;
     size_t orig_size;
     size_t nblk;
     const size_t* block_indices;
+    size_t block_index_base;
     size_t num_assigned;
     int alg_id;
     int rc;
@@ -577,38 +851,89 @@ typedef struct {
     _Atomic uint64_t max_worker_us;
 } cpu_decompress_pool_t;
 
+typedef struct {
+    cpu_decompress_pool_t* pool;
+    size_t thread_idx;
+    size_t thread_count;
+} cpu_decompress_worker_ctx_t;
+
 static void* cpu_decompress_worker(void* arg) {
-    cpu_decompress_pool_t* pool = (cpu_decompress_pool_t*)arg;
+    cpu_decompress_worker_ctx_t* ctx = (cpu_decompress_worker_ctx_t*)arg;
+    cpu_decompress_pool_t* pool = ctx->pool;
     cpu_decompress_job_t* job = pool->job;
     uint64_t t0 = hybrid_now_ns();
+    const size_t begin = (ctx->thread_idx * job->num_assigned) / ctx->thread_count;
+    const size_t end = ((ctx->thread_idx + 1) * job->num_assigned) / ctx->thread_count;
 
-    for (;;) {
-        size_t wi = atomic_fetch_add(&pool->next_idx, 1);
-        if (wi >= job->num_assigned) break;
+    if (job->block_indices) {
+        for (size_t wi = begin; wi < end; ++wi) {
+            size_t blk_idx;
+            size_t out_offset;
+            size_t this_blk;
+            uint32_t comp_off;
+            uint32_t comp_len;
+            const unsigned char* src;
+            unsigned char* dst;
+            lzo_uint dst_len;
+            int rc;
 
-        size_t blk_idx = job->block_indices[wi];
-        size_t out_offset = blk_idx * job->block_size;
-        size_t this_blk = job->block_size;
-        if (out_offset + this_blk > job->orig_size) this_blk = job->orig_size - out_offset;
+            blk_idx = job->block_indices[wi];
+            out_offset = blk_idx * job->block_size;
+            this_blk = job->block_size;
+            if (out_offset + this_blk > job->orig_size) this_blk = job->orig_size - out_offset;
 
-        uint32_t comp_off = job->offsets[blk_idx];
-        uint32_t comp_len = job->comp_lengths[blk_idx];
+            comp_off = job->offsets[blk_idx];
+            comp_len = job->comp_lengths[blk_idx];
 
-        const unsigned char* src = job->comp_data + comp_off;
-        unsigned char* dst = job->output + out_offset;
-        lzo_uint dst_len = (lzo_uint)this_blk;
+            src = job->comp_data + comp_off;
+            dst = job->output + out_offset;
+            dst_len = (lzo_uint)this_blk;
 
-        int rc;
-        if (job->alg_id == 1) {
-            rc = lzo1y_decompress_safe(src, (lzo_uint)comp_len, dst, &dst_len, NULL);
-        } else {
-            rc = lzo1x_decompress_safe(src, (lzo_uint)comp_len, dst, &dst_len, NULL);
+            if (job->alg_id == 1) {
+                rc = lzo1y_decompress_safe(src, (lzo_uint)comp_len, dst, &dst_len, NULL);
+            } else {
+                rc = lzo1x_decompress_safe(src, (lzo_uint)comp_len, dst, &dst_len, NULL);
+            }
+
+            if (rc != LZO_E_OK || dst_len != (lzo_uint)this_blk) {
+                job->rc = -1;
+            }
         }
+    } else {
+        const size_t base = job->block_index_base;
+        for (size_t wi = begin; wi < end; ++wi) {
+            size_t blk_idx;
+            size_t out_offset;
+            size_t this_blk;
+            uint32_t comp_off;
+            uint32_t comp_len;
+            const unsigned char* src;
+            unsigned char* dst;
+            lzo_uint dst_len;
+            int rc;
 
-        if (rc != LZO_E_OK || dst_len != (lzo_uint)this_blk) {
-            job->rc = -1;
+            blk_idx = base + wi;
+            out_offset = blk_idx * job->block_size;
+            this_blk = job->block_size;
+            if (out_offset + this_blk > job->orig_size) this_blk = job->orig_size - out_offset;
+
+            comp_off = job->offsets[blk_idx];
+            comp_len = job->comp_lengths[blk_idx];
+
+            src = job->comp_data + comp_off;
+            dst = job->output + out_offset;
+            dst_len = (lzo_uint)this_blk;
+
+            if (job->alg_id == 1) {
+                rc = lzo1y_decompress_safe(src, (lzo_uint)comp_len, dst, &dst_len, NULL);
+            } else {
+                rc = lzo1x_decompress_safe(src, (lzo_uint)comp_len, dst, &dst_len, NULL);
+            }
+
+            if (rc != LZO_E_OK || dst_len != (lzo_uint)this_blk) {
+                job->rc = -1;
+            }
         }
-        job->out_lengths[blk_idx] = (uint32_t)dst_len;
     }
 
     {
@@ -650,52 +975,249 @@ static void partition_blocks_prefix(size_t nblk, double gpu_ratio,
     for (size_t i = 0; i < cn; ++i) (*cpu_indices)[i] = gn + i;
 }
 
-static void partition_blocks_distributed(size_t nblk, double gpu_ratio,
-                                         size_t** gpu_indices, size_t* gpu_count,
-                                         size_t** cpu_indices, size_t* cpu_count) {
+typedef struct {
+    size_t idx;
+    double entropy;
+} entropy_rank_t;
+
+static int cmp_entropy_desc(const void* a, const void* b) {
+    const entropy_rank_t* ea = (const entropy_rank_t*)a;
+    const entropy_rank_t* eb = (const entropy_rank_t*)b;
+    if (ea->entropy < eb->entropy) return 1;
+    if (ea->entropy > eb->entropy) return -1;
+    if (ea->idx > eb->idx) return 1;
+    if (ea->idx < eb->idx) return -1;
+    return 0;
+}
+
+static int cmp_size_t_asc(const void* a, const void* b) {
+    const size_t va = *(const size_t*)a;
+    const size_t vb = *(const size_t*)b;
+    if (va > vb) return 1;
+    if (va < vb) return -1;
+    return 0;
+}
+
+static void partition_blocks_entropy_aware(size_t nblk, double gpu_ratio,
+                                           const unsigned char* input, size_t input_size, size_t blk,
+                                           size_t** gpu_indices, size_t* gpu_count,
+                                           size_t** cpu_indices, size_t* cpu_count) {
     size_t gn = (size_t)(nblk * gpu_ratio + 0.5);
     if (gn > nblk) gn = nblk;
-    size_t cn = nblk - gn;
 
-    *gpu_count = gn;
-    *cpu_count = cn;
-
-    *gpu_indices = (size_t*)malloc(gn * sizeof(size_t));
-    *cpu_indices = (size_t*)malloc(cn * sizeof(size_t));
-    if ((gn > 0 && !*gpu_indices) || (cn > 0 && !*cpu_indices)) {
-        free(*gpu_indices);
-        free(*cpu_indices);
-        *gpu_indices = NULL;
-        *cpu_indices = NULL;
-        *gpu_count = 0;
-        *cpu_count = 0;
+    if (!input || blk == 0 || input_size == 0 || nblk <= 1 || gn == 0 || gn == nblk) {
+        partition_blocks_prefix(nblk, gpu_ratio, gpu_indices, gpu_count, cpu_indices, cpu_count);
         return;
     }
 
     {
-        size_t gpu_written = 0;
-        size_t cpu_written = 0;
-        for (size_t idx = 0; idx < nblk; ++idx) {
-            if ((((idx + 1) * gn) / nblk) != ((idx * gn) / nblk)) {
-                (*gpu_indices)[gpu_written++] = idx;
+        const size_t entropy_sample_bytes = 1024;
+        entropy_rank_t* ranks = (entropy_rank_t*)malloc(nblk * sizeof(entropy_rank_t));
+        size_t cn = nblk - gn;
+
+        *gpu_count = gn;
+        *cpu_count = cn;
+        *gpu_indices = (size_t*)malloc(gn * sizeof(size_t));
+        *cpu_indices = (size_t*)malloc(cn * sizeof(size_t));
+
+        if (!ranks || (gn > 0 && !*gpu_indices) || (cn > 0 && !*cpu_indices)) {
+            free(ranks);
+            free(*gpu_indices);
+            free(*cpu_indices);
+            *gpu_indices = NULL;
+            *cpu_indices = NULL;
+            *gpu_count = 0;
+            *cpu_count = 0;
+            partition_blocks_prefix(nblk, gpu_ratio, gpu_indices, gpu_count, cpu_indices, cpu_count);
+            return;
+        }
+
+        for (size_t i = 0; i < nblk; ++i) {
+            size_t this_blk = block_input_size(input_size, blk, i);
+            size_t sample_sz = this_blk;
+            if (sample_sz > entropy_sample_bytes) sample_sz = entropy_sample_bytes;
+
+            ranks[i].idx = i;
+            if (sample_sz == 0) {
+                ranks[i].entropy = 8.0;
             } else {
-                (*cpu_indices)[cpu_written++] = idx;
+                ranks[i].entropy = lzo_calc_entropy(input + i * blk, sample_sz);
             }
         }
-        *gpu_count = gpu_written;
-        *cpu_count = cpu_written;
+
+        qsort(ranks, nblk, sizeof(entropy_rank_t), cmp_entropy_desc);
+        for (size_t i = 0; i < gn; ++i) (*gpu_indices)[i] = ranks[i].idx;
+        for (size_t i = 0; i < cn; ++i) (*cpu_indices)[i] = ranks[gn + i].idx;
+
+        qsort(*gpu_indices, gn, sizeof(size_t), cmp_size_t_asc);
+        qsort(*cpu_indices, cn, sizeof(size_t), cmp_size_t_asc);
+
+        free(ranks);
     }
 }
 
 static void partition_blocks(size_t nblk, double gpu_ratio,
                              size_t** gpu_indices, size_t* gpu_count,
-                             size_t** cpu_indices, size_t* cpu_count,
-                             int striped_split) {
-    if (striped_split) {
-        partition_blocks_distributed(nblk, gpu_ratio, gpu_indices, gpu_count, cpu_indices, cpu_count);
-    } else {
-        partition_blocks_prefix(nblk, gpu_ratio, gpu_indices, gpu_count, cpu_indices, cpu_count);
+                             size_t** cpu_indices, size_t* cpu_count) {
+    partition_blocks_prefix(nblk, gpu_ratio, gpu_indices, gpu_count, cpu_indices, cpu_count);
+}
+
+static double lzo_cpu_thread_scale(long thread_count, int alg_id, int is_unified_memory) {
+    double gain;
+    double scale;
+    double cap;
+
+    if (thread_count <= 1) return 1.0;
+    gain = (alg_id == 1) ? 0.46 : 0.56;
+    if (!is_unified_memory) gain += 0.05;
+
+    scale = 1.0 + (double)(thread_count - 1) * gain;
+    cap = 1.0 + ((alg_id == 1) ? 1.35 : 1.55) * log2((double)thread_count + 1.0);
+    if (scale > cap) scale = cap;
+    if (scale < 1.0) scale = 1.0;
+    return scale;
+}
+
+static int hybrid_prefix_index_fastpath_enabled_for_mode(const hybrid_params_t* params,
+                                                         int is_decompress,
+                                                         size_t nblk,
+                                                         size_t total_input_sz) {
+    /*
+     * Deterministic policy (no runtime env overrides):
+     * - compress: enable prefix fastpath on medium/large inputs to cut host mapping cost
+     * - decompress: enable prefix fastpath to reduce host-side index overhead
+     */
+    if (is_decompress) return 1;
+    if (!params) return 0;
+
+    if (nblk < 16 || total_input_sz < (4U * 1024U * 1024U)) return 0;
+
+    if (params->alg_id == 1) {
+        if (nblk >= 96 || total_input_sz >= (24U * 1024U * 1024U)) return 1;
+        return 0;
     }
+
+    if (nblk >= 48 || total_input_sz >= (12U * 1024U * 1024U)) return 1;
+    return 0;
+}
+
+static double lzo_refine_ratio_candidate(const hybrid_params_t* params,
+                                         size_t total_input_sz,
+                                         size_t nblk,
+                                         double Pc_eff,
+                                         double Pg_eff,
+                                         double t0,
+                                         double cpu_freq_scale,
+                                         double gpu_freq_scale,
+                                         double thread_util,
+                                         double mean_entropy,
+                                         double seed_ratio,
+                                         double min_ratio,
+                                         double max_ratio) {
+    static const double cands_1x[] = {0.0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.62, 0.74, 0.86, 1.0};
+    static const double cands_1y[] = {0.0, 0.08, 0.16, 0.24, 0.32, 0.40, 0.50, 0.60, 0.72, 0.84, 1.0};
+    const double* cands = (params && params->alg_id == 1) ? cands_1y : cands_1x;
+    size_t nc = (params && params->alg_id == 1)
+                    ? (sizeof(cands_1y) / sizeof(cands_1y[0]))
+                    : (sizeof(cands_1x) / sizeof(cands_1x[0]));
+    double best_r = seed_ratio;
+    double best_obj = 1e300;
+    double B = (double)total_input_sz;
+    double pc = (Pc_eff > 1.0) ? Pc_eff : 1.0;
+    double pg = (Pg_eff > 1.0) ? Pg_eff : 1.0;
+
+    if (!params || total_input_sz == 0 || nblk == 0) return seed_ratio;
+    if (seed_ratio < 0.0) seed_ratio = 0.0;
+    if (seed_ratio > 1.0) seed_ratio = 1.0;
+    if (min_ratio < 0.0) min_ratio = 0.0;
+    if (min_ratio > 1.0) min_ratio = 1.0;
+    if (max_ratio < 0.0) max_ratio = 0.0;
+    if (max_ratio > 1.0) max_ratio = 1.0;
+    if (max_ratio < min_ratio) max_ratio = min_ratio;
+
+    for (size_t i = 0; i < nc; ++i) {
+        int collapsed = 0;
+        size_t gpu_blocks = hybrid_adaptive_adjust_gpu_blocks(nblk, cands[i], &collapsed);
+        size_t cpu_blocks = nblk - gpu_blocks;
+        size_t mix_blocks = (gpu_blocks < cpu_blocks) ? gpu_blocks : cpu_blocks;
+        double r = (nblk > 0) ? ((double)gpu_blocks / (double)nblk) : cands[i];
+        double bytes_gpu = B * r;
+        double bytes_cpu = B - bytes_gpu;
+        double mix_base_us = (params->alg_id == 1) ? 230.0 : 170.0;
+        double mix_per_block_us = (params->alg_id == 1) ? 0.42 : 0.30;
+        double mix_pen_s = (gpu_blocks > 0 && cpu_blocks > 0)
+                               ? ((mix_base_us + mix_per_block_us * (double)mix_blocks) / 1000000.0)
+                               : 0.0;
+        double comp_cpu_s = bytes_cpu / pc;
+        double comp_gpu_s = (gpu_blocks > 0) ? (t0 + bytes_gpu / pg) : 0.0;
+        double comp_s;
+        double dec_cpu_thr;
+        double dec_gpu_thr;
+        double dec_cpu_s;
+        double dec_gpu_s;
+        double dec_s;
+        double cpu_pow;
+        double gpu_pow;
+        double energy;
+        double ratio_pen = 0.0;
+        double smooth_pen;
+        double obj;
+
+        if (r < min_ratio || r > max_ratio) {
+            continue;
+        }
+
+        if (gpu_blocks > 0 && cpu_blocks > 0) {
+            comp_s = (comp_cpu_s > comp_gpu_s ? comp_cpu_s : comp_gpu_s) + mix_pen_s;
+        } else {
+            comp_s = comp_cpu_s + comp_gpu_s;
+        }
+
+        dec_cpu_thr = pc * ((params->alg_id == 1) ? 1.20 : 1.32);
+        dec_gpu_thr = pg * ((params->alg_id == 1) ? 0.78 : 0.90);
+        dec_cpu_s = bytes_cpu / dec_cpu_thr;
+        dec_gpu_s = (gpu_blocks > 0) ? (0.45 * t0 + bytes_gpu / dec_gpu_thr) : 0.0;
+        if (gpu_blocks > 0 && cpu_blocks > 0) {
+            dec_s = (dec_cpu_s > dec_gpu_s ? dec_cpu_s : dec_gpu_s) + 0.85 * mix_pen_s;
+        } else {
+            dec_s = dec_cpu_s + dec_gpu_s;
+        }
+
+        cpu_pow = (0.35 + 0.65 * cpu_freq_scale * cpu_freq_scale) * (0.45 + 0.55 * thread_util);
+        gpu_pow = (0.45 + 0.55 * gpu_freq_scale * gpu_freq_scale);
+        energy = cpu_pow * (comp_cpu_s + 0.60 * dec_cpu_s) + gpu_pow * (comp_gpu_s + 0.60 * dec_gpu_s);
+
+        if (mean_entropy > 0.0) {
+            double compressibility = 1.0 - mean_entropy / 8.0;
+            if (compressibility < 0.0) compressibility = 0.0;
+            if (compressibility > 1.0) compressibility = 1.0;
+            ratio_pen = ((params->alg_id == 1) ? 0.12 : 0.10) * compressibility * r * r;
+        }
+
+        smooth_pen = fabs(r - seed_ratio) * 0.0015;
+        obj = comp_s + 0.85 * dec_s + 0.07 * energy + ratio_pen + smooth_pen;
+
+        if (total_input_sz < (16U * 1024U * 1024U) && gpu_blocks > 0 && cpu_blocks > 0) {
+            obj += 0.0003;
+        }
+        if (collapsed) {
+            obj += 0.00005;
+        }
+
+        if (obj < best_obj) {
+            best_obj = obj;
+            best_r = r;
+        }
+    }
+
+    if (best_obj >= 1e299) {
+        best_r = seed_ratio;
+    }
+
+    if (best_r < min_ratio) best_r = min_ratio;
+    if (best_r > max_ratio) best_r = max_ratio;
+
+    return best_r;
 }
 
 static double choose_adaptive_gpu_ratio(cl_context ctx, cl_command_queue queue,
@@ -707,23 +1229,31 @@ static double choose_adaptive_gpu_ratio(cl_context ctx, cl_command_queue queue,
                                         const hybrid_params_t* params,
                                         hybrid_workspace_t* ws) {
     /*
-     * Device-aware adaptive scheduler using makespan minimization.
-     *
-     * Model:
-     *   Pc_eff = Pc0_per_thread * gC(data) * sC(runtime) * thread_count
-     *   Pg_eff = Pg0 * gG(data) * sG(runtime)
-     *   r* = Pg_eff / (Pc_eff + Pg_eff) - t0 * Pc_eff * Pg_eff / (B * (Pc_eff + Pg_eff))
-     *   gpu_ratio = clamp(r*, 0, 1)
-     *
-     * LZO uses entropy for data characterization:
-     *   gC: CPU throughput varies with data compressibility (entropy-based scaling)
-     *   gG: GPU throughput is memory-bandwidth-bound; entropy maps to compression ratio
+     * Device-aware adaptive scheduler with frequency-aware
+     * performance + energy objective.
      */
     double Pc0, Pg0, t0;
     double gC, gG;
     double sC, sG;
     double Pc_eff, Pg_eff;
     double r_star;
+    double r_perf = 0.0;
+    double r_energy = 0.0;
+    double perf_weight_pct = 70.0;
+    double energy_weight_pct = 30.0;
+    double ratio_weight_pct = 0.0;
+    double dec_host_penalty_pct = 0.0;
+    double eC_eff = 0.0;
+    double eG_eff = 0.0;
+    double freq_mode_bias = 0.0;
+    double split_mix_penalty = 0.0;
+    double cpu_freq_scale = 1.0;
+    double gpu_freq_scale = 1.0;
+    double thread_util = 1.0;
+    double cpu_thread_scale = 1.0;
+    double ratio_cap = 0.95;
+    double min_ratio = 0.0;
+    double max_ratio = 1.0;
     long thread_count;
     long total_cores;
     double B = (double)total_input_sz;
@@ -732,13 +1262,36 @@ static double choose_adaptive_gpu_ratio(cl_context ctx, cl_command_queue queue,
     double mean_entropy = 0.0;
     size_t sampled = 0;
     double sample_cpu_throughput = 0.0;
+    int measure_cpu_probe = 1;
+    double cached_ratio;
 
     if (!gpu_kernel) return 0.0;
 
     if (!params || nblk == 0 || blk == 0 || total_input_sz == 0)
         return 0.5;
 
-    /* --- 1. Device capability profile (cached) --- */
+    if (ws) {
+        if (input && ws->adaptive_ratio_cache_comp_valid) {
+            cached_ratio = ws->adaptive_ratio_cache_comp;
+            if (cached_ratio < 0.0) cached_ratio = 0.0;
+            if (cached_ratio > 1.0) cached_ratio = 1.0;
+            if (params->debug) {
+                fprintf(stderr, "Adaptive: reuse cached comp ratio r*=%.4f\n", cached_ratio);
+            }
+            lzo_hybrid_metrics_record_adaptive(cached_ratio);
+            return cached_ratio;
+        }
+        if (!input && ws->adaptive_ratio_cache_dec_valid) {
+            cached_ratio = ws->adaptive_ratio_cache_dec;
+            if (cached_ratio < 0.0) cached_ratio = 0.0;
+            if (cached_ratio > 1.0) cached_ratio = 1.0;
+            if (params->debug) {
+                fprintf(stderr, "Adaptive: reuse cached dec ratio r*=%.4f\n", cached_ratio);
+            }
+            return cached_ratio;
+        }
+    }
+
     lzo_calibrate_device_profile(ctx, queue, device, gpu_kernel, params, ws);
     Pc0 = g_lzo_dev_profile.cpu_throughput;
     Pg0 = g_lzo_dev_profile.gpu_throughput;
@@ -750,12 +1303,29 @@ static double choose_adaptive_gpu_ratio(cl_context ctx, cl_command_queue queue,
         thread_count = params->cpu_threads;
     else
         thread_count = total_cores;
+    cpu_thread_scale = lzo_cpu_thread_scale(thread_count,
+                                            params->alg_id,
+                                            g_lzo_dev_profile.is_unified_memory);
 
-    /* --- 2. Data characteristics from entropy sampling + CPU timing --- */
     gC = 1.0;
     gG = 1.0;
     sample_blocks = params->adaptive_sample_blocks ? params->adaptive_sample_blocks : 8;
+    if (params->alg_id == 1) {
+        /* lzo1y 对采样稀释更敏感：小文件保留更高采样密度，避免误判到低 GPU 比率 */
+        if (total_input_sz <= (16U * 1024U * 1024U) && sample_blocks > 6U) {
+            sample_blocks = 6U;
+        }
+    } else {
+        if (total_input_sz <= (16U * 1024U * 1024U) && sample_blocks > 2U) {
+            sample_blocks = 2U;
+        } else if (total_input_sz <= (64U * 1024U * 1024U) && sample_blocks > 4U) {
+            sample_blocks = 4U;
+        }
+    }
     if (sample_blocks > nblk) sample_blocks = nblk;
+    if (params->alg_id != 1 && total_input_sz < (32U * 1024U * 1024U) && nblk < 256U) {
+        measure_cpu_probe = 0;
+    }
 
     if (input && sample_blocks > 0) {
         size_t prev_block = SIZE_MAX;
@@ -770,33 +1340,36 @@ static double choose_adaptive_gpu_ratio(cl_context ctx, cl_command_queue queue,
 
             if (tmp_out && wrkmem) {
                 memset(wrkmem, 0, wrkmem_sz);
-                uint64_t sample_t0 = hybrid_now_ns();
-
-                for (size_t i = 0; i < sample_blocks; ++i) {
-                    const size_t blk_idx = sampled_block_index(i, sample_blocks, nblk);
-                    const size_t blk_sz = block_input_size(total_input_sz, blk, blk_idx);
-                    if (blk_idx == prev_block || blk_sz == 0) continue;
-
-                    double entropy = lzo_calc_entropy(input + blk_idx * blk, blk_sz);
-                    mean_entropy += entropy;
-                    sampled++;
-                    prev_block = blk_idx;
-                    sample_bytes += blk_sz;
-
-                    /* Time CPU compress for throughput measurement */
-                    {
-                        lzo_uint out_len = (lzo_uint)lzo_worst_size(blk);
-                        if (params->alg_id == 1)
-                            lzo1y_1_compress(input + blk_idx * blk, (lzo_uint)blk_sz, tmp_out, &out_len, wrkmem);
-                        else
-                            lzo1x_1_compress(input + blk_idx * blk, (lzo_uint)blk_sz, tmp_out, &out_len, wrkmem);
-                    }
-                }
-
                 {
-                    uint64_t sample_t1 = hybrid_now_ns();
-                    if (sample_bytes > 0 && sample_t1 > sample_t0)
-                        sample_cpu_throughput = (double)sample_bytes / ((double)(sample_t1 - sample_t0) * 1e-9);
+                    uint64_t sample_t0 = measure_cpu_probe ? hybrid_now_ns() : 0ULL;
+
+                    for (size_t i = 0; i < sample_blocks; ++i) {
+                        const size_t blk_idx = sampled_block_index(i, sample_blocks, nblk);
+                        const size_t blk_sz = block_input_size(total_input_sz, blk, blk_idx);
+                        if (blk_idx == prev_block || blk_sz == 0) continue;
+
+                        {
+                            double entropy = lzo_calc_entropy(input + blk_idx * blk, blk_sz);
+                            mean_entropy += entropy;
+                        }
+                        sampled++;
+                        prev_block = blk_idx;
+
+                        if (measure_cpu_probe) {
+                            lzo_uint out_len = (lzo_uint)lzo_worst_size(blk);
+                            if (params->alg_id == 1)
+                                lzo1y_1_compress(input + blk_idx * blk, (lzo_uint)blk_sz, tmp_out, &out_len, wrkmem);
+                            else
+                                lzo1x_1_compress(input + blk_idx * blk, (lzo_uint)blk_sz, tmp_out, &out_len, wrkmem);
+                            sample_bytes += blk_sz;
+                        }
+                    }
+
+                    if (measure_cpu_probe) {
+                        uint64_t sample_t1 = hybrid_now_ns();
+                        if (sample_bytes > 0 && sample_t1 > sample_t0)
+                            sample_cpu_throughput = (double)sample_bytes / ((double)(sample_t1 - sample_t0) * 1e-9);
+                    }
                 }
             }
             free(tmp_out);
@@ -805,20 +1378,12 @@ static double choose_adaptive_gpu_ratio(cl_context ctx, cl_command_queue queue,
 
         if (sampled > 0) mean_entropy /= (double)sampled;
 
-        /* gC: ratio of sample CPU throughput to calibration throughput */
         if (sample_cpu_throughput > 0.0 && Pc0 > 0.0) {
             gC = sample_cpu_throughput / Pc0;
             if (gC < 0.3) gC = 0.3;
             if (gC > 3.0) gC = 3.0;
         }
 
-        /*
-         * gG: GPU data-dependent factor from entropy.
-         * High entropy → high compression ratio → less output bandwidth → slightly faster.
-         * Low entropy → high compressibility → more varied output → gG stays near 1.0.
-         * Map: entropy 0→8 bits corresponds roughly to ratio 0.05→0.95.
-         * gG = (1 + m + Rref) / (1 + m + R_est)
-         */
         {
             const double m = 2.0;
             const double Rref = 0.50;
@@ -831,7 +1396,6 @@ static double choose_adaptive_gpu_ratio(cl_context ctx, cl_command_queue queue,
         }
     }
 
-    /* --- 3. Runtime state --- */
     sC = lzo_read_cpu_availability();
     sG = lzo_read_gpu_availability();
 
@@ -841,15 +1405,48 @@ static double choose_adaptive_gpu_ratio(cl_context ctx, cl_command_queue queue,
         if (sC > 1.0) sC = 1.0;
     }
 
-    Pc_eff = Pc0 * gC * sC * (double)thread_count;
-    Pg_eff = Pg0 * gG * sG;
+    thread_util = (total_cores > 0) ? ((double)thread_count / (double)total_cores) : 1.0;
+    if (thread_util < 0.05) thread_util = 0.05;
+    if (thread_util > 1.25) thread_util = 1.25;
+
+    cpu_freq_scale = lzo_read_cpu_freq_scale();
+    gpu_freq_scale = lzo_read_gpu_freq_scale();
+
+    Pc_eff = Pc0 * gC * sC * cpu_thread_scale * cpu_freq_scale;
+    Pg_eff = Pg0 * gG * sG * gpu_freq_scale;
 
     if (B <= t0 * Pg_eff && t0 > 0.0) {
-        if (params->debug) {
-            fprintf(stderr, "Adaptive: input too small (%.0f B <= overhead %.6f s * %.0f B/s), CPU-only\n",
-                    B, t0, Pg_eff);
+        double overlap = B / (t0 * Pg_eff);
+        double small_ratio;
+        double soft_floor;
+        if (overlap < 0.0) overlap = 0.0;
+        if (overlap > 1.0) overlap = 1.0;
+        small_ratio = 0.06 + 0.12 * overlap;
+        if (thread_util >= 0.75) small_ratio += 0.04;
+        if (small_ratio > 0.26) small_ratio = 0.26;
+
+        /*
+         * 对极小输入的软保护做算法感知下限：
+         * - lzo1y 在低 R 下容易出现明显吞吐塌陷（如 dickens），保持更高 GPU 占比；
+         * - lzo1x 也需要避免过低 R，但下限可更保守。
+         */
+        if (params->alg_id == 1) {
+            soft_floor = (mean_entropy > 0.0 && mean_entropy < 5.2) ? 0.58 : 0.56;
+        } else {
+            soft_floor = (mean_entropy > 0.0 && mean_entropy < 5.2) ? 0.50 : 0.46;
         }
-        return 0.0;
+        if (small_ratio < soft_floor) small_ratio = soft_floor;
+        if (small_ratio > 0.62) small_ratio = 0.62;
+
+        if (params->debug) {
+            fprintf(stderr,
+                    "Adaptive: small-input soft guard (B=%.0f <= overhead %.6f s * %.0f B/s), r*=%.4f\n",
+                    B, t0, Pg_eff, small_ratio);
+        }
+        if (input) {
+            lzo_hybrid_metrics_record_adaptive(small_ratio);
+        }
+        return small_ratio;
     }
 
     if (Pc_eff + Pg_eff <= 0.0) return 0.5;
@@ -857,31 +1454,244 @@ static double choose_adaptive_gpu_ratio(cl_context ctx, cl_command_queue queue,
     if (B > 0.0 && t0 > 0.0) {
         r_star -= (t0 * Pc_eff * Pg_eff) / (B * (Pc_eff + Pg_eff));
     }
+    r_perf = r_star;
 
-    /* --- 4. Energy-aware correction --- */
+    {
+        double input_mb = (double)total_input_sz / (1024.0 * 1024.0);
+        lzo_adaptive_choose_objective_weights(input_mb,
+                                              mean_entropy,
+                                              sC,
+                                              sG,
+                                              thread_util,
+                                              cpu_freq_scale,
+                                              gpu_freq_scale,
+                                              &perf_weight_pct,
+                                              &energy_weight_pct,
+                                              &ratio_weight_pct,
+                                              &dec_host_penalty_pct);
+    }
+
     {
         double eC = g_lzo_dev_profile.cpu_energy_per_byte;
         double eG = g_lzo_dev_profile.gpu_energy_per_byte;
+
         if (eC > 0.0 && eG > 0.0) {
-            double r_energy = (Pg_eff * eC) / (Pc_eff * eG + Pg_eff * eC);
-            r_star = 0.7 * r_star + 0.3 * r_energy;
+            const double cpu_dyn_power = 0.75 + 0.60 * thread_util +
+                0.55 * (cpu_freq_scale * cpu_freq_scale * cpu_freq_scale);
+            const double gpu_dyn_power = 0.85 + 0.50 * gpu_freq_scale + 0.15 * (1.0 - sG);
+            eC_eff = eC * cpu_dyn_power / (cpu_freq_scale > 0.30 ? cpu_freq_scale : 0.30);
+            eG_eff = eG * gpu_dyn_power / (gpu_freq_scale > 0.30 ? gpu_freq_scale : 0.30);
+
+            {
+                double denom = Pc_eff * eG_eff + Pg_eff * eC_eff;
+                if (denom > 0.0) {
+                    r_energy = (Pg_eff * eC_eff) / denom;
+                } else {
+                    r_energy = r_perf;
+                }
+            }
+
+            {
+                double sum_w = perf_weight_pct + energy_weight_pct;
+                if (sum_w <= 0.0) {
+                    perf_weight_pct = 62.0;
+                    energy_weight_pct = 28.0;
+                    sum_w = perf_weight_pct + energy_weight_pct;
+                }
+                r_star = (perf_weight_pct * r_perf + energy_weight_pct * r_energy) / sum_w;
+            }
+
+            freq_mode_bias = (gpu_freq_scale - cpu_freq_scale) * 0.08;
+            if (thread_util >= 0.80) freq_mode_bias += 0.04;
+            if (gpu_freq_scale < 0.75) freq_mode_bias -= 0.05;
+            r_star += freq_mode_bias;
         }
     }
 
+    if (input) {
+        if (thread_count >= 2) split_mix_penalty += 0.008;
+        if (thread_count >= 4) split_mix_penalty += 0.010;
+        if (thread_count >= 8) split_mix_penalty += 0.008;
+        if (nblk >= 512U) split_mix_penalty += 0.008;
+        if (nblk >= 1024U) split_mix_penalty += 0.010;
+        if (total_input_sz >= (128U * 1024U * 1024U)) split_mix_penalty += 0.008;
+        if (split_mix_penalty > 0.06) split_mix_penalty = 0.06;
+        if (split_mix_penalty > 0.0) {
+            r_star *= (1.0 - split_mix_penalty);
+        }
+    }
+
+    if (input && sampled > 0) {
+        double compressibility = 1.0 - (mean_entropy / 8.0);
+        double ratio_push;
+
+        if (compressibility < 0.0) compressibility = 0.0;
+        if (compressibility > 1.0) compressibility = 1.0;
+
+        ratio_cap = lzo_adaptive_ratio_guard_cap(mean_entropy,
+                             thread_count,
+                                                 thread_util,
+                                                 cpu_freq_scale,
+                                                 gpu_freq_scale,
+                                                 total_input_sz,
+                                                 nblk);
+
+        if (thread_count >= 2 &&
+            (total_input_sz >= (128U * 1024U * 1024U) || nblk >= 1024U) &&
+            mean_entropy < 6.8) {
+            double high_thread_cap = (thread_count >= 4) ? 0.52 : 0.58;
+            if (ratio_cap > high_thread_cap) ratio_cap = high_thread_cap;
+        }
+
+        ratio_push = (ratio_weight_pct / 100.0) * (0.08 + 0.16 * compressibility);
+        if (ratio_push < 0.0) ratio_push = 0.0;
+        if (ratio_push > 0.14) ratio_push = 0.14;
+        r_star *= (1.0 - ratio_push);
+
+        if (r_star > ratio_cap) {
+            r_star = ratio_cap;
+        }
+    }
+
+    if (input) {
+        double gpu_perf_adv = (Pc_eff > 1.0) ? (Pg_eff / Pc_eff) : 1.0;
+        double gpu_floor = (params->alg_id == 1) ? 0.16 : 0.18;
+
+        if (gpu_perf_adv > 1.05) gpu_floor += 0.08;
+        if (gpu_perf_adv > 1.18) gpu_floor += 0.06;
+        if (gpu_freq_scale > cpu_freq_scale + 0.08) gpu_floor += 0.08;
+        if (thread_util >= 0.75) gpu_floor += 0.05;
+        if (total_input_sz >= (8U * 1024U * 1024U)) gpu_floor += 0.06;
+        if (total_input_sz >= (32U * 1024U * 1024U)) gpu_floor += 0.08;
+        if (total_input_sz >= (128U * 1024U * 1024U)) gpu_floor += 0.05;
+        if (total_input_sz < (24U * 1024U * 1024U)) gpu_floor += 0.08;
+        if (mean_entropy > 0.0 && mean_entropy < 4.8) gpu_floor += 0.03;
+        if (mean_entropy > 6.6) gpu_floor += 0.03;
+        if (gpu_floor < 0.10) gpu_floor = 0.10;
+        if (gpu_floor > 0.58) gpu_floor = 0.58;
+        if (gpu_floor > ratio_cap) gpu_floor = ratio_cap;
+
+        min_ratio = gpu_floor;
+        max_ratio = ratio_cap;
+
+        if (total_input_sz >= (256U * 1024U * 1024U) &&
+            total_input_sz <= (2U * 1024U * 1024U * 1024U) &&
+            nblk >= 1024U) {
+            double mid_cap = (params->alg_id == 1) ? 0.82 : 0.78;
+            if (max_ratio > mid_cap) max_ratio = mid_cap;
+        }
+
+        if (total_input_sz <= (64U * 1024U * 1024U)) {
+            double anchor_min = (params->alg_id == 1) ? 0.42 : 0.44;
+            double anchor_max = (params->alg_id == 1) ? 0.58 : 0.56;
+            if (min_ratio < anchor_min) min_ratio = anchor_min;
+            if (max_ratio > anchor_max) max_ratio = anchor_max;
+        }
+
+        if (total_input_sz <= (16U * 1024U * 1024U)) {
+            double tiny_min = (params->alg_id == 1) ? 0.34 : 0.36;
+            double tiny_max = (params->alg_id == 1) ? 0.62 : 0.60;
+            if (min_ratio < tiny_min) min_ratio = tiny_min;
+            if (max_ratio > tiny_max) max_ratio = tiny_max;
+        }
+        if (max_ratio < min_ratio) max_ratio = min_ratio;
+
+        if (r_star < min_ratio) r_star = min_ratio;
+        if (r_star > max_ratio) r_star = max_ratio;
+    } else {
+        min_ratio = (params->alg_id == 1) ? 0.38 : 0.42;
+        max_ratio = (params->alg_id == 1) ? 0.62 : 0.66;
+        if (gpu_freq_scale > cpu_freq_scale + 0.08) {
+            min_ratio += 0.06;
+            max_ratio += 0.08;
+        } else if (gpu_freq_scale + 0.08 < cpu_freq_scale) {
+            min_ratio -= 0.06;
+            max_ratio -= 0.08;
+        }
+        if (min_ratio < 0.22) min_ratio = 0.22;
+        if (max_ratio > 0.86) max_ratio = 0.86;
+        if (max_ratio < min_ratio) max_ratio = min_ratio;
+        if (r_star < min_ratio) r_star = min_ratio;
+        if (r_star > max_ratio) r_star = max_ratio;
+    }
+
+    {
+        double freq_gap = gpu_freq_scale - cpu_freq_scale;
+        if (freq_gap > 0.05) {
+            double boost = freq_gap * 0.18;
+            if (thread_util >= 0.70) boost += 0.02;
+            if (boost > 0.18) boost = 0.18;
+            r_star += boost;
+        } else if (freq_gap < -0.10) {
+            double cut = (-freq_gap) * 0.08;
+            if (cut > 0.10) cut = 0.10;
+            r_star -= cut;
+        }
+    }
+
+    if (r_star < min_ratio) r_star = min_ratio;
+    if (r_star > max_ratio) r_star = max_ratio;
+
+    if (!input && dec_host_penalty_pct > 0.0) {
+        double factor = 1.0 - dec_host_penalty_pct / 100.0;
+        if (factor < 0.0) factor = 0.0;
+        r_star *= factor;
+    }
+
+    r_star = lzo_refine_ratio_candidate(params,
+                                        total_input_sz,
+                                        nblk,
+                                        Pc_eff,
+                                        Pg_eff,
+                                        t0,
+                                        cpu_freq_scale,
+                                        gpu_freq_scale,
+                                        thread_util,
+                                        mean_entropy,
+                                        r_star,
+                                        min_ratio,
+                                        max_ratio);
+
+    if (r_star < min_ratio) r_star = min_ratio;
+    if (r_star > max_ratio) r_star = max_ratio;
     if (r_star < 0.0) r_star = 0.0;
     if (r_star > 1.0) r_star = 1.0;
 
     if (params->debug) {
         fprintf(stderr,
-                "Adaptive: Pc0=%.0f gC=%.2f sC=%.2f threads=%ld Pc_eff=%.0f | "
-                "Pg0=%.0f gG=%.2f sG=%.2f Pg_eff=%.0f | "
-                "t0=%.6f B=%.0f entropy=%.2f eC=%.2e eG=%.2e r*=%.4f\n",
-                Pc0, gC, sC, thread_count, Pc_eff,
-                Pg0, gG, sG, Pg_eff,
+            "Adaptive: Pc0=%.0f gC=%.2f sC=%.2f cpuF=%.2f threads=%ld cpuScale=%.2f util=%.2f Pc_eff=%.0f | "
+                "Pg0=%.0f gG=%.2f sG=%.2f gpuF=%.2f Pg_eff=%.0f | "
+                "t0=%.6f B=%.0f entropy=%.2f perfW=%.1f energyW=%.1f ratioW=%.1f decHostPen=%.1f "
+                "rPerf=%.4f rEnergy=%.4f freqBias=%.4f splitPen=%.4f ratioCap=%.4f eCeff=%.2e eGeff=%.2e r*=%.4f\n",
+            Pc0, gC, sC, cpu_freq_scale, thread_count, cpu_thread_scale, thread_util, Pc_eff,
+                Pg0, gG, sG, gpu_freq_scale, Pg_eff,
                 t0, B, mean_entropy,
-                g_lzo_dev_profile.cpu_energy_per_byte,
-                g_lzo_dev_profile.gpu_energy_per_byte,
+                perf_weight_pct,
+                energy_weight_pct,
+                ratio_weight_pct,
+                dec_host_penalty_pct,
+                r_perf,
+                r_energy,
+                freq_mode_bias,
+                split_mix_penalty,
+                ratio_cap,
+                eC_eff,
+                eG_eff,
                 r_star);
+    }
+
+    if (input) {
+        lzo_hybrid_metrics_record_adaptive(r_star);
+    }
+
+    if (ws) {
+        if (input) {
+            ws->adaptive_ratio_cache_comp = r_star;
+            ws->adaptive_ratio_cache_comp_valid = 1;
+        } else {
+            ws->adaptive_ratio_cache_dec = r_star;
+            ws->adaptive_ratio_cache_dec_valid = 1;
+        }
     }
 
     return r_star;
@@ -914,12 +1724,25 @@ static int hybrid_compress_buf(
     double gpu_ratio = params->gpu_ratio;
     int n_cpu_threads = 0;
     pthread_t* cpu_tids = NULL;
+    pthread_t cpu_tids_stack[64];
+    int cpu_tids_heap = 0;
+    cpu_compress_worker_ctx_t* cpu_ctx = NULL;
+    cpu_compress_worker_ctx_t cpu_ctx_stack[64];
+    int cpu_ctx_heap = 0;
+    void* cpu_wrkmem_blob = NULL;
+    size_t cpu_wrkmem_sz = (params->alg_id == 1) ? LZO1Y_MEM_COMPRESS : LZO1X_1_MEM_COMPRESS;
     int force_cpu_only = 0;
     int force_gpu_only = 0;
-    int use_prefix_split = 0;
+    int adaptive_collapsed_split = 0;
+    int use_prefix_split = 1;
+    int prefix_fastpath = hybrid_prefix_index_fastpath_enabled_for_mode(params, 0, nblk, in_sz);
     if (params->cpu_threads <= 0) gpu_ratio = 1.0;
     if (params->split_mode == HYBRID_SPLIT_ADAPTIVE) {
         gpu_ratio = choose_adaptive_gpu_ratio(ctx, queue, device, gpu_kernel, input_buf, in_sz, blk, nblk, params, ws);
+        {
+            size_t adjusted_gpu_blocks = hybrid_adaptive_adjust_gpu_blocks(nblk, gpu_ratio, &adaptive_collapsed_split);
+            gpu_ratio = (nblk > 0) ? ((double)adjusted_gpu_blocks / (double)nblk) : 0.0;
+        }
     }
 
     if (gpu_kernel == NULL) gpu_ratio = 0.0;
@@ -932,7 +1755,7 @@ static int hybrid_compress_buf(
     if (force_cpu_only) {
         gpu_count = 0;
         cpu_count = nblk;
-        if (cpu_count > 0) {
+        if (cpu_count > 0 && !(use_prefix_split && prefix_fastpath)) {
             cpu_idx = (size_t*)malloc(cpu_count * sizeof(size_t));
             if (!cpu_idx) goto fail;
             for (size_t i = 0; i < cpu_count; ++i) cpu_idx[i] = i;
@@ -940,22 +1763,33 @@ static int hybrid_compress_buf(
     } else if (force_gpu_only) {
         gpu_count = nblk;
         cpu_count = 0;
-        if (gpu_count > 0) {
+        if (gpu_count > 0 && !(use_prefix_split && prefix_fastpath)) {
             gpu_idx = (size_t*)malloc(gpu_count * sizeof(size_t));
             if (!gpu_idx) goto fail;
             for (size_t i = 0; i < gpu_count; ++i) gpu_idx[i] = i;
         }
     } else {
-        partition_blocks(nblk, gpu_ratio, &gpu_idx, &gpu_count, &cpu_idx, &cpu_count, params->striped_split);
+        if (use_prefix_split && prefix_fastpath) {
+            gpu_count = (size_t)(nblk * gpu_ratio + 0.5);
+            if (gpu_count > nblk) gpu_count = nblk;
+            cpu_count = nblk - gpu_count;
+        } else {
+            partition_blocks_entropy_aware(nblk, gpu_ratio,
+                                           input_buf, in_sz, blk,
+                                           &gpu_idx, &gpu_count, &cpu_idx, &cpu_count);
+        }
     }
-
-    use_prefix_split = (params->striped_split == 0);
 
     if (gpu_count > 0 && (gpu_kernel == NULL || ctx == NULL || queue == NULL || ws == NULL)) {
         goto fail;
     }
     timing.gpu_blocks = gpu_count;
     timing.cpu_blocks = cpu_count;
+    if (params->debug && params->split_mode == HYBRID_SPLIT_ADAPTIVE && adaptive_collapsed_split) {
+        fprintf(stderr,
+                "Adaptive split: mixed block count too small, collapsed to %s-only\n",
+                gpu_count == 0 ? "CPU" : "GPU");
+    }
 
     /* Launch CPU workers */
     cpu_compress_job_t cpu_job = {
@@ -967,6 +1801,7 @@ static int hybrid_compress_buf(
         .nblk = nblk,
         .worst_blk = worst_blk,
         .block_indices = cpu_idx,
+        .block_index_base = (use_prefix_split && prefix_fastpath) ? gpu_count : 0,
         .num_assigned = cpu_count,
         .alg_id = params->alg_id,
         .rc = 0,
@@ -981,13 +1816,35 @@ static int hybrid_compress_buf(
     if (n_cpu_threads > (int)cpu_count) n_cpu_threads = (int)cpu_count;
     uint64_t t_cpu_start = hybrid_now_ns();
     if (n_cpu_threads > 0) {
+        cpu_wrkmem_blob = calloc((size_t)n_cpu_threads, cpu_wrkmem_sz);
+        if (!cpu_wrkmem_blob) goto fail;
+
+        if (n_cpu_threads <= (int)(sizeof(cpu_ctx_stack) / sizeof(cpu_ctx_stack[0]))) {
+            cpu_ctx = cpu_ctx_stack;
+        } else {
+            cpu_ctx = (cpu_compress_worker_ctx_t*)malloc((size_t)n_cpu_threads * sizeof(cpu_compress_worker_ctx_t));
+            cpu_ctx_heap = 1;
+        }
+        if (!cpu_ctx) goto fail;
+
         if (n_cpu_threads == 1) {
-            cpu_compress_worker(&cpu_pool);
+            cpu_ctx[0].pool = &cpu_pool;
+            cpu_ctx[0].wrkmem = (unsigned char*)cpu_wrkmem_blob;
+            cpu_compress_worker(&cpu_ctx[0]);
             timing.cpu_kernel_us = (unsigned long)atomic_load(&cpu_pool.max_worker_us);
         } else {
-            cpu_tids = (pthread_t*)malloc(n_cpu_threads * sizeof(pthread_t));
-            for (int i = 0; i < n_cpu_threads; i++)
-                pthread_create(&cpu_tids[i], NULL, cpu_compress_worker, &cpu_pool);
+            if (n_cpu_threads <= (int)(sizeof(cpu_tids_stack) / sizeof(cpu_tids_stack[0]))) {
+                cpu_tids = cpu_tids_stack;
+            } else {
+                cpu_tids = (pthread_t*)malloc(n_cpu_threads * sizeof(pthread_t));
+                cpu_tids_heap = 1;
+            }
+            if (!cpu_tids) goto fail;
+            for (int i = 0; i < n_cpu_threads; i++) {
+                cpu_ctx[i].pool = &cpu_pool;
+                cpu_ctx[i].wrkmem = (unsigned char*)cpu_wrkmem_blob + (size_t)i * cpu_wrkmem_sz;
+                pthread_create(&cpu_tids[i], NULL, cpu_compress_worker, &cpu_ctx[i]);
+            }
         }
     }
 
@@ -1001,12 +1858,13 @@ static int hybrid_compress_buf(
         size_t gpu_input_sz;
         int gpu_upload_owned = 0;
         int can_skip_upload = (skip_upload && force_gpu_only && cpu_count == 0);
+        int gpu_prefix_mapping = (use_prefix_split && gpu_idx == NULL);
 
         if (cpu_count == 0) {
             gpu_upload_ptr = input_buf;
             gpu_input_sz = in_sz;
             gpu_upload_owned = 0;
-        } else if (use_prefix_split) {
+        } else if (gpu_prefix_mapping) {
             gpu_upload_ptr = input_buf;
             gpu_input_sz = gpu_count * blk;
             gpu_upload_owned = 0;
@@ -1132,17 +1990,29 @@ static int hybrid_compress_buf(
         void* mapped_len = clEnqueueMapBuffer(queue, ws->d_len, CL_TRUE, CL_MAP_READ,
                                                0, gpu_count * sizeof(cl_uint), 0, NULL, NULL, &err);
         if (err != CL_SUCCESS) goto fail;
-        for (size_t i = 0; i < gpu_count; i++) {
-            size_t blk_idx = gpu_idx ? gpu_idx[i] : i;
-            lengths[blk_idx] = ((cl_uint*)mapped_len)[i];
+        if (gpu_idx) {
+            for (size_t i = 0; i < gpu_count; i++) {
+                size_t blk_idx = gpu_idx[i];
+                lengths[blk_idx] = ((cl_uint*)mapped_len)[i];
+            }
+        } else {
+            memcpy(lengths, mapped_len, gpu_count * sizeof(cl_uint));
         }
         clEnqueueUnmapMemObject(queue, ws->d_len, mapped_len, 0, NULL, NULL);
 
         {
             size_t packed_total = 0;
             int use_compaction;
-            for (size_t i = 0; i < gpu_count; i++) {
-                packed_total += (size_t)lengths[gpu_idx[i]];
+            const int pack_zerocopy_prefix = 1;
+            if (gpu_idx) {
+                for (size_t i = 0; i < gpu_count; i++) {
+                    size_t blk_idx = gpu_idx[i];
+                    packed_total += (size_t)lengths[blk_idx];
+                }
+            } else {
+                for (size_t i = 0; i < gpu_count; i++) {
+                    packed_total += (size_t)lengths[i];
+                }
             }
 
             use_compaction = hybrid_should_use_device_compaction(
@@ -1151,6 +2021,9 @@ static int hybrid_compress_buf(
                 gpu_count,
                 pack_kernel
             );
+            if (pack_zerocopy_prefix && gpu_prefix_mapping) {
+                use_compaction = 0;
+            }
 
             if (use_compaction && packed_total > 0) {
                 {
@@ -1168,9 +2041,17 @@ static int hybrid_compress_buf(
                                                               0, gpu_count * sizeof(cl_uint), 0, NULL, NULL, &err);
                         if (err != CL_SUCCESS) goto fail;
                         size_t packed_offset = 0;
-                        for (size_t i = 0; i < gpu_count; i++) {
-                            ((cl_uint*)mapped_off)[i] = (cl_uint)packed_offset;
-                            packed_offset += (size_t)lengths[gpu_idx[i]];
+                        if (gpu_idx) {
+                            for (size_t i = 0; i < gpu_count; i++) {
+                                size_t blk_idx = gpu_idx[i];
+                                ((cl_uint*)mapped_off)[i] = (cl_uint)packed_offset;
+                                packed_offset += (size_t)lengths[blk_idx];
+                            }
+                        } else {
+                            for (size_t i = 0; i < gpu_count; i++) {
+                                ((cl_uint*)mapped_off)[i] = (cl_uint)packed_offset;
+                                packed_offset += (size_t)lengths[i];
+                            }
                         }
                         err = clEnqueueUnmapMemObject(queue, ws->d_packed_off, mapped_off, 0, NULL, NULL);
                         if (err != CL_SUCCESS) goto fail;
@@ -1181,7 +2062,16 @@ static int hybrid_compress_buf(
                 {
                     cl_uint worst_blk_cl = (cl_uint)worst_blk;
                     cl_uint gpu_count_cl = (cl_uint)gpu_count;
-                    size_t pack_global = gpu_count;
+                    size_t pack_local = 64U;
+                    size_t pack_global;
+                    if (pack_local == 0) pack_local = 1;
+                    if (pack_local > 256) pack_local = 256;
+                    if (pack_local > gpu_count && gpu_count > 0) {
+                        size_t p2 = 1;
+                        while ((p2 << 1) <= gpu_count) p2 <<= 1;
+                        pack_local = p2;
+                    }
+                    pack_global = gpu_count ? (gpu_count * pack_local) : pack_local;
                     uint64_t t_pack_k0 = hybrid_now_ns();
                     err  = clSetKernelArg(pack_kernel, 0, sizeof(cl_mem), &ws->d_out);
                     err |= clSetKernelArg(pack_kernel, 1, sizeof(cl_mem), &ws->d_len);
@@ -1190,7 +2080,7 @@ static int hybrid_compress_buf(
                     err |= clSetKernelArg(pack_kernel, 4, sizeof(cl_uint), &worst_blk_cl);
                     err |= clSetKernelArg(pack_kernel, 5, sizeof(cl_uint), &gpu_count_cl);
                     if (err != CL_SUCCESS) goto fail;
-                    err = clEnqueueNDRangeKernel(queue, pack_kernel, 1, NULL, &pack_global, NULL, 0, NULL, NULL);
+                    err = clEnqueueNDRangeKernel(queue, pack_kernel, 1, NULL, &pack_global, &pack_local, 0, NULL, NULL);
                     if (err != CL_SUCCESS) goto fail;
                     clFinish(queue);
                     pack_kernel_us = (unsigned long)((hybrid_now_ns() - t_pack_k0) / 1000);
@@ -1201,26 +2091,47 @@ static int hybrid_compress_buf(
                                                              0, packed_total, 0, NULL, NULL, &err);
                     if (err != CL_SUCCESS) goto fail;
                     size_t packed_offset = 0;
-                    for (size_t i = 0; i < gpu_count; i++) {
-                    size_t blk_idx = gpu_idx[i];
-                    memcpy(out_buf + blk_idx * worst_blk,
-                           (unsigned char*)mapped_packed + packed_offset,
-                           (size_t)lengths[blk_idx]);
-                        packed_offset += (size_t)lengths[blk_idx];
+                    if (gpu_idx) {
+                        for (size_t i = 0; i < gpu_count; i++) {
+                            size_t blk_idx = gpu_idx[i];
+                            memcpy(out_buf + blk_idx * worst_blk,
+                                   (unsigned char*)mapped_packed + packed_offset,
+                                   (size_t)lengths[blk_idx]);
+                            packed_offset += (size_t)lengths[blk_idx];
+                        }
+                    } else {
+                        memcpy(out_buf, mapped_packed, packed_total);
                     }
                     clEnqueueUnmapMemObject(queue, ws->d_packed_out, mapped_packed, 0, NULL, NULL);
                 }
             } else {
-                void* mapped_out = clEnqueueMapBuffer(queue, ws->d_out, CL_TRUE, CL_MAP_READ,
-                                                       0, gpu_count * worst_blk, 0, NULL, NULL, &err);
-                if (err != CL_SUCCESS) goto fail;
-                for (size_t i = 0; i < gpu_count; i++) {
-                    size_t blk_idx = gpu_idx[i];
-                    memcpy(out_buf + blk_idx * worst_blk,
-                           (unsigned char*)mapped_out + i * worst_blk,
-                           (size_t)lengths[blk_idx]);
+                if (pack_zerocopy_prefix && gpu_prefix_mapping) {
+                    err = clEnqueueReadBuffer(queue,
+                                              ws->d_out,
+                                              CL_TRUE,
+                                              0,
+                                              gpu_count * worst_blk,
+                                              out_buf,
+                                              0,
+                                              NULL,
+                                              NULL);
+                    if (err != CL_SUCCESS) goto fail;
+                } else {
+                    void* mapped_out = clEnqueueMapBuffer(queue, ws->d_out, CL_TRUE, CL_MAP_READ,
+                                                           0, gpu_count * worst_blk, 0, NULL, NULL, &err);
+                    if (err != CL_SUCCESS) goto fail;
+                    if (gpu_idx) {
+                        for (size_t i = 0; i < gpu_count; i++) {
+                            size_t blk_idx = gpu_idx[i];
+                            memcpy(out_buf + blk_idx * worst_blk,
+                                   (unsigned char*)mapped_out + i * worst_blk,
+                                   (size_t)lengths[blk_idx]);
+                        }
+                    } else {
+                        memcpy(out_buf, mapped_out, gpu_count * worst_blk);
+                    }
+                    clEnqueueUnmapMemObject(queue, ws->d_out, mapped_out, 0, NULL, NULL);
                 }
-                clEnqueueUnmapMemObject(queue, ws->d_out, mapped_out, 0, NULL, NULL);
             }
         }
         uint64_t t_dl1 = hybrid_now_ns();
@@ -1233,10 +2144,13 @@ static int hybrid_compress_buf(
         for (int i = 0; i < n_cpu_threads; i++)
             pthread_join(cpu_tids[i], NULL);
         t_cpu_end = hybrid_now_ns();
-        free(cpu_tids);
+        if (cpu_tids_heap) free(cpu_tids);
         cpu_tids = NULL;
         timing.cpu_kernel_us = (unsigned long)atomic_load(&cpu_pool.max_worker_us);
     }
+
+    free(cpu_wrkmem_blob);
+    if (cpu_ctx_heap) free(cpu_ctx);
     timing.gpu_kernel_us = (t_gpu_k1 > t_gpu_k0) ? (unsigned long)((t_gpu_k1 - t_gpu_k0) / 1000) + pack_kernel_us : pack_kernel_us;
 
     if (cpu_job.rc != 0) goto fail;
@@ -1257,8 +2171,10 @@ fail:
     free(gpu_idx); free(cpu_idx);
     if (cpu_tids) {
         for (int i = 0; i < n_cpu_threads; i++) pthread_join(cpu_tids[i], NULL);
-        free(cpu_tids);
+        if (cpu_tids_heap) free(cpu_tids);
     }
+    free(cpu_wrkmem_blob);
+    if (cpu_ctx_heap) free(cpu_ctx);
     return -1;
 }
 
@@ -1269,7 +2185,7 @@ static int hybrid_decompress_buf(
     cl_kernel gpu_kernel,
     const unsigned char* packed, const uint32_t* offsets, const uint32_t* comp_lengths,
     size_t packed_sz, uint32_t orig_sz, uint32_t blk_sz, uint32_t nblk, int alg_id,
-    unsigned char* output_buf, uint32_t* out_lengths,
+    unsigned char* output_buf,
     const hybrid_params_t* params, hybrid_workspace_t* ws,
     hybrid_timing_t* timing_out
 ) {
@@ -1288,12 +2204,23 @@ static int hybrid_decompress_buf(
     double gpu_ratio = params->gpu_ratio;
     int n_cpu_threads = 0;
     pthread_t* cpu_tids = NULL;
+    pthread_t cpu_tids_stack[64];
+    int cpu_tids_heap = 0;
+    cpu_decompress_worker_ctx_t* cpu_ctx = NULL;
+    cpu_decompress_worker_ctx_t cpu_ctx_stack[64];
+    int cpu_ctx_heap = 0;
     int force_cpu_only = 0;
     int force_gpu_only = 0;
-    int use_prefix_split = 0;
+    int adaptive_collapsed_split = 0;
+    int use_prefix_split = 1;
+    int prefix_fastpath = hybrid_prefix_index_fastpath_enabled_for_mode(params, 1, nblk, orig_sz);
     if (params->cpu_threads <= 0) gpu_ratio = 1.0;
     if (params->split_mode == HYBRID_SPLIT_ADAPTIVE) {
         gpu_ratio = choose_adaptive_gpu_ratio(ctx, queue, 0, gpu_kernel, NULL, orig_sz, blk_sz, nblk, params, ws);
+        {
+            size_t adjusted_gpu_blocks = hybrid_adaptive_adjust_gpu_blocks(nblk, gpu_ratio, &adaptive_collapsed_split);
+            gpu_ratio = (nblk > 0) ? ((double)adjusted_gpu_blocks / (double)nblk) : 0.0;
+        }
     }
 
     if (gpu_kernel == NULL) gpu_ratio = 0.0;
@@ -1306,7 +2233,7 @@ static int hybrid_decompress_buf(
     if (force_cpu_only) {
         gpu_count = 0;
         cpu_count = nblk;
-        if (cpu_count > 0) {
+        if (cpu_count > 0 && !(use_prefix_split && prefix_fastpath)) {
             cpu_idx = (size_t*)malloc(cpu_count * sizeof(size_t));
             if (!cpu_idx) goto dfail;
             for (size_t i = 0; i < cpu_count; ++i) cpu_idx[i] = i;
@@ -1314,24 +2241,31 @@ static int hybrid_decompress_buf(
     } else if (force_gpu_only) {
         gpu_count = nblk;
         cpu_count = 0;
-        if (gpu_count > 0) {
+        if (gpu_count > 0 && !(use_prefix_split && prefix_fastpath)) {
             gpu_idx = (size_t*)malloc(gpu_count * sizeof(size_t));
             if (!gpu_idx) goto dfail;
             for (size_t i = 0; i < gpu_count; ++i) gpu_idx[i] = i;
         }
     } else {
-        partition_blocks(nblk, gpu_ratio, &gpu_idx, &gpu_count, &cpu_idx, &cpu_count, params->striped_split);
+        if (use_prefix_split && prefix_fastpath) {
+            gpu_count = (size_t)(nblk * gpu_ratio + 0.5);
+            if (gpu_count > nblk) gpu_count = nblk;
+            cpu_count = nblk - gpu_count;
+        } else {
+            partition_blocks(nblk, gpu_ratio, &gpu_idx, &gpu_count, &cpu_idx, &cpu_count);
+        }
     }
-
-    use_prefix_split = (params->striped_split == 0);
 
     if (gpu_count > 0 && (gpu_kernel == NULL || ctx == NULL || queue == NULL || ws == NULL)) {
         goto dfail;
     }
     timing.gpu_blocks = gpu_count;
     timing.cpu_blocks = cpu_count;
-
-    memset(out_lengths, 0, nblk * sizeof(uint32_t));
+    if (params->debug && params->split_mode == HYBRID_SPLIT_ADAPTIVE && adaptive_collapsed_split) {
+        fprintf(stderr,
+                "Adaptive split(decompress): mixed block count too small, collapsed to %s-only\n",
+                gpu_count == 0 ? "CPU" : "GPU");
+    }
 
     /* Launch CPU decompression */
     cpu_decompress_job_t cpu_job = {
@@ -1339,11 +2273,11 @@ static int hybrid_decompress_buf(
         .offsets = offsets,
         .comp_lengths = comp_lengths,
         .output = output_buf,
-        .out_lengths = out_lengths,
         .block_size = blk_sz,
         .orig_size = orig_sz,
         .nblk = nblk,
         .block_indices = cpu_idx,
+        .block_index_base = (use_prefix_split && prefix_fastpath) ? gpu_count : 0,
         .num_assigned = cpu_count,
         .alg_id = alg_id,
         .rc = 0,
@@ -1358,13 +2292,34 @@ static int hybrid_decompress_buf(
     if (n_cpu_threads > (int)cpu_count) n_cpu_threads = (int)cpu_count;
     uint64_t t_cpu_start = hybrid_now_ns();
     if (n_cpu_threads > 0) {
+        if (n_cpu_threads <= (int)(sizeof(cpu_ctx_stack) / sizeof(cpu_ctx_stack[0]))) {
+            cpu_ctx = cpu_ctx_stack;
+        } else {
+            cpu_ctx = (cpu_decompress_worker_ctx_t*)malloc((size_t)n_cpu_threads * sizeof(cpu_decompress_worker_ctx_t));
+            cpu_ctx_heap = 1;
+        }
+        if (!cpu_ctx) goto dfail;
+
         if (n_cpu_threads == 1) {
-            cpu_decompress_worker(&cpu_pool);
+            cpu_ctx[0].pool = &cpu_pool;
+            cpu_ctx[0].thread_idx = 0;
+            cpu_ctx[0].thread_count = 1;
+            cpu_decompress_worker(&cpu_ctx[0]);
             timing.cpu_kernel_us = (unsigned long)atomic_load(&cpu_pool.max_worker_us);
         } else {
-            cpu_tids = (pthread_t*)malloc(n_cpu_threads * sizeof(pthread_t));
-            for (int i = 0; i < n_cpu_threads; i++)
-                pthread_create(&cpu_tids[i], NULL, cpu_decompress_worker, &cpu_pool);
+            if (n_cpu_threads <= (int)(sizeof(cpu_tids_stack) / sizeof(cpu_tids_stack[0]))) {
+                cpu_tids = cpu_tids_stack;
+            } else {
+                cpu_tids = (pthread_t*)malloc(n_cpu_threads * sizeof(pthread_t));
+                cpu_tids_heap = 1;
+            }
+            if (!cpu_tids) goto dfail;
+            for (int i = 0; i < n_cpu_threads; i++) {
+                cpu_ctx[i].pool = &cpu_pool;
+                cpu_ctx[i].thread_idx = (size_t)i;
+                cpu_ctx[i].thread_count = (size_t)n_cpu_threads;
+                pthread_create(&cpu_tids[i], NULL, cpu_decompress_worker, &cpu_ctx[i]);
+            }
         }
     }
 
@@ -1379,9 +2334,13 @@ static int hybrid_decompress_buf(
         const unsigned char* gpu_comp_src = packed;
         size_t gpu_packed_sz = packed_sz;
         size_t gpu_orig_sz = gpu_count * blk_sz;
-        for (size_t i = 0; i < gpu_count; ++i) {
-            size_t blk_idx = gpu_idx[i];
-            if (blk_idx == nblk - 1) gpu_orig_sz = i * blk_sz + block_input_size(orig_sz, blk_sz, blk_idx);
+        if (gpu_idx) {
+            for (size_t i = 0; i < gpu_count; ++i) {
+                size_t blk_idx = gpu_idx[i];
+                if (blk_idx == nblk - 1) gpu_orig_sz = i * blk_sz + block_input_size(orig_sz, blk_sz, blk_idx);
+            }
+        } else if (gpu_count == (size_t)nblk && nblk > 0) {
+            gpu_orig_sz = (size_t)(nblk - 1) * blk_sz + block_input_size(orig_sz, blk_sz, nblk - 1);
         }
         if (use_prefix_split) {
             gpu_offsets_src = offsets;
@@ -1460,29 +2419,103 @@ static int hybrid_decompress_buf(
         /* Read GPU output for GPU-assigned blocks only */
         uint64_t t_dl0 = hybrid_now_ns();
         size_t gpu_out_sz = gpu_orig_sz;
-        void* mapped = clEnqueueMapBuffer(queue, ws->d_decomp_out, CL_TRUE, CL_MAP_READ,
-                                            0, gpu_out_sz, 0, NULL, NULL, &err);
-        if (err != CL_SUCCESS) goto dfail;
         if (use_prefix_split) {
-            memcpy(output_buf, mapped, gpu_out_sz);
+            err = clEnqueueReadBuffer(queue,
+                                      ws->d_decomp_out,
+                                      CL_TRUE,
+                                      0,
+                                      gpu_out_sz,
+                                      output_buf,
+                                      0,
+                                      NULL,
+                                      NULL);
+            if (err != CL_SUCCESS) goto dfail;
+
             for (size_t i = 0; i < gpu_count; i++) {
                 size_t off = i * blk_sz;
                 size_t this_blk = blk_sz;
                 if (off + this_blk > orig_sz) this_blk = orig_sz - off;
-                out_lengths[i] = (uint32_t)this_blk;
             }
         } else {
-            for (size_t i = 0; i < gpu_count; i++) {
-                size_t bi = gpu_idx ? gpu_idx[i] : i;
-                size_t off = bi * blk_sz;
-                size_t this_blk = blk_sz;
-                if (off + this_blk > orig_sz) this_blk = orig_sz - off;
-                memcpy(output_buf + off, (unsigned char*)mapped + i * blk_sz, this_blk);
-                out_lengths[bi] = (uint32_t)this_blk;
+            void* mapped_out = NULL;
+            err = CL_SUCCESS;
+            if (gpu_out_sz > 0) {
+                mapped_out = clEnqueueMapBuffer(queue,
+                                                ws->d_decomp_out,
+                                                CL_TRUE,
+                                                CL_MAP_READ,
+                                                0,
+                                                gpu_out_sz,
+                                                0,
+                                                NULL,
+                                                NULL,
+                                                &err);
+                if (err != CL_SUCCESS || mapped_out == NULL) {
+                    mapped_out = NULL;
+                }
+            }
+
+            if (mapped_out) {
+                if (gpu_idx) {
+                    for (size_t i = 0; i < gpu_count; i++) {
+                        size_t bi = gpu_idx[i];
+                        size_t off = bi * blk_sz;
+                        size_t this_blk = blk_sz;
+                        if (off + this_blk > orig_sz) this_blk = orig_sz - off;
+                        memcpy(output_buf + off, (const unsigned char*)mapped_out + i * blk_sz, this_blk);
+                    }
+                } else {
+                    memcpy(output_buf, mapped_out, gpu_out_sz);
+                    for (size_t i = 0; i < gpu_count; i++) {
+                        size_t off = i * blk_sz;
+                        size_t this_blk = blk_sz;
+                        if (off + this_blk > orig_sz) this_blk = orig_sz - off;
+                    }
+                }
+                err = clEnqueueUnmapMemObject(queue, ws->d_decomp_out, mapped_out, 0, NULL, NULL);
+                if (err != CL_SUCCESS) goto dfail;
+                clFinish(queue);
+            } else {
+                unsigned char* gpu_out_tmp = NULL;
+                if (gpu_out_sz > 0) {
+                    gpu_out_tmp = (unsigned char*)malloc(gpu_out_sz);
+                    if (!gpu_out_tmp) goto dfail;
+                    err = clEnqueueReadBuffer(queue,
+                                              ws->d_decomp_out,
+                                              CL_TRUE,
+                                              0,
+                                              gpu_out_sz,
+                                              gpu_out_tmp,
+                                              0,
+                                              NULL,
+                                              NULL);
+                    if (err != CL_SUCCESS) {
+                        free(gpu_out_tmp);
+                        goto dfail;
+                    }
+                }
+
+                if (gpu_idx) {
+                    for (size_t i = 0; i < gpu_count; i++) {
+                        size_t bi = gpu_idx[i];
+                        size_t off = bi * blk_sz;
+                        size_t this_blk = blk_sz;
+                        if (off + this_blk > orig_sz) this_blk = orig_sz - off;
+                        memcpy(output_buf + off, gpu_out_tmp + i * blk_sz, this_blk);
+                    }
+                } else {
+                    memcpy(output_buf, gpu_out_tmp, gpu_out_sz);
+                    for (size_t i = 0; i < gpu_count; i++) {
+                        size_t off = i * blk_sz;
+                        size_t this_blk = blk_sz;
+                        if (off + this_blk > orig_sz) this_blk = orig_sz - off;
+                    }
+                }
+
+                free(gpu_out_tmp);
             }
         }
-        clEnqueueUnmapMemObject(queue, ws->d_decomp_out, mapped, 0, NULL, NULL);
-        clFinish(queue);
+
         uint64_t t_dl1 = hybrid_now_ns();
         timing.download_us = (unsigned long)((t_dl1 - t_dl0) / 1000);
     }
@@ -1492,9 +2525,13 @@ static int hybrid_decompress_buf(
     if (n_cpu_threads > 0 && cpu_tids) {
         for (int i = 0; i < n_cpu_threads; i++) pthread_join(cpu_tids[i], NULL);
         t_cpu_end = hybrid_now_ns();
-        free(cpu_tids);
+        if (cpu_tids_heap) free(cpu_tids);
         cpu_tids = NULL;
         timing.cpu_kernel_us = (unsigned long)atomic_load(&cpu_pool.max_worker_us);
+    }
+    if (cpu_ctx_heap) {
+        free(cpu_ctx);
+        cpu_ctx = NULL;
     }
     timing.gpu_kernel_us = (t_gpu_k1 > t_gpu_k0) ? (unsigned long)((t_gpu_k1 - t_gpu_k0) / 1000) : 0;
 
@@ -1510,8 +2547,9 @@ static int hybrid_decompress_buf(
 dfail:
     if (cpu_tids) {
         for (int i = 0; i < n_cpu_threads; i++) pthread_join(cpu_tids[i], NULL);
-        free(cpu_tids);
+        if (cpu_tids_heap) free(cpu_tids);
     }
+    if (cpu_ctx_heap) free(cpu_ctx);
     free(gpu_idx); free(cpu_idx);
     return -1;
 }
@@ -1555,6 +2593,13 @@ int hybrid_compress(
     size_t blk = 0, nblk = 0;
     size_t blk_bytes = (params->block_size > 0) ? params->block_size : 0;
     hybrid_choose_blocking(input_buf, in_sz, device, gpu_kernel, blk_bytes, params->debug, &blk, &nblk);
+    {
+        size_t min_blk = adaptive_min_block_size_bytes(params);
+        if (min_blk > 0 && blk < min_blk) {
+            blk = min_blk;
+            nblk = (in_sz + blk - 1) / blk;
+        }
+    }
     size_t worst_blk = lzo_worst_size(blk);
 
     /* Allocate output arrays */
@@ -1647,14 +2692,13 @@ int hybrid_decompress(
     for (uint32_t i = 0; i < nblk; i++) offsets[i + 1] = offsets[i] + comp_lengths[i];
 
     unsigned char* output_buf = (unsigned char*)malloc(orig_sz);
-    uint32_t* out_lengths = (uint32_t*)calloc(nblk, sizeof(uint32_t));
-    if (!output_buf || !out_lengths) goto dec_fail;
+    if (!output_buf) goto dec_fail;
 
     /* Decompress using buffer-based function */
     int rc = hybrid_decompress_buf(ctx, queue, gpu_kernel,
                                     comp_data, offsets, comp_lengths,
                                     comp_data_sz, orig_sz, blk_sz, nblk, (int)alg_id,
-                                    output_buf, out_lengths,
+                                    output_buf,
                                     params, ws, &timing);
     if (rc != 0) goto dec_fail;
 
@@ -1675,12 +2719,12 @@ int hybrid_decompress(
     if (timing_out) *timing_out = timing;
 
     free(comp_data); free(comp_lengths); free(offsets);
-    free(output_buf); free(out_lengths);
+    free(output_buf);
     return 0;
 
 dec_fail:
     free(comp_data); free(comp_lengths); free(offsets);
-    free(output_buf); free(out_lengths);
+    free(output_buf);
     return -1;
 }
 
@@ -1703,6 +2747,35 @@ static double median_double(const double* vals, size_t n) {
 
 static double elapsed_sec(const struct timespec* s, const struct timespec* e) {
     return (double)(e->tv_sec - s->tv_sec) + (double)(e->tv_nsec - s->tv_nsec) / 1e9;
+}
+
+typedef struct {
+    double adaptive_gpu_ratio_sum;
+    size_t adaptive_gpu_ratio_count;
+    double adaptive_gpu_ratio_min;
+    double adaptive_gpu_ratio_max;
+} lzo_hybrid_metrics_t;
+
+static lzo_hybrid_metrics_t g_lzo_hybrid_metrics = {0};
+
+static void lzo_hybrid_metrics_reset(void) {
+    g_lzo_hybrid_metrics.adaptive_gpu_ratio_sum = 0.0;
+    g_lzo_hybrid_metrics.adaptive_gpu_ratio_count = 0;
+    g_lzo_hybrid_metrics.adaptive_gpu_ratio_min = 1.0;
+    g_lzo_hybrid_metrics.adaptive_gpu_ratio_max = 0.0;
+}
+
+static void lzo_hybrid_metrics_record_adaptive(double ratio) {
+    if (ratio < 0.0) ratio = 0.0;
+    if (ratio > 1.0) ratio = 1.0;
+    g_lzo_hybrid_metrics.adaptive_gpu_ratio_sum += ratio;
+    g_lzo_hybrid_metrics.adaptive_gpu_ratio_count += 1;
+    if (ratio < g_lzo_hybrid_metrics.adaptive_gpu_ratio_min) {
+        g_lzo_hybrid_metrics.adaptive_gpu_ratio_min = ratio;
+    }
+    if (ratio > g_lzo_hybrid_metrics.adaptive_gpu_ratio_max) {
+        g_lzo_hybrid_metrics.adaptive_gpu_ratio_max = ratio;
+    }
 }
 
 static int create_temp_path(char* path_buf, size_t path_buf_size, const char* templ) {
@@ -1757,6 +2830,13 @@ int hybrid_bench(
     size_t blk = 0, nblk = 0;
     size_t blk_bytes = (params->block_size > 0) ? params->block_size : 0;
     hybrid_choose_blocking(input_ref, in_size, device, comp_kernel, blk_bytes, params->debug, &blk, &nblk);
+    {
+        size_t min_blk = adaptive_min_block_size_bytes(params);
+        if (min_blk > 0 && blk < min_blk) {
+            blk = min_blk;
+            nblk = (in_size + blk - 1) / blk;
+        }
+    }
     size_t worst_blk = lzo_worst_size(blk);
 
     /* Pre-allocate reusable buffers */
@@ -1766,10 +2846,9 @@ int hybrid_bench(
     size_t packed_cap = 0;
     uint32_t* offsets = (uint32_t*)malloc((nblk + 1) * sizeof(uint32_t));
     unsigned char* dec_buf = (unsigned char*)malloc(in_size);
-    uint32_t* out_lengths = (uint32_t*)calloc(nblk, sizeof(uint32_t));
-    if (!lengths || !out_buf || !offsets || !dec_buf || !out_lengths) {
+    if (!lengths || !out_buf || !offsets || !dec_buf) {
         free(lengths); free(out_buf); free(packed); free(offsets);
-        free(dec_buf); free(out_lengths); free(input_ref);
+        free(dec_buf); free(input_ref);
         return 1;
     }
 
@@ -1782,6 +2861,7 @@ int hybrid_bench(
     int verify_ok = 1;
     struct timespec ts0, ts1;
     clock_gettime(CLOCK_MONOTONIC, &ts0);
+    lzo_hybrid_metrics_reset();
 
     while (verify_ok) {
         hybrid_timing_t tc = {0};
@@ -1829,7 +2909,7 @@ int hybrid_bench(
                                        packed, offsets, lengths,
                                        comp_total, (uint32_t)in_size, (uint32_t)blk, (uint32_t)nblk,
                                        params->alg_id,
-                                       dec_buf, out_lengths,
+                                       dec_buf,
                                        params, ws, &td);
             uint64_t dec_total_end = hybrid_now_ns();
 
@@ -1876,6 +2956,21 @@ int hybrid_bench(
         printf("Bench Decompress : kernel_tp=%.2f MB/s total_tp=%.2f MB/s verify=%s\n",
                median_double(dec_ktp, n), median_double(dec_ttp, n), verify_ok ? "OK" : "FAIL");
         printf("Bench Summary : iterations=%zu seconds=%.2f\n", n, sec);
+        if (params->split_mode == HYBRID_SPLIT_ADAPTIVE &&
+            g_lzo_hybrid_metrics.adaptive_gpu_ratio_count > 0) {
+            double ratio_mean = g_lzo_hybrid_metrics.adaptive_gpu_ratio_sum /
+                (double)g_lzo_hybrid_metrics.adaptive_gpu_ratio_count;
+            printf("Bench Adaptive : gpu_ratio_mean=%.4f min=%.4f max=%.4f samples=%zu\n",
+                   ratio_mean,
+                   g_lzo_hybrid_metrics.adaptive_gpu_ratio_min,
+                   g_lzo_hybrid_metrics.adaptive_gpu_ratio_max,
+                   g_lzo_hybrid_metrics.adaptive_gpu_ratio_count);
+            printf("Bench Adaptive : gpu_ratio=%.4f objective=perf_energy_ratio min=%.4f max=%.4f samples=%zu\n",
+                   ratio_mean,
+                   g_lzo_hybrid_metrics.adaptive_gpu_ratio_min,
+                   g_lzo_hybrid_metrics.adaptive_gpu_ratio_max,
+                   g_lzo_hybrid_metrics.adaptive_gpu_ratio_count);
+        }
     } else {
         fprintf(stderr, "bench error: no successful iteration\n");
         verify_ok = 0;
@@ -1883,6 +2978,6 @@ int hybrid_bench(
 
     free(comp_ktp); free(dec_ktp); free(comp_ttp); free(dec_ttp); free(ratio_pct);
     free(input_ref); free(lengths); free(out_buf);
-    free(packed); free(offsets); free(dec_buf); free(out_lengths);
+    free(packed); free(offsets); free(dec_buf);
     return verify_ok ? 0 : 1;
 }

@@ -17,6 +17,29 @@
 #define PATH_MAX 4096
 #endif
 
+static int lzo_copy_string(char* dst, size_t dst_sz, const char* src) {
+    size_t n;
+    if (!dst || dst_sz == 0 || !src) return -1;
+    n = strlen(src);
+    if (n >= dst_sz) return -1;
+    memcpy(dst, src, n + 1);
+    return 0;
+}
+
+static int lzo_join_path2(char* out, size_t out_sz, const char* dir, const char* name) {
+    size_t dl, nl;
+    if (!out || out_sz == 0 || !dir || !name) return -1;
+    dl = strlen(dir);
+    nl = strlen(name);
+    if (dl == 0 || nl == 0) return -1;
+    if (dl + 1 + nl >= out_sz) return -1;
+    memcpy(out, dir, dl);
+    out[dl] = '/';
+    memcpy(out + dl + 1, name, nl);
+    out[dl + 1 + nl] = '\0';
+    return 0;
+}
+
 static int lzo_get_executable_path(char* out, size_t outlen) {
     if (!out || outlen == 0) return -1;
 #if defined(_WIN32) || defined(_WIN64)
@@ -34,6 +57,134 @@ static int lzo_get_executable_path(char* out, size_t outlen) {
         return 0;
     }
 #endif
+}
+
+static void lzo_strip_suffix_if_present(char* s, const char* suffix) {
+    size_t slen;
+    size_t suflen;
+    if (!s || !suffix) return;
+    slen = strlen(s);
+    suflen = strlen(suffix);
+    if (slen >= suflen && strcmp(s + slen - suflen, suffix) == 0) {
+        s[slen - suflen] = '\0';
+    }
+}
+
+static void lzo_compose_source_filename(char* out, size_t out_sz, const char* source_alg, int bits, int want_debug) {
+    if (!out || out_sz == 0 || !source_alg || !*source_alg) return;
+    if (bits == 999) {
+        snprintf(out, out_sz, "%s_999.cl", source_alg);
+    } else if (bits == 99) {
+        snprintf(out, out_sz, "%s_99.cl", source_alg);
+    } else if (want_debug) {
+        snprintf(out, out_sz, "%s_debug.cl", source_alg);
+    } else {
+        snprintf(out, out_sz, "%s.cl", source_alg);
+    }
+}
+
+static int lzo_stat_mtime(const char* path, time_t* out_mtime) {
+    struct stat st;
+    if (!path || !*path || !out_mtime) return -1;
+    if (stat(path, &st) != 0) return -1;
+    *out_mtime = st.st_mtime;
+    return 0;
+}
+
+static int lzo_source_is_newer_than_binary(const char* source_path, const char* binary_path) {
+    time_t src_mtime;
+    time_t bin_mtime;
+    if (lzo_stat_mtime(source_path, &src_mtime) != 0) return 0;
+    if (lzo_stat_mtime(binary_path, &bin_mtime) != 0) return 0;
+    return src_mtime > bin_mtime;
+}
+
+static int lzo_validate_program_kernels(cl_program prog, const char* source_alg, int bits, int decomp_only) {
+    cl_int err = CL_SUCCESS;
+    cl_kernel kcomp = NULL;
+    cl_kernel kdec = NULL;
+    char comp_name[96];
+    char dec_name[96];
+
+    if (!prog || !source_alg || !*source_alg) return 0;
+
+    snprintf(dec_name, sizeof(dec_name), "%s_block_decompress", source_alg);
+
+    if (!decomp_only) {
+        if (bits == 999)
+            snprintf(comp_name, sizeof(comp_name), "%s_block_compress_999", source_alg);
+        else if (bits == 99)
+            snprintf(comp_name, sizeof(comp_name), "%s_block_compress_99", source_alg);
+        else
+            snprintf(comp_name, sizeof(comp_name), "%s_block_compress", source_alg);
+
+        kcomp = clCreateKernel(prog, comp_name, &err);
+        if (err != CL_SUCCESS || !kcomp) {
+            if (kcomp) clReleaseKernel(kcomp);
+            return 0;
+        }
+    }
+
+    kdec = clCreateKernel(prog, dec_name, &err);
+    if (kcomp) clReleaseKernel(kcomp);
+    if (err != CL_SUCCESS || !kdec) {
+        if (kdec) clReleaseKernel(kdec);
+        return 0;
+    }
+    clReleaseKernel(kdec);
+    return 1;
+}
+
+static int lzo_resolve_output_binary_path(const char* bin_name, const char* resolved_src, char* out_path, size_t out_path_sz) {
+    char found_path[PATH_MAX];
+    if (!bin_name || !*bin_name || !out_path || out_path_sz == 0) return -1;
+
+    if (lzo_find_file_path(bin_name, found_path, sizeof(found_path)) == 0) {
+        if (lzo_copy_string(out_path, out_path_sz, found_path) != 0) return -1;
+        return 0;
+    }
+
+    if (resolved_src && *resolved_src) {
+        if (lzo_copy_string(out_path, out_path_sz, resolved_src) != 0) return -1;
+        {
+            char* slash = strrchr(out_path, '/');
+            if (slash) {
+                *(slash + 1) = '\0';
+                if (strlen(out_path) + strlen(bin_name) >= out_path_sz) return -1;
+                strcat(out_path, bin_name);
+                return 0;
+            }
+        }
+    }
+
+    if (lzo_copy_string(out_path, out_path_sz, bin_name) != 0) return -1;
+    return 0;
+}
+
+static void lzo_refresh_program_binary(cl_program prog, const char* bin_path) {
+    size_t bin_sz = 0;
+    unsigned char* blob = NULL;
+    unsigned char* bins[1] = { NULL };
+    FILE* bf = NULL;
+
+    if (!prog || !bin_path || !*bin_path) return;
+    if (clGetProgramInfo(prog, CL_PROGRAM_BINARY_SIZES, sizeof(size_t), &bin_sz, NULL) != CL_SUCCESS) return;
+    if (bin_sz == 0) return;
+
+    blob = (unsigned char*)malloc(bin_sz);
+    if (!blob) return;
+    bins[0] = blob;
+    if (clGetProgramInfo(prog, CL_PROGRAM_BINARIES, sizeof(bins), bins, NULL) != CL_SUCCESS) {
+        free(blob);
+        return;
+    }
+
+    bf = fopen(bin_path, "wb");
+    if (bf) {
+        (void)fwrite(blob, 1, bin_sz, bf);
+        fclose(bf);
+    }
+    free(blob);
 }
 
 unsigned long g_ocl_init_us = 0;
@@ -63,8 +214,9 @@ int lzo_find_file_path(const char *name, char *out, size_t outlen)
     /* 1: LZO_GPU_DIR (Highest priority for testing) */
     const char *env = getenv("LZO_GPU_DIR");
     if (env && env[0]) {
-        snprintf(path, sizeof(path), "%s/%s", env, name);
-        if (access(path, R_OK) == 0) { strncpy(out, path, outlen - 1); out[outlen - 1] = '\0'; return 0; }
+        if (lzo_join_path2(path, sizeof(path), env, name) == 0 && access(path, R_OK) == 0) {
+            if (lzo_copy_string(out, outlen, path) == 0) return 0;
+        }
     }
     /* 2: exe dir and exe_dir/../lzo_gpu */
     char exe_path[PATH_MAX] = {0};
@@ -79,25 +231,28 @@ int lzo_find_file_path(const char *name, char *out, size_t outlen)
         if (!slash) slash = strrchr(exe_path, '/');
         if (slash) {
             *slash = '\0';
-            snprintf(path, sizeof(path), "%s/%s", exe_path, name);
-            if (access(path, R_OK) == 0) { strncpy(out, path, outlen - 1); out[outlen - 1] = '\0'; return 0; }
+            if (lzo_join_path2(path, sizeof(path), exe_path, name) == 0 && access(path, R_OK) == 0) {
+                if (lzo_copy_string(out, outlen, path) == 0) return 0;
+            }
             snprintf(path, sizeof(path), "%s/../lzo_gpu/%s", exe_path, name);
-            if (access(path, R_OK) == 0) { strncpy(out, path, outlen - 1); out[outlen - 1] = '\0'; return 0; }
+            if (access(path, R_OK) == 0) { if (lzo_copy_string(out, outlen, path) == 0) return 0; }
         }
     }
     /* 3: OUT_DIR */
     env = getenv("OUT_DIR");
     if (env && env[0]) {
-        snprintf(path, sizeof(path), "%s/%s", env, name);
-        if (access(path, R_OK) == 0) { strncpy(out, path, outlen - 1); out[outlen - 1] = '\0'; return 0; }
+        if (lzo_join_path2(path, sizeof(path), env, name) == 0 && access(path, R_OK) == 0) {
+            if (lzo_copy_string(out, outlen, path) == 0) return 0;
+        }
     }
     /* 4: cwd */
     if (getcwd(base, sizeof(base)) != NULL) {
-        snprintf(path, sizeof(path), "%s/%s", base, name);
-        if (access(path, R_OK) == 0) { strncpy(out, path, outlen - 1); out[outlen - 1] = '\0'; return 0; }
+        if (lzo_join_path2(path, sizeof(path), base, name) == 0 && access(path, R_OK) == 0) {
+            if (lzo_copy_string(out, outlen, path) == 0) return 0;
+        }
     }
     /* 5: fallback: raw name in cwd */
-    if (access(name, R_OK) == 0) { strncpy(out, name, outlen - 1); out[outlen - 1] = '\0'; return 0; }
+    if (access(name, R_OK) == 0) { if (lzo_copy_string(out, outlen, name) == 0) return 0; }
     return -1;
 }
 
@@ -468,8 +623,13 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
     cl_int err;
     cl_program prog = NULL;
     int want_debug = 0;
+    int decomp_only = 0;
     int allow_clbin = 1;
     char base_name[64];
+    char source_alg_name[64];
+    char source_name_for_stale[128] = {0};
+    char source_path_for_stale[PATH_MAX] = {0};
+    int source_path_for_stale_ok = 0;
 
     strncpy(base_name, alg_name, sizeof(base_name) - 1);
     base_name[sizeof(base_name) - 1] = '\0';
@@ -488,6 +648,22 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
     }
 
     {
+        char *decomp_pos = strstr(base_name, "_decomp");
+        if (decomp_pos && decomp_pos[7] == '\0') {
+            *decomp_pos = '\0';
+            decomp_only = 1;
+        }
+    }
+
+    strncpy(source_alg_name, base_name, sizeof(source_alg_name) - 1);
+    source_alg_name[sizeof(source_alg_name) - 1] = '\0';
+    lzo_strip_suffix_if_present(source_alg_name, "_decomp");
+    lzo_compose_source_filename(source_name_for_stale, sizeof(source_name_for_stale), source_alg_name, bits, want_debug);
+    if (lzo_find_file_path(source_name_for_stale, source_path_for_stale, sizeof(source_path_for_stale)) == 0) {
+        source_path_for_stale_ok = 1;
+    }
+
+    {
         const char* no_clbin_env = getenv("LZO_GPU_NO_CLBIN");
         if (want_debug) {
             allow_clbin = 0;
@@ -503,91 +679,95 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
 
     /* Try bits-specific binary first: <alg>_<bits>.clbin */
     if (allow_clbin) {
-        char bin_name[64];
+        char bin_name[128];
         if (bits > 0) snprintf(bin_name, sizeof(bin_name), "%s_%d.clbin", base_name, bits);
         else snprintf(bin_name, sizeof(bin_name), "%s.clbin", base_name);
 
         char resolved_bin[PATH_MAX];
         if (lzo_find_file_path(bin_name, resolved_bin, sizeof(resolved_bin)) == 0) {
-            FILE* fb = fopen(resolved_bin, "rb");
-            if (fb) {
-                fseek(fb, 0, SEEK_END);
-                long bsz = ftell(fb);
-                fseek(fb, 0, SEEK_SET);
-                unsigned char* bin = malloc(bsz);
-                if (bin && fread(bin, 1, bsz, fb) == (size_t)bsz) {
-                    cl_int binary_status;
-                    prog = clCreateProgramWithBinary(ctx, 1, &dev, (const size_t*)&bsz,
-                                                    (const unsigned char**)&bin, &binary_status, &err);
-                    if (err == CL_SUCCESS && binary_status == CL_SUCCESS) {
-                        /* Rebuild with the same fast-math flags used by build_kernel */
-                        const char *opts = "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable";
-                        err = clBuildProgram(prog, 1, &dev, opts, NULL, NULL);
-                        if (err == CL_SUCCESS) {
-                            if (build_log) build_log[0] = '\0';
-                            free(bin); fclose(fb); return prog;
-                        } else {
-                            /* capture build log */
-                            size_t log_sz = 0; clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
-                            if (log_sz && build_log) {
-                                size_t toread = (log_sz < build_log_len - 1) ? log_sz : build_log_len - 1;
-                                char *tmp = malloc(toread + 1);
-                                clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, toread, tmp, NULL);
-                                tmp[toread] = '\0';
-                                snprintf(build_log, build_log_len, "Binary build log: %s", tmp);
-                                free(tmp);
-                            } else if (build_log) {
-                                snprintf(build_log, build_log_len, "Binary build failed (err=%d)", (int)err);
+            if (!(source_path_for_stale_ok && lzo_source_is_newer_than_binary(source_path_for_stale, resolved_bin))) {
+                FILE* fb = fopen(resolved_bin, "rb");
+                if (fb) {
+                    fseek(fb, 0, SEEK_END);
+                    long bsz = ftell(fb);
+                    fseek(fb, 0, SEEK_SET);
+                    unsigned char* bin = malloc(bsz);
+                    if (bin && fread(bin, 1, bsz, fb) == (size_t)bsz) {
+                        cl_int binary_status;
+                        prog = clCreateProgramWithBinary(ctx, 1, &dev, (const size_t*)&bsz,
+                                                        (const unsigned char**)&bin, &binary_status, &err);
+                        if (err == CL_SUCCESS && binary_status == CL_SUCCESS) {
+                            /* Rebuild with the same fast-math flags used by build_kernel */
+                            const char *opts = "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable";
+                            err = clBuildProgram(prog, 1, &dev, opts, NULL, NULL);
+                            if (err == CL_SUCCESS && lzo_validate_program_kernels(prog, source_alg_name, bits, decomp_only)) {
+                                if (build_log) build_log[0] = '\0';
+                                free(bin); fclose(fb); return prog;
+                            } else {
+                                /* capture build log */
+                                size_t log_sz = 0; clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
+                                if (log_sz && build_log) {
+                                    size_t toread = (log_sz < build_log_len - 1) ? log_sz : build_log_len - 1;
+                                    char *tmp = malloc(toread + 1);
+                                    clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, toread, tmp, NULL);
+                                    tmp[toread] = '\0';
+                                    snprintf(build_log, build_log_len, "Binary build log: %s", tmp);
+                                    free(tmp);
+                                } else if (build_log) {
+                                    snprintf(build_log, build_log_len, "Binary build failed or missing kernels (err=%d)", (int)err);
+                                }
+                                clReleaseProgram(prog); prog = NULL;
                             }
-                            clReleaseProgram(prog); prog = NULL;
                         }
                     }
+                    if (bin) free(bin);
+                    fclose(fb);
                 }
-                if (bin) free(bin);
-                fclose(fb);
             }
         }
     }
 
     /* Try generic binary <alg>.clbin when bits-specific not used or failed */
     if (allow_clbin && bits > 0) {
-        char bin_name[64]; snprintf(bin_name, sizeof(bin_name), "%s.clbin", base_name);
+        char bin_name[128]; snprintf(bin_name, sizeof(bin_name), "%s.clbin", base_name);
         char resolved_bin[PATH_MAX];
         if (lzo_find_file_path(bin_name, resolved_bin, sizeof(resolved_bin)) == 0) {
-            FILE* fb = fopen(resolved_bin, "rb");
-            if (fb) {
-                fseek(fb, 0, SEEK_END);
-                long bsz = ftell(fb);
-                fseek(fb, 0, SEEK_SET);
-                unsigned char* bin = malloc(bsz);
-                if (bin && fread(bin, 1, bsz, fb) == (size_t)bsz) {
-                    cl_int binary_status;
-                    prog = clCreateProgramWithBinary(ctx, 1, &dev, (const size_t*)&bsz,
-                                                    (const unsigned char**)&bin, &binary_status, &err);
-                    if (err == CL_SUCCESS && binary_status == CL_SUCCESS) {
-                        const char *opts = "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable";
-                        err = clBuildProgram(prog, 1, &dev, opts, NULL, NULL);
-                        if (err == CL_SUCCESS) {
-                            if (build_log) build_log[0] = '\0';
-                            free(bin); fclose(fb); return prog;
-                        } else {
-                            size_t log_sz = 0; clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
-                            if (log_sz && build_log) {
-                                size_t toread = (log_sz < build_log_len - 1) ? log_sz : build_log_len - 1;
-                                char *tmp = malloc(toread + 1);
-                                clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, toread, tmp, NULL);
-                                tmp[toread] = '\0';
-                                snprintf(build_log, build_log_len, "Binary build log: %s", tmp);
-                                free(tmp);
-                            } else if (build_log) {
-                                snprintf(build_log, build_log_len, "Binary build failed (err=%d)", (int)err);
+            if (!(source_path_for_stale_ok && lzo_source_is_newer_than_binary(source_path_for_stale, resolved_bin))) {
+                FILE* fb = fopen(resolved_bin, "rb");
+                if (fb) {
+                    fseek(fb, 0, SEEK_END);
+                    long bsz = ftell(fb);
+                    fseek(fb, 0, SEEK_SET);
+                    unsigned char* bin = malloc(bsz);
+                    if (bin && fread(bin, 1, bsz, fb) == (size_t)bsz) {
+                        cl_int binary_status;
+                        prog = clCreateProgramWithBinary(ctx, 1, &dev, (const size_t*)&bsz,
+                                                        (const unsigned char**)&bin, &binary_status, &err);
+                        if (err == CL_SUCCESS && binary_status == CL_SUCCESS) {
+                            const char *opts = "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable";
+                            err = clBuildProgram(prog, 1, &dev, opts, NULL, NULL);
+                            if (err == CL_SUCCESS && lzo_validate_program_kernels(prog, source_alg_name, bits, decomp_only)) {
+                                if (build_log) build_log[0] = '\0';
+                                free(bin); fclose(fb); return prog;
+                            } else {
+                                size_t log_sz = 0; clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
+                                if (log_sz && build_log) {
+                                    size_t toread = (log_sz < build_log_len - 1) ? log_sz : build_log_len - 1;
+                                    char *tmp = malloc(toread + 1);
+                                    clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, toread, tmp, NULL);
+                                    tmp[toread] = '\0';
+                                    snprintf(build_log, build_log_len, "Binary build log: %s", tmp);
+                                    free(tmp);
+                                } else if (build_log) {
+                                    snprintf(build_log, build_log_len, "Binary build failed or missing kernels (err=%d)", (int)err);
+                                }
+                                clReleaseProgram(prog); prog = NULL;
                             }
-                            clReleaseProgram(prog); prog = NULL;
                         }
                     }
+                    if (bin) free(bin);
+                    fclose(fb);
                 }
-                if (bin) free(bin);
-                fclose(fb);
             }
         }
     }
@@ -671,6 +851,17 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
             return NULL;
         }
         free(src);
+
+        if (allow_clbin && !dbg_flag) {
+            char bin_name[128];
+            char bin_path[PATH_MAX];
+            if (bits > 0) snprintf(bin_name, sizeof(bin_name), "%s_%d.clbin", source_alg, bits);
+            else snprintf(bin_name, sizeof(bin_name), "%s.clbin", source_alg);
+            if (lzo_resolve_output_binary_path(bin_name, resolved_src, bin_path, sizeof(bin_path)) == 0) {
+                lzo_refresh_program_binary(prog, bin_path);
+            }
+        }
+
         if (build_log) build_log[0] = '\0';
         return prog;
     }
@@ -682,8 +873,8 @@ int lzo_load_comp_kernel(cl_context ctx, cl_device_id dev, const char *alg_name,
     cl_int err;
     cl_program prog = NULL;
     cl_kernel krn = NULL;
-    char effective_alg[64];
-    char prog_base_name[64];
+    char effective_alg[128];
+    char prog_base_name[128];
 
     strncpy(prog_base_name, alg_name, sizeof(prog_base_name)-1);
     prog_base_name[sizeof(prog_base_name)-1] = '\0';
@@ -691,7 +882,17 @@ int lzo_load_comp_kernel(cl_context ctx, cl_device_id dev, const char *alg_name,
     if (p_dbg) *p_dbg = '\0';
 
     if (debug) {
-        snprintf(effective_alg, sizeof(effective_alg), "%s_debug", prog_base_name);
+        size_t base_len = strlen(prog_base_name);
+        const char* suffix = "_debug";
+        size_t suffix_len = strlen(suffix);
+        if (base_len + suffix_len >= sizeof(effective_alg)) {
+            if (build_log && build_log[0] == '\0') {
+                snprintf(build_log, build_log_len, "algorithm name too long: %s", prog_base_name);
+            }
+            return -1;
+        }
+        memcpy(effective_alg, prog_base_name, base_len);
+        memcpy(effective_alg + base_len, suffix, suffix_len + 1);
     } else {
         strncpy(effective_alg, prog_base_name, sizeof(effective_alg)-1);
         effective_alg[sizeof(effective_alg)-1] = '\0';
@@ -704,13 +905,28 @@ int lzo_load_comp_kernel(cl_context ctx, cl_device_id dev, const char *alg_name,
         return -1;
     }
 
-    char krn_name[96];
-    if (comp_level == 999)
-        snprintf(krn_name, sizeof(krn_name), "%s_block_compress_999", prog_base_name);
-    else if (comp_level == 99)
-        snprintf(krn_name, sizeof(krn_name), "%s_block_compress_99", prog_base_name);
-    else
-        snprintf(krn_name, sizeof(krn_name), "%s_block_compress", prog_base_name);
+    char krn_name[192];
+    {
+        const char* suffix = "_block_compress";
+        size_t base_len = strlen(prog_base_name);
+        size_t suffix_len = strlen(suffix);
+        if (comp_level == 999) {
+            suffix = "_block_compress_999";
+            suffix_len = strlen(suffix);
+        } else if (comp_level == 99) {
+            suffix = "_block_compress_99";
+            suffix_len = strlen(suffix);
+        }
+        if (base_len + suffix_len >= sizeof(krn_name)) {
+            if (build_log && build_log[0] == '\0') {
+                snprintf(build_log, build_log_len, "kernel name too long for %s", prog_base_name);
+            }
+            clReleaseProgram(prog);
+            return -1;
+        }
+        memcpy(krn_name, prog_base_name, base_len);
+        memcpy(krn_name + base_len, suffix, suffix_len + 1);
+    }
 
     krn = clCreateKernel(prog, krn_name, &err);
     if (err != CL_SUCCESS) {
