@@ -308,6 +308,13 @@ static inline void show_help(char *prog_name)
     fprintf(stderr, "  %s -h|--help                                 # show this help\n", prog_name);
     fprintf(stderr, "\nEnvironment variables (grouped — standalone / client->daemon / advanced):\n");
     fprintf(stderr, "    LZO_STANDARD_COPY=0|1    0=zero-copy (map into pinned buffer), 1=standard host->device copy (explicit upload). Applies to both compression and decompression.\n");
+    fprintf(stderr, "    LZO_GPU_ENABLE_COMPACTION=0|1  Enable device compaction/pack path (default: 0).\n");
+    fprintf(stderr, "    LZO_GPU_FORCE_COMPACTION=0|1   Force off/on device compaction, overrides adaptive gate.\n");
+    fprintf(stderr, "    LZO_PIPELINE_ENABLE=0|1        Enable chunked pipeline compression path (default: 0).\n");
+    fprintf(stderr, "    LZO_PIPELINE_OVERLAP_ENABLE=0|1 Enable upload/compute overlap on standard-copy pipeline path (default: 0).\n");
+    fprintf(stderr, "    LZO_PIPELINE_THRESHOLD_MB=N    Min input size to enable pipeline when on (default: 64).\n");
+    fprintf(stderr, "    LZO_PIPELINE_CHUNK_BLOCKS=N    Pipeline chunk blocks (default: 512).\n");
+    fprintf(stderr, "    LZO_PIPELINE_ENTROPY_ENABLE=0|1  Enable entropy gate for pipeline.\n");
 }
 
 static int cmp_double_asc(const void *a, const void *b) {
@@ -507,8 +514,8 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
             fprintf(msg,
                     "%s : %zu -> %zu (%.2f:1) in %.2f ms\n",
                     in_path,
-                    t_out.in_size,
-                    t_out.out_size,
+                    (size_t)t_out.in_size,
+                    (size_t)t_out.out_size,
                     ratio,
                     overall_us / 1000.0);
         }
@@ -603,8 +610,8 @@ static int do_decompress_mode(const char* lz_path, const char* output_path, int 
             fprintf(msg,
                     "%s : %zu -> %zu in %.2f ms\n",
                     lz_path,
-                    t_out.in_size,
-                    t_out.out_size,
+                    (size_t)t_out.in_size,
+                    (size_t)t_out.out_size,
                     overall_us / 1000.0);
         }
     }
@@ -725,16 +732,67 @@ static int run_lzo_bench(const char *in_path,
         .local_size_param = (int)g_cli_local_size,
         .debug = debug_counters
     };
+    size_t bench_cached_blk = 0;
+    size_t bench_cached_nblk = 0;
 
     size_t cap = 16, n = 0;
+    const size_t bench_drop_iterations = 1;
+    size_t total_successful_iterations = 0;
     double *comp_tp = (double *)malloc(cap * sizeof(double));
     double *dec_tp = (double *)malloc(cap * sizeof(double));
-    double *comp_total_tp = (double *)malloc(cap * sizeof(double));
-    double *dec_total_tp = (double *)malloc(cap * sizeof(double));
     double *ratio_pct = (double *)malloc(cap * sizeof(double));
     int verify_ok = 1;
-    if (!comp_tp || !dec_tp || !comp_total_tp || !dec_total_tp || !ratio_pct) {
+    if (!comp_tp || !dec_tp || !ratio_pct) {
         verify_ok = 0;
+    }
+
+    if (verify_ok) {
+        cl_int prep_err = CL_SUCCESS;
+        size_t blk_bytes = (params.block_size > 0) ? params.block_size : 0;
+        lzo_choose_blocking_adaptive(input_ref,
+                                     in_size_ref,
+                                     dev,
+                                     blk_bytes,
+                                     0,
+                                     &bench_cached_blk,
+                                     &bench_cached_nblk,
+                                     params.debug);
+        if (bench_cached_blk == 0 || bench_cached_nblk == 0) {
+            verify_ok = 0;
+        }
+        if (verify_ok) {
+            if (ws.d_in) {
+                clReleaseMemObject(ws.d_in);
+                ws.d_in = NULL;
+                ws.in_size = 0;
+            }
+            ws.d_in = clCreateBuffer(ctx, CL_MEM_READ_ONLY, in_size_ref, NULL, &prep_err);
+            if (prep_err != CL_SUCCESS || !ws.d_in) {
+                verify_ok = 0;
+            }
+        }
+        if (verify_ok) {
+            prep_err = clEnqueueWriteBuffer(q,
+                                            ws.d_in,
+                                            CL_TRUE,
+                                            0,
+                                            in_size_ref,
+                                            input_ref,
+                                            0,
+                                            NULL,
+                                            NULL);
+            if (prep_err != CL_SUCCESS) {
+                verify_ok = 0;
+            }
+        }
+        if (verify_ok) {
+            ws.in_size = in_size_ref;
+            ws.comp_cached_input_size = in_size_ref;
+            ws.comp_cached_blk_size = bench_cached_blk;
+            ws.comp_cached_nblk = bench_cached_nblk;
+        } else {
+            fprintf(stderr, "bench error: failed to preload input buffer\n");
+        }
     }
 
     struct timespec ts0, ts1;
@@ -774,9 +832,9 @@ static int run_lzo_bench(const char *in_path,
         cl_uint *h_dbg_dec = NULL;
         cl_mem d_dbg_dec = NULL;
 
-        int skip_input_upload = (n > 0) ? 1 : 0;
-        int rc = lzo_compress_core(ctx, q, dev, krn_c, pack_krn, in_path, "/dev/null",
-                                   &params, skip_input_upload, &ws, &time_us, &out_size, &tc);
+        int skip_input_upload = 1;
+        int rc = lzo_compress_core(ctx, q, dev, krn_c, pack_krn, in_path, NULL,
+                       &params, skip_input_upload, &ws, &time_us, &out_size, &tc);
         if (rc != 0) {
             verify_ok = 0;
             break;
@@ -1035,7 +1093,6 @@ static int run_lzo_bench(const char *in_path,
             goto iter_cleanup;
         }
         clWaitForEvents(1, &read_lens_evt);
-        double dec_read_us = event_elapsed_us(read_lens_evt);
         clReleaseEvent(read_lens_evt);
         size_t out_total = 0;
         for (size_t i = 0; i < nblk; ++i) {
@@ -1087,8 +1144,12 @@ static int run_lzo_bench(const char *in_path,
             fprintf(stderr, "[BENCH] first mismatch at offset %zu: got %02x expected %02x\n", mpos, mdata[mpos], input_ref[mpos]);
             verify_ok = 0;
         }
-        double dec_total_us = dec_upload_us + dec_kernel_us + dec_read_us;
         if (!verify_ok) {
+            goto iter_cleanup;
+        }
+
+        total_successful_iterations += 1;
+        if (total_successful_iterations <= bench_drop_iterations) {
             goto iter_cleanup;
         }
 
@@ -1102,14 +1163,6 @@ static int run_lzo_bench(const char *in_path,
             if (!nd) { verify_ok = 0; break; }
             dec_tp = nd;
 
-            double *nct = (double *)realloc(comp_total_tp, new_cap * sizeof(double));
-            if (!nct) { verify_ok = 0; break; }
-            comp_total_tp = nct;
-
-            double *ndt = (double *)realloc(dec_total_tp, new_cap * sizeof(double));
-            if (!ndt) { verify_ok = 0; break; }
-            dec_total_tp = ndt;
-
             double *nr = (double *)realloc(ratio_pct, new_cap * sizeof(double));
             if (!nr) { verify_ok = 0; break; }
             ratio_pct = nr;
@@ -1119,12 +1172,6 @@ static int run_lzo_bench(const char *in_path,
         double in_mb = (double)tc.in_size / (1024.0 * 1024.0);
         comp_tp[n] = (tc.kernel_exec_us > 0) ? (in_mb * 1000000.0 / (double)tc.kernel_exec_us) : 0.0;
         dec_tp[n] = (dec_kernel_us > 0.0) ? (in_mb * 1000000.0 / dec_kernel_us) : 0.0;
-        {
-            /* Total throughput = device upload + kernel + device download (exclude verify / wall-time). */
-            double comp_total_us = (double)tc.data_upload_us + (double)tc.kernel_exec_us + (double)tc.download_total_us;
-            comp_total_tp[n] = (comp_total_us > 0.0) ? (in_mb * 1000000.0 / comp_total_us) : 0.0;
-        }
-        dec_total_tp[n] = (dec_total_us > 0.0) ? (in_mb * 1000000.0 / dec_total_us) : 0.0;
         ratio_pct[n] = (tc.in_size > 0) ? (100.0 * (double)tc.out_size / (double)tc.in_size) : 0.0;
         n++;
 
@@ -1150,22 +1197,20 @@ static int run_lzo_bench(const char *in_path,
     free(bench_verify_out);
 
     clock_gettime(CLOCK_MONOTONIC, &ts1);
-    double sec = elapsed_sec(&ts0, &ts1);
 
     if (n > 0) {
-        printf("Bench Compress : kernel_tp=%.2f MB/s total_tp=%.2f MB/s ratio=%.2f%%\n",
-               median_double(comp_tp, n), median_double(comp_total_tp, n), median_double(ratio_pct, n));
-        printf("Bench Decompress : kernel_tp=%.2f MB/s total_tp=%.2f MB/s verify=%s\n",
-               median_double(dec_tp, n), median_double(dec_total_tp, n), verify_ok ? "OK" : "FAIL");
-        printf("Bench Summary : iterations=%zu seconds=%.2f\n", n, sec);
-         if (debug_counters) {
-             printf("[LZO-DBG][DECOMP] tokens=%llu literal_bytes=%llu match_bytes=%llu small_offsets=%llu output_errors=%llu\n",
-                 dbg_dec_tokens_total,
-                 dbg_dec_literals_total,
-                 dbg_dec_matches_total,
-                 dbg_dec_small_offsets_total,
-                 dbg_dec_output_errors_total);
-         }
+        printf("Bench Compress : kernel_tp=%.2f MB/s ratio=%.2f%%\n",
+            median_double(comp_tp, n), median_double(ratio_pct, n));
+        printf("Bench Decompress : kernel_tp=%.2f MB/s verify=%s\n",
+            median_double(dec_tp, n), verify_ok ? "OK" : "FAIL");
+        if (debug_counters) {
+            printf("[LZO-DBG][DECOMP] tokens=%llu literal_bytes=%llu match_bytes=%llu small_offsets=%llu output_errors=%llu\n",
+                dbg_dec_tokens_total,
+                dbg_dec_literals_total,
+                dbg_dec_matches_total,
+                dbg_dec_small_offsets_total,
+                dbg_dec_output_errors_total);
+        }
     } else {
         fprintf(stderr, "bench error: no successful iteration\n");
         verify_ok = 0;
@@ -1173,8 +1218,6 @@ static int run_lzo_bench(const char *in_path,
 
     free(comp_tp);
     free(dec_tp);
-    free(comp_total_tp);
-    free(dec_total_tp);
     free(ratio_pct);
     free(input_ref);
     lzo_gpu_workspace_free(&ws);

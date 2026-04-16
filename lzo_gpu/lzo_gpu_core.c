@@ -160,7 +160,13 @@ static double lzo_estimate_file_entropy_prefix(const char* path, size_t sample_b
 
     if (!path || sample_bytes == 0) return -1.0;
 
-    fd = open(path, O_RDONLY);
+    {
+        int open_flags = O_RDONLY;
+#ifdef O_BINARY
+        open_flags |= O_BINARY;
+#endif
+        fd = open(path, open_flags);
+    }
     if (fd < 0) goto cleanup;
 
     buf = (unsigned char*)malloc(chunk);
@@ -305,6 +311,16 @@ static int lzo_read_buffer_auto(cl_command_queue queue, cl_mem buf, void* dst, s
     return (err == CL_SUCCESS) ? 0 : -1;
 }
 
+static unsigned long lzo_event_elapsed_us(cl_event ev) {
+    cl_ulong st = 0;
+    cl_ulong en = 0;
+    if (!ev) return 0;
+    if (clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(st), &st, NULL) != CL_SUCCESS) return 0;
+    if (clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(en), &en, NULL) != CL_SUCCESS) return 0;
+    if (en <= st) return 0;
+    return (unsigned long)((en - st) / 1000ULL);
+}
+
 static int lzo_readback_to_file_chunked(cl_command_queue queue,
                                         cl_mem buf,
                                         size_t total_bytes,
@@ -365,6 +381,7 @@ typedef struct {
     size_t len_cap;
     size_t packed_out_cap;
     size_t packed_off_cap;
+    cl_event upload_ev;
     cl_event kernel_ev;
     int inflight;
     size_t in_size;
@@ -379,6 +396,10 @@ static size_t lzo_env_size_mb_to_bytes(const char* name, size_t default_mb) {
 
 static void lzo_pipeline_slot_release(lzo_pipeline_slot_t* slot) {
     if (!slot) return;
+    if (slot->upload_ev) {
+        clReleaseEvent(slot->upload_ev);
+        slot->upload_ev = NULL;
+    }
     if (slot->kernel_ev) {
         clReleaseEvent(slot->kernel_ev);
         slot->kernel_ev = NULL;
@@ -453,8 +474,12 @@ static size_t lzo_sanitize_local_size(cl_device_id device, size_t requested, siz
 static int lzo_should_use_device_compaction(size_t packed_bytes, size_t sparse_bytes, size_t num_blocks, cl_kernel pack_kernel) {
     int force_set = 0;
     int force_value = lzo_env_flag_value("LZO_GPU_FORCE_COMPACTION", &force_set);
+    int enable_set = 0;
+    int enable_value = lzo_env_flag_value("LZO_GPU_ENABLE_COMPACTION", &enable_set);
+    int enable_compaction = enable_set ? enable_value : 0;
     if (!pack_kernel) return 0;
     if (force_set) return force_value;
+    if (!enable_compaction) return 0;
     if (packed_bytes == 0 || sparse_bytes == 0 || packed_bytes >= sparse_bytes) return 0;
     {
         unsigned min_blocks = lzo_env_unsigned_value("LZO_GPU_COMPACTION_MIN_BLOCKS", 8U);
@@ -571,6 +596,7 @@ static int lzo_pipeline_drain_slot(
     cl_uint* lens_all,
     size_t nblk_total,
     size_t* comp_total_out,
+    unsigned long* upload_us_accum,
     unsigned long* kernel_us_accum,
     unsigned long* download_us_accum,
     unsigned long* write_us_accum
@@ -599,6 +625,14 @@ static int lzo_pipeline_drain_slot(
                         slot->block_count);
             }
         }
+    }
+
+    if (slot->upload_ev) {
+        if (upload_us_accum) {
+            *upload_us_accum += lzo_event_elapsed_us(slot->upload_ev);
+        }
+        clReleaseEvent(slot->upload_ev);
+        slot->upload_ev = NULL;
     }
 
     {
@@ -835,7 +869,10 @@ static int lzo_compress_core_pipeline(
     int ret = -1;
     int fd = -1;
     int use_standard_copy = params->standard_copy ? 1 : 0;
+    int overlap_enabled = lzo_env_flag_value("LZO_PIPELINE_OVERLAP_ENABLE", NULL);
+    int use_overlap = overlap_enabled && use_standard_copy;
     int discard_output = (!output_path || strcmp(output_path, "/dev/null") == 0);
+    cl_command_queue transfer_queue = queue;
 
     size_t chunk_blocks_cfg = (size_t)lzo_env_u32("LZO_PIPELINE_CHUNK_BLOCKS", 512U);
     if (chunk_blocks_cfg < 64) chunk_blocks_cfg = 64;
@@ -854,6 +891,7 @@ static int lzo_compress_core_pipeline(
     size_t comp_total = 0;
 
     unsigned char* host_stage[2] = {NULL, NULL};
+    int host_stage_aligned[2] = {0, 0};
     lzo_pipeline_slot_t slots[2];
     cl_uint* lens_all = NULL;
     FILE* out_fp = NULL;
@@ -870,6 +908,28 @@ static int lzo_compress_core_pipeline(
     int is_99 = (params->level == 99);
 
     memset(slots, 0, sizeof(slots));
+
+    if (use_overlap) {
+        cl_command_queue q_tmp = NULL;
+#if defined(CL_VERSION_2_0)
+        {
+            const cl_queue_properties qprops[] = {
+                CL_QUEUE_PROPERTIES,
+                (cl_queue_properties)CL_QUEUE_PROFILING_ENABLE,
+                0
+            };
+            q_tmp = clCreateCommandQueueWithProperties(ctx, device, qprops, &err);
+        }
+#else
+        q_tmp = clCreateCommandQueue(ctx, device, CL_QUEUE_PROFILING_ENABLE, &err);
+#endif
+        if (err != CL_SUCCESS || !q_tmp) {
+            use_overlap = 0;
+            transfer_queue = queue;
+        } else {
+            transfer_queue = q_tmp;
+        }
+    }
 
     if (!discard_output) {
         if (lzo_pipeline_open_output_file(output_path, in_sz, blk, nblk,
@@ -890,7 +950,10 @@ static int lzo_compress_core_pipeline(
         int i;
         for (i = 0; i < 2; i++) {
             int rc = lzo_aligned_alloc_portable((void**)&host_stage[i], ALIGN_BYTES, chunk_bytes_max);
-            if (rc != 0 || host_stage[i] == NULL) {
+            if (rc == 0 && host_stage[i] != NULL) {
+                host_stage_aligned[i] = 1;
+            } else {
+                host_stage_aligned[i] = 0;
                 host_stage[i] = (unsigned char*)malloc(chunk_bytes_max);
             }
             if (!host_stage[i]) {
@@ -900,7 +963,13 @@ static int lzo_compress_core_pipeline(
         }
     }
 
-    fd = open(input_path, O_RDONLY);
+    {
+        int open_flags = O_RDONLY;
+#ifdef O_BINARY
+        open_flags |= O_BINARY;
+#endif
+        fd = open(input_path, open_flags);
+    }
     if (fd < 0) {
         perror("open input");
         goto cleanup;
@@ -1021,6 +1090,7 @@ static int lzo_compress_core_pipeline(
                 if (lzo_pipeline_drain_slot(ctx, queue, slot, pack_kernel, worst_blk, debug_sched,
                                             discard_output, out_fp, lens_all,
                                             nblk, &comp_total,
+                                            &upload_us,
                                             &kernel_exec_us, &download_us, &write_us) != 0) {
                     fprintf(stderr, "[PIPE] failed draining inflight slot\n");
                     goto cleanup;
@@ -1063,14 +1133,13 @@ static int lzo_compress_core_pipeline(
             buffer_alloc_us += (unsigned long)((core_now_ns() - t_ba_start) / 1000ULL);
 
             if (use_standard_copy) {
-                uint64_t t_up_start = core_now_ns();
-                err = clEnqueueWriteBuffer(queue, slot->d_in, CL_FALSE, 0, chunk_bytes,
+                cl_command_queue upload_queue = use_overlap ? transfer_queue : queue;
+                err = clEnqueueWriteBuffer(upload_queue, slot->d_in, CL_FALSE, 0, chunk_bytes,
                                            host_stage[slot_idx], 0, NULL, &ev_upload);
                 if (err != CL_SUCCESS) {
                     fprintf(stderr, "[PIPE] clEnqueueWriteBuffer failed: %d\n", err);
                     goto cleanup;
                 }
-                upload_us += (unsigned long)((core_now_ns() - t_up_start) / 1000ULL);
             } else {
                 uint64_t t_up_start = core_now_ns();
                 void* mapped_in = clEnqueueMapBuffer(queue, slot->d_in, CL_TRUE, CL_MAP_WRITE,
@@ -1124,7 +1193,11 @@ static int lzo_compress_core_pipeline(
                     goto cleanup;
                 }
 
-                if (ev_upload) clReleaseEvent(ev_upload);
+                if (use_standard_copy) {
+                    slot->upload_ev = ev_upload;
+                } else if (ev_upload) {
+                    clReleaseEvent(ev_upload);
+                }
 
                 slot->kernel_ev = ev_kernel;
                 slot->inflight = 1;
@@ -1153,6 +1226,7 @@ static int lzo_compress_core_pipeline(
             if (lzo_pipeline_drain_slot(ctx, queue, &slots[drain_idx], pack_kernel, worst_blk, debug_sched,
                                         discard_output, out_fp, lens_all,
                                         nblk, &comp_total,
+                                        &upload_us,
                                         &kernel_exec_us, &download_us, &write_us) != 0) {
                 fprintf(stderr, "[PIPE] failed draining tail slot\n");
                 goto cleanup;
@@ -1203,10 +1277,17 @@ cleanup:
     if (fd >= 0) close(fd);
     if (out_fp) fclose(out_fp);
     if (lens_all) free(lens_all);
-    if (host_stage[0]) free(host_stage[0]);
-    if (host_stage[1]) free(host_stage[1]);
+    if (host_stage[0]) {
+        if (host_stage_aligned[0]) lzo_aligned_free_portable(host_stage[0]);
+        else free(host_stage[0]);
+    }
+    if (host_stage[1]) {
+        if (host_stage_aligned[1]) lzo_aligned_free_portable(host_stage[1]);
+        else free(host_stage[1]);
+    }
     lzo_pipeline_slot_release(&slots[0]);
     lzo_pipeline_slot_release(&slots[1]);
+    if (transfer_queue && transfer_queue != queue) clReleaseCommandQueue(transfer_queue);
     if (ret != 0 && !discard_output && output_path && strcmp(output_path, "/dev/null") != 0) {
         unlink(output_path);
     }

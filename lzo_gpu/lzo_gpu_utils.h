@@ -84,7 +84,7 @@ int lzo_specified_unit_is_bytes(const char* s);
  */
 void lzo_choose_blocking_adaptive(const unsigned char* data, size_t in_sz, cl_device_id dev, size_t blk_bytes, int fixed_exact, size_t* blk_sz_out, size_t* nblk_out, int debug);
 
-/* Load an OpenCL program from a precompiled binary (<prog>_<bits>.clbin or <prog>.clbin) or compile from source (<prog>.cl) with -D D_BITS=<bits>.
+/* Load an OpenCL program from a precompiled binary (<prog>_<bits>.clbin) or compile from source (<prog>.cl) with -D D_BITS=<bits>.
  * On success returns a built cl_program; on failure returns NULL and, if build_log is provided, writes build output into it.
  */
 cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const char *alg_name, int bits, char *build_log, size_t build_log_len);

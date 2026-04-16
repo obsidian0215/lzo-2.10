@@ -4,6 +4,14 @@
 # Copyright (C) 1996-2017 Markus F.X.J. Oberhumer
 #
 
+ifeq ($(OS),Windows_NT)
+MSYS2_USR_BIN ?= C:/msys64/usr/bin
+ifneq ($(wildcard $(MSYS2_USR_BIN)/sh.exe),)
+SHELL := $(MSYS2_USR_BIN)/sh.exe
+export PATH := $(MSYS2_USR_BIN);$(PATH)
+endif
+endif
+
 PROGRAM = lzo_cpu
 # Fully decoupled build: use local copies under lzo_cpu (include and src)
 SOURCES = lzo_frag.c lzo1x_1k.c lzo1x_1l.c lzo1x_1.c lzo1x_1o.c lzo1x_d1.c lzo1x_d2.c \

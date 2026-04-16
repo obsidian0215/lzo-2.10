@@ -1,40 +1,5 @@
 # LZO Hybrid 优化路线（可读版）
 
-## Wave-0 噪声阈值（G1 门禁，2026-04-06）
-
-测量口径
-
-- 样本目录：`/root/samples_subset`
-- 重复次数：`3`
-- 单轮时长：`bench_seconds=3.5`
-- 代表配置：`HYBRID-only, split_layout=prefix, cpu_threads=2, block=64K, local=1, level=15, alg=lzo1x,lzo1y`
-- 阈值公式：`|Δ| > max(1.5×MAD, P95(|noise_delta|))`
-- 判定方向：`CompTotalMBs`、`DecTotalMBs`、`Ratio%` 均按“越大越好”；`Δ <= -threshold_abs` 记为明显回退，`Δ >= threshold_abs` 记为明显提升。
-- 阈值工件：`/root/lzo-2.10/exp_results/noise_profiles/g1/thresholds/lzo_hybrid_fixed.json`、`/root/lzo-2.10/exp_results/noise_profiles/g1/thresholds/lzo_hybrid_adaptive.json`
-
-当前门禁阈值（LZO Hybrid fixed）
-
-- `CompTotalMBs(mean)`：`threshold_abs=19.3598 MB/s`
-- `CompTotalMBs(median)`：`threshold_abs=50.6775 MB/s`
-- `DecTotalMBs(mean)`：`threshold_abs=14.6347 MB/s`
-- `DecTotalMBs(median)`：`threshold_abs=26.6100 MB/s`
-- `Ratio%(mean)`：`threshold_abs=0.0000 pctpt`
-- `Ratio%(median)`：`threshold_abs=0.0000 pctpt`
-
-当前门禁阈值（LZO Hybrid adaptive）
-
-- `CompTotalMBs(mean)`：`threshold_abs=89.0665 MB/s`
-- `CompTotalMBs(median)`：`threshold_abs=91.6845 MB/s`
-- `DecTotalMBs(mean)`：`threshold_abs=50.8884 MB/s`
-- `DecTotalMBs(median)`：`threshold_abs=226.1200 MB/s`
-- `Ratio%(mean)`：`threshold_abs=0.0063 pctpt`
-- `Ratio%(median)`：`threshold_abs=0.0495 pctpt`
-
-说明
-
-- 以上阈值用于当前 Wave-0 的 subset/fullset 采纳门禁；若后续切换配置空间或计时口径，需要重新测量并覆盖本节。
-- 除 `lzo_hybrid_adaptive` 的 `Ratio%` 外，其余 `Ratio%` 阈值接近 `0`，后续仍按“均值+中位数双判 + 全样本10轮”执行。
-
 ## 全集基线结果（当前保留）
 
 - 基线全集目录：`/root/lzo-2.10/exp_results/runs/fullset_allcfg_current_lzo/runs/20260403_140710`
@@ -130,10 +95,6 @@
 
 | 修改名（实际语义） | 动机 | 设计与实现 | 测试结果 | 拒绝原因 |
 | --- | --- | --- | --- | --- |
-| fixed 路径离散化与 adaptive 对齐 | 降低分配抖动 | `split_mode=fixed` 复用 adaptive 调整逻辑（`lzo_hybrid_core.c`） | `R0.7,T2: Comp -3.595%/+0.777%, Dec -14.789%/-30.147%`；`R0.7,T4: Comp -1.437%/-0.974%, Dec -12.014%/-28.342%` | strict 门禁失败 |
-| `clFinish` 改 `clWaitForEvents` | 减少全局同步开销 | 队列同步从 finish 改为 event wait（`lzo_hybrid_core.c`） | 多配置均出现负向；如 `R0.3,T2: Comp -1.5634%/-2.5282%` | 无全绿配置 |
-| 解压 worker 抢占式调度 | 改善尾部负载不均 | 静态分段改 `atomic_fetch_add` 抢占（`lzo_hybrid_core.c`） | `R0.5,T2: Comp -1.0575%/-1.7538%, Dec +17.2428%/+17.3502%`；`R0.5,T4: Comp -0.6958%/-0.8149%, Dec +31.2716%/+36.6022%` | Dec 提升但 Comp 门禁失败 |
-| prefix fastpath 扩展到压缩+解压 | 争取双路径收益 | 双路径统一 fastpath（`lzo_hybrid_core.c`） | 六组配置均有负向；如 `R0.5,T4: Comp -2.0508%/-2.4319%` | strict 失败 |
 | event-sync 统一口径复测 | 验证同步改动可复制收益 | 固定 8 文件，baseline/candidate 各 10 轮 | `Comp -2.718%/+2.091%`，`Dec +0.132%/+0.142%` | 压缩均值负向 |
 | host-copy/dense-copy 聚合 | 降低 host copy 开销 | 固定参数子集严格 A/B | `Comp -0.0981%/+0.0502%`，`Dec +1.9384%/-0.4948%` | Comp mean 与 Dec median 未过 |
 | helper 清理（疑似无用函数删除） | 验证清理是否无损 | 删除多处 helper 并 fullset 复核 | `Comp +0.4824%/-2.0489%`，`Dec +0.0628%/+0.6092%` | 压缩中位数负向 |
@@ -144,10 +105,8 @@
 | 回放步骤四（事件同步迁移） | 同上 | replay4 | `Comp -0.2429%/-1.3703%`，`Dec -0.4618%/+2.5013%` | 有主判负向 |
 | 回放步骤五（事件同步迁移） | 同上 | replay5 | `Comp -0.2816%/-0.7022%`，`Dec -1.0264%/-1.0698%` | 双侧负向 |
 | 回放步骤六（事件同步迁移） | 同上 | replay6 | `Comp -2.4104%/-0.0707%`，`Dec -0.7568%/+0.6512%` | 压缩均值显著负向 |
-| 解压批量 claim | 降低原子开销 | 解压 worker 批量领取（`host_round_...R5A...`） | 子集：`Comp -0.1896%/-0.2222%`，全集：`Comp -0.1003%/-2.0297%`（Dec 虽正） | Comp 持续负向 |
-| 前缀布局直写（免索引） | 复制 L4H 的 host 优化 | 压缩索引组织精简（`...R5B...FULLSET...`） | `Comp -1.1855%/-0.7784%`，`Dec +0.1345%/+0.3650%` | 压缩双负向 |
+| 前缀布局直写（免索引） | 复制 L4H 的 host 优化 | 压缩索引组织精简 | `Comp -1.1855%/-0.7784%`，`Dec +0.1345%/+0.3650%` | 压缩双负向 |
 | 最小化解压 offsets 构建 | 降低准备开销 | 仅 CPU 分段做必要 offsets | `Comp +0.1819%/+0.2102%`，`Dec -0.1337%/+0.6448%` | Dec mean 负向 |
-| 压缩批量 claim | 减少原子热点 | 压缩线程批量领取 | `Comp -0.1822%/-0.0697%`，`Dec +0.1084%/+0.2461%` | 压缩未过门禁 |
 | 解压调度强化（大块优先） | 优先提升 Dec | 大块场景增强解压调度 | `Comp -0.2041%/-0.7057%`，`Dec +15.6184%/+15.6794%` | Comp 门禁失败 |
 | adaptive 多目标权重初版 | 统一性能/能效/压缩率 | 动态权重 + ratio 软约束 | `Comp -0.9371%/-1.3114%`，`Dec -3.3846%/-0.9763%` | Comp/Dec 双负向 |
 | adaptive 保守约束修复版 | 试图修复初版双负向 | 小文件 CPU-only + 吞吐比约束 | `Comp +4.5925%/-9.1769%`，`Dec +1.1149%/+3.5716%` | Comp median 严重负向 |

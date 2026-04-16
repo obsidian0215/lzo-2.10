@@ -481,23 +481,60 @@ HYBRID（按 `CF/GF` 频点对聚合）结果：
 
 ---
 
-## Nvidia 平台（原有章节保留）
+## Nvidia 平台（2026-04 Windows 基线重写）
 
-> 注：按你的要求，此章节保留，不删除。
+### 1. NVIDIA GPU 差异描述
 
-### A. 平台差异
+1. **架构差异**：NVIDIA dGPU 是离散显存模型，`H2D/D2H` 与主机组装开销会直接影响 total 指标。
+2. **执行口径差异**：Windows + MinGW 场景已完成 LZO GPU 稳定构建与全样本基线，重点观察 `CompTotal/DecTotal + Power + Eff`。
+3. **频率口径说明**：Windows 下 bench 已关闭频率扫描，仅保留默认频点；功率测量保持启用。
 
-- Intel iGPU：统一内存，map/unmap 成本低；
-- Nvidia dGPU：显存分离，D2H/H2D 成本影响 total 更明显。
+### 2. NVIDIA 优化实现（当前占位）
 
-### B. 代表工件
+> 本轮先完成基线和跨实现对位分析，NVIDIA 专项实现暂未新增，先保留结构。
 
-- CPU baseline：`formal_full_lzo_cpu_baseline_t123468_energy/...`
-- GPU pre-mod：`formal_full_lzo_gpu_baseline_unmodified_energy/...`
-- GPU post-mod：`formal_full_lzo_gpu_final_energy_r2/...`
+| 方向 | 状态 | 说明 |
+| --- | --- | --- |
+| dGPU 回读链路专项优化 | 待实现 | 重点缓解解压 total 受主机回读影响的问题。 |
+| NVIDIA 参数自动调谐 | 待实现 | 当前仍沿用通用并发与阈值策略。 |
+| NVIDIA 专项 kernel 分支 | 待实现 | 暂无仅 NVIDIA 的独立实现分支。 |
 
-### C. 当前摘要
+### 3. 测试结果与分析
 
-1. post-mod 在 kernel 侧有明显提升；
-2. total 提升幅度受 host/runtime 约束；
-3. 后续仍需针对 readback/组装路径做专项优化。
+#### 3.1 工件与口径
+
+- LZO GPU 基线：`lzo-2.10/exp_results/baseline/gpu_only_default/runs/20260405_055830/lzo_param_sweep.csv`
+- 对位迭代（LZ4 GPU）：`lz4/exp_results/baseline/gpu_only_default/runs/20260406_044539/lz4_param_sweep.csv`
+- 聚合结果：`lz4/exp_results/baseline/cross_compare_lzo_lz4_20260406.json`
+- 文件级差异：`lz4/exp_results/baseline/cross_compare_lzo_lz4_filelevel_20260406.json`
+
+#### 3.2 均值/中位数统计（LZO GPU vs LZ4 GPU）
+
+| 指标 | LZO GPU (mean / median) | LZ4 GPU (mean / median) | Δ(LZ4 vs LZO) |
+| --- | ---: | ---: | ---: |
+| 压缩总吞吐 `CompTotalMBs` | 3396.82 / 3454.65 | 6453.26 / 4950.95 | +89.98% |
+| 解压总吞吐 `DecTotalMBs` | 17736.27 / 13840.47 | 14950.40 / 11368.58 | -15.71% |
+| 压缩率 `Ratio%` | 27.48 / 21.60 | 28.62 / 22.82 | +4.13% |
+| 压缩功率 `CompPower(W)` | 36.35 / 36.35 | 68.98 / 69.12 | +89.79%（LZ4 劣化） |
+| 压缩能效 `CompEff` | 93.71 / 95.03 | 93.83 / 70.76 | +0.13% |
+| 解压能效 `DecEff` | 489.96 / 374.44 | 217.29 / 167.43 | -55.65% |
+
+#### 3.3 按文件差异（50 文件，avg/pos/neg 与负向幅度）
+
+> 口径：`score>0` 为更优（吞吐/压缩率/能效越大越好；功率越小越好）。
+
+| 指标 | avg_score | 正向文件 | 负向文件 | 最差负向幅度（文件） |
+| --- | ---: | ---: | ---: | --- |
+| 压缩总吞吐 `CompTotal` | +62.69% | 40 | 10 | -23.53%（`x-ray`） |
+| 解压总吞吐 `DecTotal` | -8.77% | 14 | 36 | -32.88%（`elasticsearch-ycsb__migrate__parent_2__pages-1.img`） |
+| 压缩率 `Ratio` | +5.45% | 45 | 5 | -4.76%（`x-ray`） |
+| 压缩能效 `CompEff` | -14.32% | 14 | 36 | -59.16%（`x-ray`） |
+| 解压能效 `DecEff` | -51.94% | 0 | 50 | -63.97%（`elasticsearch-ycsb__migrate__parent_2__pages-1.img`） |
+| 压缩功率 `CompPower` | -89.84% | 0 | 50 | +93.41% 功率上升（`influxdb-bench_cartelem__migrate__parent_1__pages-1.img`） |
+
+### 4. 总结与未来方向
+
+1. **LZO 当前优势**：解压 total 与解压能效在 dGPU 对位中仍领先，且功率更低。
+2. **LZO 当前短板**：压缩 total 与压缩率弱于对位 LZ4，需要进一步提升压缩路径兑现率。
+3. **迭代比较结论**：按“上一版(LZO) -> 当前对位(LZ4)”口径，优势集中在压缩 throughput，劣化集中在功率与解压能效。
+4. **后续方向**：围绕 NVIDIA 回读/组装链路与压缩并发策略做专项优化，在维持功率优势前提下补齐压缩侧短板。

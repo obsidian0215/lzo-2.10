@@ -14,6 +14,7 @@ typedef struct {
     unsigned long gpu_kernel_us;    /* GPU kernel execution time */
     unsigned long cpu_kernel_us;    /* CPU worker execution time */
     unsigned long total_us;         /* Wall-clock total (incl. host overhead) */
+    unsigned long ocl_setup_us;
     unsigned long file_read_us;
     unsigned long file_write_us;
     unsigned long upload_us;

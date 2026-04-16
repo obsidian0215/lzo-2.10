@@ -143,10 +143,29 @@ make OS=Windows_NT CC=gcc \
 
 ## 8. 环境变量
 
-- `FORCE_OPENCL_DEVICE=GPU|CPU|DEFAULT|ALL`
-- `LZO_STANDARD_COPY=0|1`
+`lzo_hybrid` 的 GPU 子路径复用 `lzo_gpu` 运行时，因此以下变量会影响 hybrid 内的 GPU 段行为：
 
-建议在批量实验中固定环境变量并随结果工件一起记录。
+| 变量 | 取值 / 默认 | 作用范围 |
+| --- | --- | --- |
+| `FORCE_OPENCL_DEVICE` | `GPU`(默认) / `CPU` / `DEFAULT` / `ALL` | OpenCL 设备选择 |
+| `LZO_STANDARD_COPY` | `auto` / `0` / `1` | host-device 传输路径 |
+| `LZO_PIPELINE_ENABLE` | `0/1`（默认 `0`） | 启用 GPU chunked pipeline 压缩路径 |
+| `LZO_PIPELINE_OVERLAP_ENABLE` | `0/1`（默认 `0`） | 仅在 pipeline + standard-copy 下启用 upload/compute overlap |
+| `LZO_PIPELINE_THRESHOLD_MB` | 整数 MB（默认 `64`） | pipeline 触发最小输入大小 |
+| `LZO_PIPELINE_CHUNK_BLOCKS` | 正整数（默认 `512`） | pipeline chunk block 数 |
+| `LZO_PIPELINE_ENTROPY_ENABLE` | `0/1`（默认 `0`） | entropy gate 开关 |
+| `LZO_PIPELINE_ENTROPY_SAMPLE_KB` | 正整数 KB（默认 `256`） | 熵采样窗口 |
+| `LZO_PIPELINE_ENTROPY_MAX` | 浮点（默认 `7.60`） | 熵门限 |
+| `LZO_GPU_ENABLE_COMPACTION` | `0/1`（默认 `0`） | 开启 GPU 侧 compaction |
+| `LZO_GPU_FORCE_COMPACTION` | `0/1`（默认空） | 强制 compaction 开/关 |
+
+重点说明：
+
+- `pipeline` 指的是“按 chunk 分段推进的压缩执行路径”；
+- `pipeline-overlap` 指的是“pipeline 路径里上传下一段与当前 kernel 执行重叠”；
+- overlap 只有在 `LZO_PIPELINE_ENABLE=1` 且 `LZO_STANDARD_COPY=1` 时才有效。
+
+建议在批量实验中固定环境变量，并在结果工件中完整记录。
 
 ## 9. 复现实验建议
 

@@ -78,7 +78,30 @@ LZO_STANDARD_COPY=1 ./lzo_gpu --bench 3 -B 64K file
 - `0`: map/zero-copy 优先（统一内存设备常用）
 - `1`: standard host->device copy
 
-当前主线仅保留以上两类环境控制（设备选择与 host 内存拷贝模式）。
+### Pipeline 与 pipeline-overlap（重点）
+
+- `LZO_PIPELINE_ENABLE=1`：开启 **chunked pipeline 压缩路径**（按 chunk 分段推进）。
+- `LZO_PIPELINE_OVERLAP_ENABLE=1`：在 pipeline 路径上尝试 upload/compute overlap。
+- 生效前提：`LZO_PIPELINE_ENABLE=1` **且** `LZO_STANDARD_COPY=1`。
+  - 如果 `LZO_STANDARD_COPY=0`（map/zero-copy），overlap 开关会退化为无效。
+
+### Environment variables（完整速查）
+
+| 变量 | 取值 / 默认 | 作用 |
+| --- | --- | --- |
+| `FORCE_OPENCL_DEVICE` | `GPU`(默认) / `CPU` / `DEFAULT` / `ALL` | 指定 OpenCL 设备优先级 |
+| `LZO_STANDARD_COPY` | `auto`(默认) / `0` / `1` | host 与 device 之间的数据读写方式 |
+| `LZO_GPU_ENABLE_COMPACTION` | `0/1`（默认 `0`） | 启用 device-side compaction/pack 路径 |
+| `LZO_GPU_FORCE_COMPACTION` | `0/1`（默认空） | 强制关闭/开启 compaction，覆盖自适应门控 |
+| `LZO_PIPELINE_ENABLE` | `0/1`（默认 `0`） | 启用 chunked pipeline 压缩路径 |
+| `LZO_PIPELINE_OVERLAP_ENABLE` | `0/1`（默认 `0`） | 启用 pipeline 的 upload/compute overlap（仅 `LZO_PIPELINE_ENABLE=1` 且 standard-copy 生效） |
+| `LZO_PIPELINE_THRESHOLD_MB` | 整数 MB（默认 `64`） | pipeline 启动的最小输入大小 |
+| `LZO_PIPELINE_CHUNK_BLOCKS` | 正整数（默认 `512`） | 每个 pipeline chunk 的 block 数 |
+| `LZO_PIPELINE_ENTROPY_ENABLE` | `0/1`（默认 `0`） | 启用 entropy gate，按样本熵决定是否走 pipeline |
+| `LZO_PIPELINE_ENTROPY_SAMPLE_KB` | 正整数 KB（默认 `256`） | 熵采样窗口大小 |
+| `LZO_PIPELINE_ENTROPY_MAX` | 浮点（默认 `7.60`） | 熵门限，超过则回退非 pipeline |
+
+建议：实验报告必须记录完整环境变量快照（尤其是 `LZO_PIPELINE_ENABLE` 与 `LZO_PIPELINE_OVERLAP_ENABLE`）。
 
 ## Current implementation notes
 

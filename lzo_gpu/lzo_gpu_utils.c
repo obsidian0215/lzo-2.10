@@ -727,51 +727,6 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
         }
     }
 
-    /* Try generic binary <alg>.clbin when bits-specific not used or failed */
-    if (allow_clbin && bits > 0) {
-        char bin_name[128]; snprintf(bin_name, sizeof(bin_name), "%s.clbin", base_name);
-        char resolved_bin[PATH_MAX];
-        if (lzo_find_file_path(bin_name, resolved_bin, sizeof(resolved_bin)) == 0) {
-            if (!(source_path_for_stale_ok && lzo_source_is_newer_than_binary(source_path_for_stale, resolved_bin))) {
-                FILE* fb = fopen(resolved_bin, "rb");
-                if (fb) {
-                    fseek(fb, 0, SEEK_END);
-                    long bsz = ftell(fb);
-                    fseek(fb, 0, SEEK_SET);
-                    unsigned char* bin = malloc(bsz);
-                    if (bin && fread(bin, 1, bsz, fb) == (size_t)bsz) {
-                        cl_int binary_status;
-                        prog = clCreateProgramWithBinary(ctx, 1, &dev, (const size_t*)&bsz,
-                                                        (const unsigned char**)&bin, &binary_status, &err);
-                        if (err == CL_SUCCESS && binary_status == CL_SUCCESS) {
-                            const char *opts = "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable";
-                            err = clBuildProgram(prog, 1, &dev, opts, NULL, NULL);
-                            if (err == CL_SUCCESS && lzo_validate_program_kernels(prog, source_alg_name, bits, decomp_only)) {
-                                if (build_log) build_log[0] = '\0';
-                                free(bin); fclose(fb); return prog;
-                            } else {
-                                size_t log_sz = 0; clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
-                                if (log_sz && build_log) {
-                                    size_t toread = (log_sz < build_log_len - 1) ? log_sz : build_log_len - 1;
-                                    char *tmp = malloc(toread + 1);
-                                    clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, toread, tmp, NULL);
-                                    tmp[toread] = '\0';
-                                    snprintf(build_log, build_log_len, "Binary build log: %s", tmp);
-                                    free(tmp);
-                                } else if (build_log) {
-                                    snprintf(build_log, build_log_len, "Binary build failed or missing kernels (err=%d)", (int)err);
-                                }
-                                clReleaseProgram(prog); prog = NULL;
-                            }
-                        }
-                    }
-                    if (bin) free(bin);
-                    fclose(fb);
-                }
-            }
-        }
-    }
-
     /* Fallback: compile from unified source.
      * We map both "lzo1x" and "lzo1x_decomp" to lzo1x(.debug).cl,
      * same for lzo1y, so compression/decompression stay in one source unit.

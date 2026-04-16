@@ -1,31 +1,5 @@
 # LZO GPU 优化路线（可读版）
 
-## Wave-0 噪声阈值（G1 门禁，2026-04-06）
-
-测量口径
-
-- 样本目录：`/root/samples_subset`
-- 重复次数：`3`
-- 单轮时长：`bench_seconds=3.5`
-- 代表配置：`GPU-only, block=64K, local=1, level=15, alg=lzo1x,lzo1y`
-- 阈值公式：`|Δ| > max(1.5×MAD, P95(|noise_delta|))`
-- 判定方向：`CompTotalMBs`、`DecTotalMBs`、`Ratio%` 均按“越大越好”；`Δ <= -threshold_abs` 记为明显回退，`Δ >= threshold_abs` 记为明显提升。
-- 阈值工件：`/root/lzo-2.10/exp_results/noise_profiles/g1/thresholds/lzo_gpu.json`
-
-当前门禁阈值（LZO GPU）
-
-- `CompTotalMBs(mean)`：`threshold_abs=0.0857 MB/s`
-- `CompTotalMBs(median)`：`threshold_abs=0.6600 MB/s`
-- `DecTotalMBs(mean)`：`threshold_abs=1.0593 MB/s`
-- `DecTotalMBs(median)`：`threshold_abs=0.1425 MB/s`
-- `Ratio%(mean)`：`threshold_abs=0.0000 pctpt`
-- `Ratio%(median)`：`threshold_abs=0.0000 pctpt`
-
-说明
-
-- 以上阈值用于当前 Wave-0 的 subset/fullset 采纳门禁；若后续切换配置空间或计时口径，需要重新测量并覆盖本节。
-- `Ratio%` 阈值为 `0` 表示噪声测量中几乎无抖动，后续仍按“均值+中位数双判 + 全样本10轮”执行。
-
 ## 全集基线结果（当前保留）
 
 - 基线全集目录：`/root/lzo-2.10/exp_results/runs/fullset_allcfg_current_lzo/runs/20260403_140710`

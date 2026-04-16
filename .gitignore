@@ -59,6 +59,10 @@ lzo_cpu/lzo_cpu
 lzo_gpu/lzo_gpu
 samples/
 lzo_gpu/build_kernel
+lzo_gpu/variant_validation/nvidia/
+lzo_gpu/variant_validation/intel/
+lzo_hybrid/variant_validation/nvidia/
+lzo_hybrid/variant_validation/intel/
 lzo_debug/
 
 exp_results/

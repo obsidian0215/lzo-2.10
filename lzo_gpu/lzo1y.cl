@@ -36,12 +36,6 @@ typedef __generic unsigned int *  lzo_uintp;
 /* Standard macros */
 #define LZO_BYTE(x)       ((unsigned char) (x))
 
-#define LZO_MAX(a,b)        ((a) >= (b) ? (a) : (b))
-#define LZO_MIN(a,b)        ((a) <= (b) ? (a) : (b))
-
-#define lzo_sizeof(type)    ((lzo_uint) (sizeof(type)))
-#define DMUL(a,b)           ((lzo_xint) ((a) * (b)))
-
 /* OpenCL 2.0 Generic Memory Access */
 #define lzo_memops_TU0p __generic void *
 #define lzo_memops_TU1p __generic unsigned char *
@@ -55,29 +49,6 @@ typedef __generic unsigned int *  lzo_uintp;
     LZO_BLOCK_BEGIN \
     *(lzo_memops_set_TU1p) (lzo_memops_TU0p) (dd) = LZO_BYTE(cc); \
     LZO_BLOCK_END
-
-#define LZO_MEMOPS_COPY1(dd,ss)   *((__generic uchar *)(dd)) = *((__generic const uchar *)(ss))
-#define LZO_MEMOPS_COPY2(dd,ss)   *((__generic ushort*)(dd)) = *((__generic const ushort*)(ss))
-
-static inline void LZO_MEMOPS_COPY4(__generic void *dd, const __generic void *ss)
-{
-    if (lzo_ptr_aligned(dd,4) && lzo_ptr_aligned(ss,4))
-        *((__generic uint*)dd) =  *((__generic const uint*)ss);
-    else {
-        uchar4 v = vload4(0, (__generic const uchar*)ss);
-        vstore4(v,0,(__generic uchar*)dd);
-    }
-}
-
-static inline void LZO_MEMOPS_COPY8(__generic void *dd, const __generic void *ss)
-{
-    if (lzo_ptr_aligned(dd,8) && lzo_ptr_aligned(ss,8))
-        *((__generic ulong*)dd) = *((__generic const ulong*)ss);
-    else {
-        uchar8 v = vload8(0, (__generic const uchar*)ss);
-        vstore8(v,0,(__generic uchar*)dd);
-    }
-}
 
 static inline void LZO_MEMOPS_COPYN_FAST(__generic void *dd, const __generic void *ss, uint nn)
 {
@@ -166,20 +137,10 @@ static inline uint lzo1y_hash32(uint dv)
     return dv;
 }
 
-static inline uint lzo1y_hash32_alt(uint dv)
-{
-    dv ^= dv >> 11;
-    dv *= 0x85ebca6bu;
-    dv ^= dv >> 13;
-    return dv;
-}
-
 #define DINDEX(dv,p)        ((lzo1y_hash32(dv)) >> (32 - D_BITS))
-#define DINDEX_ALT(dv,p)    ((lzo1y_hash32_alt(dv)) >> (32 - D_BITS))
 /* 32-bit packed dictionary: epoch_12 (bits 31:20) | offset_20 (bits 19:0) */
 #define DICT_EPOCH_SHIFT 20
 #define DICT_OFF_MASK    0x000FFFFFu
-#define DICT_EPOCH_MASK  0xFFF00000u
 
 static inline void dict_store32(__global uint* dict, uint idx, uint offset, uint epoch)
 {
@@ -298,14 +259,8 @@ lzo1y_compress_core(__generic const lzo_bytep in , lzo_uint  in_len,
             dv = UA_GET_LE32(ip);
             lzo_uint ip_off = pd(ip, in);
             dindex = DINDEX(dv,ip);
-            lzo_uint dindex_alt = DINDEX_ALT(dv,ip);
             uint valid = 0;
-            uint valid_alt = 0;
-            uint m_off_alt = 0;
             m_off = dict_load32(dict, dindex, epoch, &valid);
-            if (dindex_alt != dindex) {
-                m_off_alt = dict_load32(dict, dindex_alt, epoch, &valid_alt);
-            }
             if (valid && m_off != 0) {
                 if (ip_off > m_off && (ip_off - m_off) <= M4_MAX_OFFSET) {
                     m_pos = in + m_off;
@@ -315,19 +270,7 @@ lzo1y_compress_core(__generic const lzo_bytep in , lzo_uint  in_len,
                     }
                 }
             }
-            if (valid_alt && m_off_alt != 0) {
-                if (ip_off > m_off_alt && (ip_off - m_off_alt) <= M4_MAX_OFFSET) {
-                    m_pos = in + m_off_alt;
-                    if (dv == UA_GET_LE32(m_pos)) {
-                        saved_dindex = dindex_alt;
-                        goto match_found;
-                    }
-                }
-            }
-            {
-                uint store_idx = (((ip_off >> 3) & 1u) && dindex_alt != dindex) ? dindex_alt : dindex;
-                dict_store32(dict, store_idx, (uint)ip_off, epoch);
-            }
+            dict_store32(dict, dindex, (uint)ip_off, epoch);
             goto literal;
         }
 
@@ -580,12 +523,6 @@ static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos,
             if (len) *op++ = p0;
             return;
         }
-        if (offset == 3) {
-            uchar p0 = m_pos[0], p1 = m_pos[1], p2 = m_pos[2];
-            while (len >= 3) { *op++ = p0; *op++ = p1; *op++ = p2; len -= 3; }
-            if (len == 2) { *op++ = p0; *op++ = p1; } else if (len == 1) { *op++ = p0; }
-            return;
-        }
         if (offset == 4) {
             uchar p0 = m_pos[0], p1 = m_pos[1], p2 = m_pos[2], p3 = m_pos[3];
             uchar16 v16 = (uchar16)(p0, p1, p2, p3, p0, p1, p2, p3, p0, p1, p2, p3, p0, p1, p2, p3);
@@ -725,12 +662,7 @@ lzo1y_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
         copy_match:
             {
                 uint mlen = t + 2;
-                uint moff = (uint)(op - m_pos);
-                if (moff >= mlen) {
-                    UA_COPYN(op, m_pos, mlen);
-                } else {
-                    COPY_MATCH(op, m_pos, mlen);
-                }
+                COPY_MATCH(op, m_pos, mlen);
                 op += mlen;
             }
         match_done:

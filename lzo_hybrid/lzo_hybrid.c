@@ -17,6 +17,12 @@
 #define PATH_MAX 4096
 #endif
 
+#if defined(__GNUC__)
+#define HYBRID_UNUSED __attribute__((unused))
+#else
+#define HYBRID_UNUSED
+#endif
+
 #include "../lzo_gpu/lzo_defaults.h"
 #include "../lzo_gpu/lzo_gpu_utils.h"
 #include "lzo_hybrid_core.h"
@@ -52,7 +58,7 @@ static long get_online_cpu_count(void) {
 #endif
 }
 
-static size_t parse_size_bytes_soft(const char* s) {
+static size_t HYBRID_UNUSED parse_size_bytes_soft(const char* s) {
     char* endptr = NULL;
     size_t val;
     if (!s || !*s) return 0;
@@ -202,7 +208,6 @@ static void show_help(const char* prog) {
     fprintf(stderr, "  --gpu-ratio F        GPU block fraction 0.0-1.0 (default: 0.8)\n");
     fprintf(stderr, "  --adaptive           Enable adaptive per-file CPU/GPU split\n");
     fprintf(stderr, "  --sample-blocks N    Adaptive sample block count (default: 8)\n");
-    fprintf(stderr, "  --split-prefix       Use contiguous prefix split (default, low host overhead)\n");
     fprintf(stderr, "  --bench [SECONDS]    Benchmark mode (compress+decompress+verify)\n");
     fprintf(stderr, "  input '-'            Read input from stdin\n");
     fprintf(stderr, "  output '-'           Write output to stdout\n");
@@ -210,9 +215,44 @@ static void show_help(const char* prog) {
     fprintf(stderr, "Environment knobs:\n");
     fprintf(stderr, "  FORCE_OPENCL_DEVICE=GPU|CPU|DEFAULT|ALL   OpenCL device selection\n");
     fprintf(stderr, "  LZO_STANDARD_COPY=0|1                      Host-memory copy mode (0=map/zero-copy, 1=standard copy)\n");
-    fprintf(stderr, "  Prefix index-less fast path uses deterministic policy (compress=off, decompress=on)\n");
+    fprintf(stderr, "  LZO_HYBRID_FORCE_DEBUG=1                   Enable internal adaptive model debug logs\n");
     fprintf(stderr, "  -v, --verbose        Verbose output\n");
     fprintf(stderr, "  -h, --help           Show this help\n");
+}
+
+static void print_hybrid_time_row(FILE* msg, const char* label, unsigned long us, unsigned long total_us) {
+    double ms;
+    double pct;
+    if (!msg || !label) return;
+    ms = (double)us / 1000.0;
+    pct = (total_us > 0) ? (100.0 * (double)us / (double)total_us) : 0.0;
+    fprintf(msg, "  %-18s : %10.3f ms (%6.2f%%)\n", label, ms, pct);
+}
+
+static void print_hybrid_verbose_timing(FILE* msg, const hybrid_timing_t* timing) {
+    unsigned long parallel_us;
+    unsigned long total_us;
+    unsigned long host_overhead_us;
+
+    if (!msg || !timing) return;
+
+    parallel_us = timing->gpu_kernel_us;
+    if (timing->cpu_kernel_us > parallel_us) parallel_us = timing->cpu_kernel_us;
+
+    total_us = timing->total_us;
+    if (total_us < parallel_us) total_us = parallel_us;
+    host_overhead_us = (total_us > parallel_us) ? (total_us - parallel_us) : 0;
+
+    print_hybrid_time_row(msg, "File Read", timing->file_read_us, total_us);
+    print_hybrid_time_row(msg, "OCI Setup", timing->ocl_setup_us, total_us);
+    print_hybrid_time_row(msg, "Data Upload", timing->upload_us, total_us);
+    print_hybrid_time_row(msg, "GPU Kernel", timing->gpu_kernel_us, total_us);
+    print_hybrid_time_row(msg, "CPU Kernel", timing->cpu_kernel_us, total_us);
+    print_hybrid_time_row(msg, "Parallel Span", parallel_us, total_us);
+    print_hybrid_time_row(msg, "Data Download", timing->download_us, total_us);
+    print_hybrid_time_row(msg, "File Write", timing->file_write_us, total_us);
+    print_hybrid_time_row(msg, "Host Overhead", host_overhead_us, total_us);
+    fprintf(msg, "  %-18s : %10.3f ms\n", "TOTAL INCLUSIVE", (double)total_us / 1000.0);
 }
 
 int main(int argc, char** argv) {
@@ -304,6 +344,7 @@ int main(int argc, char** argv) {
             continue;
         }
         if (strcmp(arg, "--split-prefix") == 0) {
+            /* Deprecated: accepted for backward compatibility. */
             continue;
         }
         if (strcmp(arg, "--sample-blocks") == 0) {
@@ -332,6 +373,12 @@ int main(int argc, char** argv) {
 
     if (gpu_ratio < 0.0) gpu_ratio = 0.0;
     if (gpu_ratio > 1.0) gpu_ratio = 1.0;
+    {
+        const char* env_dbg = getenv("LZO_HYBRID_FORCE_DEBUG");
+        if (env_dbg && *env_dbg && strcmp(env_dbg, "0") != 0) {
+            debug = 1;
+        }
+    }
     if (cpu_threads <= 0) {
         long n = get_online_cpu_count();
         cpu_threads = (n > 0) ? (int)n : 4;
@@ -422,6 +469,7 @@ int main(int argc, char** argv) {
     }
 
     uint64_t t0 = now_ns();
+    unsigned long ocl_setup_us = 0;
 
     char build_log[8192] = {0};
     cl_program comp_prog = NULL;
@@ -434,10 +482,12 @@ int main(int argc, char** argv) {
     if (adaptive_skip_ocl) use_opencl = 0;
     if (decomp_skip_ocl) use_opencl = 0;
     if (use_opencl) {
+        uint64_t t_ocl0 = now_ns();
         if (ocl_init() != 0) {
             fprintf(stderr, "Error: OpenCL initialization failed\n");
             return 1;
         }
+        ocl_setup_us = (unsigned long)((now_ns() - t_ocl0) / 1000ULL);
 
         if (lzo_load_comp_kernel(g_ctx, g_dev, alg_name, comp_level, debug,
                                  &comp_prog, &comp_krn, &kernel_has_dbg,
@@ -529,6 +579,8 @@ int main(int argc, char** argv) {
                                effective_in_path, effective_output_path, &params, &ws, &timing);
         uint64_t t1 = now_ns();
         if (rc == 0) {
+            timing.ocl_setup_us = ocl_setup_us;
+            timing.total_us = (unsigned long)((t1 - t0) / 1000ULL);
             FILE* msg = output_to_stdout ? stderr : stdout;
             fprintf(msg,
                     "%s : decompressed in %.2f ms (gpu_blocks=%zu cpu_blocks=%zu)\n",
@@ -537,12 +589,7 @@ int main(int argc, char** argv) {
                     timing.gpu_blocks,
                     timing.cpu_blocks);
             if (verbose) {
-                fprintf(msg,
-                        "  gpu_kernel=%lu us  cpu_kernel=%lu us  upload=%lu us  download=%lu us\n",
-                        timing.gpu_kernel_us,
-                        timing.cpu_kernel_us,
-                        timing.upload_us,
-                        timing.download_us);
+                print_hybrid_verbose_timing(msg, &timing);
             }
         }
     } else {
@@ -554,6 +601,8 @@ int main(int argc, char** argv) {
                              effective_in_path, effective_output_path, &params, &ws, &timing);
         uint64_t t1 = now_ns();
         if (rc == 0) {
+            timing.ocl_setup_us = ocl_setup_us;
+            timing.total_us = (unsigned long)((t1 - t0) / 1000ULL);
             FILE* msg = output_to_stdout ? stderr : stdout;
             double ratio = (double)timing.in_size / (timing.out_size > 0 ? (double)timing.out_size : 1.0);
             fprintf(msg,
@@ -566,12 +615,7 @@ int main(int argc, char** argv) {
                     timing.gpu_blocks,
                     timing.cpu_blocks);
             if (verbose) {
-                fprintf(msg,
-                        "  gpu_kernel=%lu us  cpu_kernel=%lu us  upload=%lu us  download=%lu us\n",
-                        timing.gpu_kernel_us,
-                        timing.cpu_kernel_us,
-                        timing.upload_us,
-                        timing.download_us);
+                print_hybrid_verbose_timing(msg, &timing);
             }
         }
     }
