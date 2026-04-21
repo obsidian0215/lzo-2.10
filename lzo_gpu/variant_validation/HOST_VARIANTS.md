@@ -1,31 +1,35 @@
-# LZO GPU 主机端变体记录
+# LZO GPU 主机端变体账本
 
-更新时间：2026-04-16
+更新时间：2026-04-20
 
-## 1. 使用约定
+## 当前已采纳基线
 
-- 本文件登记 `lzo_gpu` 的 `host` 组件；
-- 正式主判据必须来自 **7~9 次 manual roundtrip** 的分段时间，而不是 `bench` 总吞吐；
-- 主机端条目仍需按 `vendor -> stage -> operation` 归类。
-- 正式 host 变体只聚焦 **steady-state 主机路径**：`pipeline`、`standard_copy / mapped`、`pack / compaction`；
-- `metadata / header` 修补、`telemetry`、bench-only 采样与日志开关，只计为**修正 / hygiene**，不单列为正式 host 变体条目。
-- host 变体目录必须附带 **program/source record bundle**：可执行程序、源码文件列表、构建说明、环境开关与补丁摘要缺一不可。
-- `hash_table_overhead` 作为特殊轴时，必须在 `buffer_lifecycle` 建账，并与 `KERNEL_VARIANTS.md` 的同轴条目交叉引用。
+- 名称：`intel_lzo_gpu_lzo1x_d14_baseline_lock`
+- 适用：`lzo1x`, `D_BITS=14`
+- 默认 host 路径：Intel 设备走 `mapped/zero-copy`（`LZO_STANDARD_COPY=0`）
+- 当前实现要点：
+  - grow-only workspace buffer 复用
+  - 压缩/解压共用 `standard_copy` / `mapped` 双通路
+  - manual 统计中可拆出 `buffer alloc/upload/download` 分段时间
+- 证据：`intel/records/host/intel_lzo_gpu_lzo1x_d14_baseline_lock.md`
+- 结论：`adopt`
 
-## 2. NVIDIA
+## 当前 Intel 候选
 
-| stage | operation | variant_id | 状态 | 说明 |
-| --- | --- | --- | --- | --- |
-| `buffer_lifecycle` | `hash_table_overhead` | `hash_table_overhead_ab` | `pending` | **[special-axis]** 记录 dictionary/hash table buffer 容量、slot 管理、alloc/reuse 策略对 alloc/upload/download 与显存占用的影响；需同步回写 `KERNEL_VARIANTS.md`。 |
-| `host_device_transfer` | `standard_copy_vs_mapped` | `host_transfer_mode_ab` | `pending` | 对比 `LZO_STANDARD_COPY=1` 与 map/unmap 路径，确认 steady-state upload/download/readback 的真实收益。 |
-| `dispatch_sync` | `pipeline_overlap` | `host_pipeline_overlap_ab` | `pending` | 只记录会改变 steady-state 提交/重叠路径的 pipeline 变体；bench-only 辅助开关不建正式条目。 |
-| `host_feature` | `pack_gate` | `host_pack_gate_ab` | `pending` | 记录 `pack/compaction` 是否启用、启用条件与回退门限；`metadata` / `telemetry` 修正不并入此条。 |
+1. `intel_lzo_gpu_lzo1x_d14_standard_copy_r1`
+   - 阶段：`host_device_transfer`
+   - 操作：`standard_copy_vs_mapped`
+   - 动机：对 Intel 平台正式确认“mapped 默认”是否优于强制 `standard copy`。
+   - 证据：`intel/records/host/intel_lzo_gpu_lzo1x_d14_standard_copy_r1.md`
+  - 当前状态：`reject`
 
-## 3. Intel
+## Intel 已拒绝项
 
-| stage | operation | variant_id | 状态 | 说明 |
-| --- | --- | --- | --- | --- |
-| `buffer_lifecycle` | `hash_table_overhead` | `hash_table_overhead_ab` | `pending` | **[special-axis]** 待补 Intel/Linux 侧 dictionary/hash table buffer 容量与管理开销结果，并与 kernel 侧同名条目对位。 |
-| `host_device_transfer` | `standard_copy_vs_mapped` | `host_transfer_mode_ab` | `pending` | 待补 Intel/Linux 侧 `standard_copy / mapped` 对位结果。 |
-| `dispatch_sync` | `pipeline_overlap` | `host_pipeline_overlap_ab` | `pending` | 待补 Intel/Linux 侧 pipeline steady-state 路径结果。 |
-| `host_feature` | `pack_gate` | `host_pack_gate_ab` | `pending` | 待补 Intel/Linux 侧 pack/compaction 门控结果。 |
+1. `intel_lzo_gpu_lzo1x_d14_standard_copy_r1`
+  - 结果：`reject`
+  - 原因：`comp_total_no_oci_tp_mbs` 与 `dec_total_no_oci_tp_mbs` 都是 10/10 全负向，`bench_dec_kernel_mbs` 也是 10/10 全负向；Intel 默认继续保持 `mapped/zero-copy`。
+
+## 记账边界
+
+- 仅记录会改变 steady-state 数据路径的 host 变体。
+- `metadata/header` 修补、日志、telemetry、bench-only 统计开关默认不作为正式 host 变体。

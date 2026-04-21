@@ -4,6 +4,7 @@
 #endif
 
 #include "lzo_gpu.h"
+#include "lzo_gpu_debug.h"
 
 /* LZO1X Unified Kernel
  * Supports variable dictionary sizes via D_BITS macro.
@@ -175,7 +176,7 @@ static inline uint dict_load32(__global const uint* dict, uint idx, uint epoch, 
 static lzo_uint
 lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
                    LZO_ADDR_GLOBAL lzo_bytep out, lzo_uintp out_len,
-                    lzo_uint ti, __global uint *dict, uint epoch)
+                    lzo_uint ti, __global uint *dict, uint epoch LZO_COMP_DBG_ARGS)
 {
     LZO_ADDR_GLOBAL const lzo_bytep ip;
     LZO_ADDR_GLOBAL lzo_bytep op;
@@ -217,55 +218,108 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
                 uint off2 = dict_load32(dict, idx_a.s2, epoch, &valid2);
                 uint off3 = dict_load32(dict, idx_a.s3, epoch, &valid3);
 
+                LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_SEARCH_ITERS, 4u);
+                LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_DICT_LOOKUPS, 4u);
+
                 // Check position 0
+                if (valid0 && off0 != 0) {
+                    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_EPOCH_VALID_HITS, 1u);
+                } else if (!valid0 && off0 != 0) {
+                    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_EPOCH_MISMATCH_MISS, 1u);
+                    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_MATCH_MISS_AFTER_EPOCH_MISMATCH, 1u);
+                }
                 if (valid0 && off0 != 0 && ip_off > off0 && (ip_off - off0) <= M4_MAX_OFFSET) {
                     m_pos = in + off0;
                     if (dvs_a.s0 == UA_GET_LE32(m_pos)) {
                         dv = dvs_a.s0; saved_dindex = idx_a.s0;
+                        LZO_DBG_COMP_NOTE_STORE(dbg_stats, dbg_base, valid0, off0);
                         dict_store32(dict, idx_a.s0, (uint)ip_off, epoch);
                         goto match_found;
                     }
                 }
+                if (valid0 && off0 != 0) {
+                    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_MATCH_MISS_AFTER_VALID_HIT, 1u);
+                }
                 // Check position 1
                 ip++; ip_off++;
+                if (valid1 && off1 != 0) {
+                    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_EPOCH_VALID_HITS, 1u);
+                } else if (!valid1 && off1 != 0) {
+                    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_EPOCH_MISMATCH_MISS, 1u);
+                    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_MATCH_MISS_AFTER_EPOCH_MISMATCH, 1u);
+                }
                 if (valid1 && off1 != 0 && ip_off > off1 && (ip_off - off1) <= M4_MAX_OFFSET) {
                     m_pos = in + off1;
                     if (dvs_a.s1 == UA_GET_LE32(m_pos)) {
                         dv = dvs_a.s1; saved_dindex = idx_a.s1;
+                        LZO_DBG_COMP_NOTE_STORE(dbg_stats, dbg_base, valid0, off0);
                         dict_store32(dict, idx_a.s0, (uint)(ip_off - 1), epoch);
+                        LZO_DBG_COMP_NOTE_STORE(dbg_stats, dbg_base, valid1, off1);
                         dict_store32(dict, idx_a.s1, (uint)ip_off, epoch);
                         goto match_found;
                     }
                 }
+                if (valid1 && off1 != 0) {
+                    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_MATCH_MISS_AFTER_VALID_HIT, 1u);
+                }
                 // Check position 2
                 ip++; ip_off++;
+                if (valid2 && off2 != 0) {
+                    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_EPOCH_VALID_HITS, 1u);
+                } else if (!valid2 && off2 != 0) {
+                    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_EPOCH_MISMATCH_MISS, 1u);
+                    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_MATCH_MISS_AFTER_EPOCH_MISMATCH, 1u);
+                }
                 if (valid2 && off2 != 0 && ip_off > off2 && (ip_off - off2) <= M4_MAX_OFFSET) {
                     m_pos = in + off2;
                     if (dvs_a.s2 == UA_GET_LE32(m_pos)) {
                         dv = dvs_a.s2; saved_dindex = idx_a.s2;
+                        LZO_DBG_COMP_NOTE_STORE(dbg_stats, dbg_base, valid0, off0);
                         dict_store32(dict, idx_a.s0, (uint)(ip_off - 2), epoch);
+                        LZO_DBG_COMP_NOTE_STORE(dbg_stats, dbg_base, valid1, off1);
                         dict_store32(dict, idx_a.s1, (uint)(ip_off - 1), epoch);
+                        LZO_DBG_COMP_NOTE_STORE(dbg_stats, dbg_base, valid2, off2);
                         dict_store32(dict, idx_a.s2, (uint)ip_off, epoch);
                         goto match_found;
                     }
                 }
+                if (valid2 && off2 != 0) {
+                    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_MATCH_MISS_AFTER_VALID_HIT, 1u);
+                }
                 // Check position 3
                 ip++; ip_off++;
+                if (valid3 && off3 != 0) {
+                    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_EPOCH_VALID_HITS, 1u);
+                } else if (!valid3 && off3 != 0) {
+                    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_EPOCH_MISMATCH_MISS, 1u);
+                    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_MATCH_MISS_AFTER_EPOCH_MISMATCH, 1u);
+                }
                 if (valid3 && off3 != 0 && ip_off > off3 && (ip_off - off3) <= M4_MAX_OFFSET) {
                     m_pos = in + off3;
                     if (dvs_a.s3 == UA_GET_LE32(m_pos)) {
                         dv = dvs_a.s3; saved_dindex = idx_a.s3;
+                        LZO_DBG_COMP_NOTE_STORE(dbg_stats, dbg_base, valid0, off0);
                         dict_store32(dict, idx_a.s0, (uint)(ip_off - 3), epoch);
+                        LZO_DBG_COMP_NOTE_STORE(dbg_stats, dbg_base, valid1, off1);
                         dict_store32(dict, idx_a.s1, (uint)(ip_off - 2), epoch);
+                        LZO_DBG_COMP_NOTE_STORE(dbg_stats, dbg_base, valid2, off2);
                         dict_store32(dict, idx_a.s2, (uint)(ip_off - 1), epoch);
+                        LZO_DBG_COMP_NOTE_STORE(dbg_stats, dbg_base, valid3, off3);
                         dict_store32(dict, idx_a.s3, (uint)ip_off, epoch);
                         goto match_found;
                     }
                 }
+                if (valid3 && off3 != 0) {
+                    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_MATCH_MISS_AFTER_VALID_HIT, 1u);
+                }
                 // No match found: batch store all 4 positions
+                LZO_DBG_COMP_NOTE_STORE(dbg_stats, dbg_base, valid0, off0);
                 dict_store32(dict, idx_a.s0, (uint)(ip_off - 3), epoch);
+                LZO_DBG_COMP_NOTE_STORE(dbg_stats, dbg_base, valid1, off1);
                 dict_store32(dict, idx_a.s1, (uint)(ip_off - 2), epoch);
+                LZO_DBG_COMP_NOTE_STORE(dbg_stats, dbg_base, valid2, off2);
                 dict_store32(dict, idx_a.s2, (uint)(ip_off - 1), epoch);
+                LZO_DBG_COMP_NOTE_STORE(dbg_stats, dbg_base, valid3, off3);
                 dict_store32(dict, idx_a.s3, (uint)ip_off, epoch);
 
                 ip++;
@@ -280,7 +334,17 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
             dindex = DINDEX(dv,ip);
             uint valid = 0;
 
+            LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_SEARCH_ITERS, 1u);
+            LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_DICT_LOOKUPS, 1u);
+
             m_off = dict_load32(dict, dindex, epoch, &valid);
+
+            if (valid && m_off != 0) {
+                LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_EPOCH_VALID_HITS, 1u);
+            } else if (!valid && m_off != 0) {
+                LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_EPOCH_MISMATCH_MISS, 1u);
+                LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_MATCH_MISS_AFTER_EPOCH_MISMATCH, 1u);
+            }
 
             if (valid && m_off != 0) {
                 if (ip_off > m_off && (ip_off - m_off) <= M4_MAX_OFFSET) {
@@ -290,8 +354,10 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
                         goto match_found;
                     }
                 }
+                LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_MATCH_MISS_AFTER_VALID_HIT, 1u);
             }
 
+            LZO_DBG_COMP_NOTE_STORE(dbg_stats, dbg_base, valid, m_off);
             dict_store32(dict, dindex, (uint)ip_off, epoch);
 
             goto literal;
@@ -299,10 +365,14 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
 
         match_found:
         /* Match found, continue with match encoding */
+        LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_MATCH_FOUND, 1u);
+        LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_MATCH_OPS, 1u);
         ii -= ti; ti = 0;
         lzo_uint t = pd(ip,ii);
         if (t != 0)
         {
+            LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_LITERAL_BYTES, t);
+            LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_LITERAL_OPS, 1u);
             if (t <= 3)
             {
                 op[-2] = LZO_BYTE(op[-2] | t);
@@ -396,6 +466,8 @@ lzo1x_compress_core(LZO_ADDR_GLOBAL const lzo_bytep in , lzo_uint  in_len,
         }
 m_len_done:
         /* Update dictionary entry with current position */
+        LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_MATCH_BYTES, m_len);
+        LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_DICT_STORES, 1u);
         dict_store32(dict, saved_dindex, (uint)pd(ip, in), epoch);
 
         m_off = pd(ip,m_pos);
@@ -406,11 +478,13 @@ m_len_done:
         uint is_m3 = (m_off <= M3_MAX_OFFSET) & !is_m2;
 
         if (is_m2) {
+            LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_M2_MATCHES, 1u);
             m_off -= 1;
             *op++ = LZO_BYTE(((m_len - 1) << 5) | ((m_off & 7) << 2));
             *op++ = LZO_BYTE(m_off >> 3);
         }
         else if (is_m3) {
+            LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_M3_MATCHES, 1u);
             m_off -= 1;
             if (m_len <= M3_MAX_LEN)
                 *op++ = LZO_BYTE(M3_MARKER | (m_len - 2));
@@ -428,6 +502,7 @@ m_len_done:
             *op++ = LZO_BYTE(m_off >> 6);
         }
         else {
+            LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_M4_MATCHES, 1u);
             m_off -= 0x4000;
             if (m_len <= M4_MAX_LEN)
                 *op++ = LZO_BYTE(M4_MARKER | ((m_off >> 11) & 8) | (m_len - 2));
@@ -476,19 +551,26 @@ static __global uchar* lzo1x_compress_terminate(__global const uchar* ip, uint i
     return op;
 }
 
-static void do_compress(__global const uchar* in, uint in_len, __global uchar* out, lzo_uintp out_len, lzo_uint ti, __global uint *dict, uint epoch)
+static void do_compress(__global const uchar* in, uint in_len, __global uchar* out, lzo_uintp out_len, lzo_uint ti, __global uint *dict, uint epoch LZO_COMP_DBG_ARGS)
 {
     lzo_uint t = ti;
     __global uchar* op = out;
 
     lzo_uint olen = 0;
-    t = lzo1x_compress_core(in, in_len, op, &olen, t, dict, epoch);
+    t = lzo1x_compress_core(in, in_len, op, &olen, t, dict, epoch LZO_COMP_DBG_PASS);
 
     op += olen;
+    if (t > 0) {
+        LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_LITERAL_BYTES, t);
+        LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_LITERAL_OPS, 1u);
+        LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_TAIL_LITERAL_BYTES, t);
+    }
     // Terminate the block
     op = lzo1x_compress_terminate(in + in_len, 0, op, t);
 
     *out_len = (lzo_uint)(op - out);
+    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_INPUT_BYTES, in_len);
+    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_OUTPUT_BYTES, *out_len);
 }
 
 __kernel void lzo1x_block_compress(__global const uchar *in ,
@@ -499,7 +581,12 @@ __kernel void lzo1x_block_compress(__global const uchar *in ,
                                    const uint  worst_blk,
                                    __global uint *dict_pool,
                                    const uint  dict_pool_size,
-                                   const uint  epoch_base)
+                                   const uint  epoch_base
+#if LZO_GPU_DEBUG_COUNTERS_RUNTIME
+                                   , __global uint *dbg_comp,
+                                   const uint  dbg_enabled
+#endif
+                                   )
 {
     const uint wi = get_global_id(0);
     const uint total_wi = get_global_size(0);
@@ -509,6 +596,9 @@ __kernel void lzo1x_block_compress(__global const uchar *in ,
     if (wi >= dict_pool_size) return;
 
     __global uint *dict = dict_pool + ((size_t)wi * dict_elems);
+#if LZO_GPU_DEBUG_COUNTERS_RUNTIME
+    __global uint *dbg_stats = dbg_enabled ? dbg_comp : (__global uint *)0;
+#endif
 
     for (uint b = wi; b < total_blocks; b += total_wi) {
         uint epoch = epoch_base + b + 1u;
@@ -516,20 +606,45 @@ __kernel void lzo1x_block_compress(__global const uchar *in ,
         __global const uchar* ip = in + in_off;
         __global uchar* op = out + b * worst_blk;
         uint in_len = (in_off + blk_size <= in_sz) ? blk_size : (in_sz - in_off);
+#if LZO_GPU_DEBUG_COUNTERS_RUNTIME
+        uint dbg_base = b * LZO_DBG_COMP_N;
+    LZO_DBG_COMP_ADD(dbg_stats, dbg_base, LZO_DBG_COMP_NOSHARE_FASTPATH_BLOCKS, 1u);
+#endif
 
         lzo_uint olen = 0;
-        do_compress(ip, in_len, op, &olen, 0, dict, epoch);
+        do_compress(ip, in_len, op, &olen, 0, dict, epoch LZO_COMP_DBG_PASS);
         out_len[b] = (uint)olen;
     }
 }
 
 /* ---------------- lzo1x decompress ---------------- */
 
+static inline void lzo1x_fast_direct_match_copy_18(__global uchar *op,
+                                                   __global const uchar *m_pos,
+                                                   uint len)
+{
+    uchar8 a = vload8(0, m_pos);
+    uchar8 b = vload8(0, m_pos + 8);
+    vstore8(a, 0, op);
+    vstore8(b, 0, op + 8);
+    if (len > 16u) {
+        op[16] = m_pos[16];
+        if (len > 17u) op[17] = m_pos[17];
+    }
+}
+
 #define M2_MAX_OFFSET 0x0800
 
-static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos, uint len)
+static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos, uint len LZO_DEC_DBG_ARGS)
 {
     uint offset = op - m_pos;
+#if LZO_GPU_DEBUG_COUNTERS_RUNTIME
+    LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_MATCH_OPS, 1u);
+    LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_MATCH_BYTES, len);
+    if (offset <= 4) LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_SMALL_OFFSETS, 1u);
+    if (offset == 0) LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_OUTPUT_ERROR, 1u);
+    if (offset < len) LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_OVERLAP_MATCHES, 1u);
+#endif
     if (offset >= len) {
         UA_COPYN(op, m_pos, len);
         return;
@@ -648,7 +763,7 @@ static inline void COPY_MATCH(__generic uchar *op, __generic const uchar *m_pos,
 static lzo_uint
 lzo1x_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
     LZO_ADDR_GLOBAL lzo_bytep out, lzo_uintp out_len,
-    lzo_voidp wrkmem)
+    lzo_voidp wrkmem LZO_DEC_DBG_ARGS)
 {
     LZO_ADDR_GLOBAL lzo_bytep op = out;
     LZO_ADDR_GLOBAL const lzo_bytep ip = in;
@@ -657,8 +772,13 @@ lzo1x_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
     *out_len = 0;
 
     if (*ip > 17) {
+        LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_TOKENS, 1u);
         t = *ip++ - 17;
         if (t < 4) goto match_next;
+        LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_LITERAL_BYTES, t);
+        LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_LITERAL_OPS, 1u);
+        LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_FIRST_LITERAL_RUN_BYTES, t);
+        LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_FIRST_LITERAL_RUN_OPS, 1u);
         UA_COPYN(op, ip, (uint)t);
         op += t; ip += t;
         goto first_literal_run;
@@ -667,6 +787,7 @@ lzo1x_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
     for (;;) {
 
         t = *ip++;
+        LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_TOKENS, 1u);
         if (t >= 16) goto match;
         if (t == 0) {
             while (*ip == 0) { t += 255; ip++; }
@@ -674,6 +795,8 @@ lzo1x_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
         }
         {
             uint copy_len = (uint)(3 + t);
+            LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_LITERAL_BYTES, copy_len);
+            LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_LITERAL_OPS, 1u);
             UA_COPYN(op, ip, copy_len);
             op += copy_len;
             ip += copy_len;
@@ -684,6 +807,11 @@ lzo1x_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
         m_pos = op - (1 + M2_MAX_OFFSET);
         m_pos -= t >> 2;
         m_pos -= *ip++ << 2;
+        LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_MATCH_OPS, 1u);
+        LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_MATCH_BYTES, 3u);
+        LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_SMALL_OFFSETS, 1u);
+        LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_M2_MATCHES, 1u);
+        if ((uint)(op - m_pos) < 3u) LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_OVERLAP_MATCHES, 1u);
         *op++ = *m_pos++;
         *op++ = *m_pos++;
         *op++ = *m_pos;
@@ -692,10 +820,12 @@ lzo1x_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
         for (;;) {
         match:
             if (t >= 64) {
+                LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_M2_MATCHES, 1u);
                 m_pos = op - 1 - ((t >> 2) & 7) - (*ip++ << 3);
                 t = (t >> 5) - 1;
                 goto copy_match;
             } else if (t >= 32) {
+                LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_M3_MATCHES, 1u);
                 t &= 31;
                 if (t == 0) {
                     while (*ip == 0) {
@@ -717,9 +847,14 @@ lzo1x_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
                 }
                 m_pos -= (ip[0] >> 2) + (ip[1] << 6);
                 ip += 2;
-                if (m_pos == op) goto eof_found;
+                if (m_pos == op) {
+                    LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_EOF_MARKERS, 1u);
+                    goto eof_found;
+                }
+                LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_M4_MATCHES, 1u);
                 m_pos -= 0x4000;
             } else {
+                LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_M2_MATCHES, 1u);
                 m_pos = op - 1 - (t >> 2) - (*ip++ << 2);
                 *op++ = *m_pos++;
                 *op++ = *m_pos;
@@ -728,13 +863,25 @@ lzo1x_decompress(LZO_ADDR_GLOBAL const lzo_bytep in, lzo_uint in_len,
         copy_match:
             {
                 uint mlen = t + 2;
-                COPY_MATCH(op, m_pos, mlen);
+                uint offset = (uint)(op - m_pos);
+                if (offset >= mlen && mlen <= 18u) {
+                    LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_MATCH_OPS, 1u);
+                    LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_MATCH_BYTES, mlen);
+                    if (offset <= 4) LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_SMALL_OFFSETS, 1u);
+                    lzo1x_fast_direct_match_copy_18(op, m_pos, mlen);
+                } else {
+                    COPY_MATCH(op, m_pos, mlen LZO_DEC_DBG_PASS);
+                }
                 op += mlen;
             }
         match_done:
             t = ip[-2] & 3;
             if (t == 0) break;
         match_next:
+            LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_LITERAL_BYTES, t);
+            LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_LITERAL_OPS, 1u);
+            LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_POST_MATCH_LITERAL_BYTES, t);
+            LZO_DBG_DEC_ADD(dbg_stats, dbg_base, LZO_DBG_DEC_POST_MATCH_LITERAL_OPS, 1u);
             *op++ = *ip++;
             if (t > 1) {
                 *op++ = *ip++;
@@ -753,7 +900,11 @@ __kernel void lzo1x_block_decompress(
     __global const uchar* in_buf, __global const uint* off_arr,
     __global const uint* comp_lens,
     __global       uchar* out_buf, __global uint* out_lens,
-    uint blk_sz, uint orig_size, uint nblk)
+    uint blk_sz, uint orig_size, uint nblk
+#if LZO_GPU_DEBUG_COUNTERS_RUNTIME
+    , __global uint* dbg_dec, uint dbg_enabled
+#endif
+    )
 {
     uint gid = get_global_id(0);
     if (gid >= nblk) return;
@@ -761,87 +912,12 @@ __kernel void lzo1x_block_decompress(
     uint in_len = comp_lens[gid];
     uint out_off = gid * blk_sz;
     uint out_len = (out_off + blk_sz <= orig_size) ? blk_sz : (orig_size - out_off);
-    lzo1x_decompress(in_buf + in_off, in_len, out_buf + out_off, &out_len, NULL);
+#if LZO_GPU_DEBUG_COUNTERS_RUNTIME
+    __global uint* dbg_stats = dbg_enabled ? dbg_dec : (__global uint*)0;
+    uint dbg_base = gid * LZO_DBG_DEC_N;
+#endif
+    lzo1x_decompress(in_buf + in_off, in_len, out_buf + out_off, &out_len, NULL LZO_DEC_DBG_PASS);
     if (out_lens) {
         out_lens[gid] = out_len;
-    }
-}
-
-__kernel void lzo_pack_compressed_blocks(__global const uchar* sparse_out,
-                                          __global const uint* block_lens,
-                                          __global uchar* packed_out,
-                                          __global const uint* packed_offsets,
-                                          uint worst_blk,
-                                          uint total_blocks)
-{
-    uint blk = get_group_id(0);
-    uint lane = get_local_id(0);
-    uint lanes = get_local_size(0);
-
-    if (blk >= total_blocks) return;
-
-    {
-        uint len = block_lens[blk];
-        __global const uchar* src = sparse_out + blk * worst_blk;
-        __global uchar* dst = packed_out + packed_offsets[blk];
-
-        if (len == 0) return;
-
-        // Bucket-based parallel copy with better workgroup utilization
-        // Small bucket (1-32 bytes): optimized scalar path with lane 0
-        if (len <= 32u) {
-            if (lane == 0) {
-                uint pos = 0;
-                if (len >= 16u) {
-                    uchar16 c16 = vload16(0, src);
-                    vstore16(c16, 0, dst);
-                    pos = 16u;
-                }
-                if (len - pos >= 8u) {
-                    uchar8 c8 = vload8(0, src + pos);
-                    vstore8(c8, 0, dst + pos);
-                    pos += 8u;
-                }
-                for (; pos < len; ++pos) dst[pos] = src[pos];
-            }
-            return;
-        }
-
-        // Medium bucket (33-128 bytes): parallel copies using multiple lanes
-        if (len <= 128u) {
-            uint vec16_end = len & ~15u;
-            // First: parallel 16-byte vector loads
-            for (uint pos = lane * 16u; pos < vec16_end; pos += lanes * 16u) {
-                uchar16 c = vload16(0, src + pos);
-                vstore16(c, 0, dst + pos);
-            }
-            // Then: remaining bytes handled by all lanes in parallel
-            for (uint pos = vec16_end + lane; pos < len; pos += lanes) {
-                dst[pos] = src[pos];
-            }
-            return;
-        }
-
-        // Large bucket (>128 bytes): fully vectorized parallel copy
-        // Use 32-byte chunks with all lanes
-        uint vec32_end = len & ~31u;
-        for (uint pos = lane * 32u; pos < vec32_end; pos += lanes * 32u) {
-            uchar16 c0 = vload16(0, src + pos);
-            uchar16 c1 = vload16(0, src + pos + 16u);
-            vstore16(c0, 0, dst + pos);
-            vstore16(c1, 0, dst + pos + 16u);
-        }
-
-        // 16-byte vectorized
-        uint vec16_end = len & ~15u;
-        for (uint pos = vec32_end + lane * 16u; pos < vec16_end; pos += lanes * 16u) {
-            uchar16 c = vload16(0, src + pos);
-            vstore16(c, 0, dst + pos);
-        }
-
-        // Tail: scalar per-lane
-        for (uint pos = vec16_end + lane; pos < len; pos += lanes) {
-            dst[pos] = src[pos];
-        }
     }
 }

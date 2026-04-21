@@ -628,6 +628,26 @@ def build_gpu_subprocess_env():
     return env
 
 
+def resolve_gpu_run_cwd(run_env=None):
+    merged_env = os.environ.copy()
+    if run_env:
+        merged_env.update(run_env)
+
+    runtime_dir = (merged_env.get("LZO_GPU_DIR") or "").strip()
+    if runtime_dir:
+        runtime_path = Path(runtime_dir).resolve()
+        if runtime_path.is_dir():
+            if (runtime_path / "lzo_gpu.h").exists():
+                return str(runtime_path)
+            for parent in runtime_path.parents:
+                if (parent / "lzo_gpu.h").exists():
+                    return str(parent)
+                if (parent / "lzo_gpu" / "lzo_gpu.h").exists():
+                    return str(parent)
+
+    return str(Path(LZO_GPU_BIN).resolve().parent)
+
+
 def _telemetry_window_from_summary(summary, elapsed_override_s=None):
     tel = {
         "elapsed_s": float(summary.get("elapsed_s", 0.0) or 0.0),
@@ -1420,11 +1440,11 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                 idle_pkg_power_w = telemetry.measure_idle_pkg_power_w(10)
                 idle_core_power_w = telemetry.measure_idle_core_power_w(10)
                 idle_gpu_power_w = telemetry.measure_idle_gpu_power_w(10)
-        gpu_dir = str(Path(LZO_GPU_BIN).resolve().parent)
-
         gpu_env = build_gpu_subprocess_env()
         if run_env:
             gpu_env.update(run_env)
+        gpu_dir = str(Path(LZO_GPU_BIN).resolve().parent)
+        gpu_run_cwd = resolve_gpu_run_cwd(gpu_env)
 
         bench_cmd = [
             LZO_GPU_BIN,
@@ -1435,7 +1455,7 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
             "--local", str(lsz),
             sample_path,
         ]
-        bench_res, _ = run_command_with_telemetry_cwd(bench_cmd, cwd=gpu_dir, telemetry=telemetry, env=gpu_env)
+        bench_res, _ = run_command_with_telemetry_cwd(bench_cmd, cwd=gpu_run_cwd, telemetry=telemetry, env=gpu_env)
         bench_output = (bench_res.stdout or "") + (bench_res.stderr or "")
         stable = parse_stable_bench_output(bench_output)
         if stable:
@@ -1476,10 +1496,10 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                 ]
                 t_comp = time.perf_counter()
                 if telemetry is None:
-                    comp_total_res, _ = run_command_with_telemetry_cwd(cmd_comp_total, cwd=gpu_dir, telemetry=None, env=gpu_env)
+                    comp_total_res, _ = run_command_with_telemetry_cwd(cmd_comp_total, cwd=gpu_run_cwd, telemetry=None, env=gpu_env)
                     comp_total_tel = {}
                 else:
-                    comp_total_res, comp_total_tel = run_command_with_telemetry_cwd(cmd_comp_total, cwd=gpu_dir, telemetry=telemetry, env=gpu_env)
+                    comp_total_res, comp_total_tel = run_command_with_telemetry_cwd(cmd_comp_total, cwd=gpu_run_cwd, telemetry=telemetry, env=gpu_env)
                 comp_elapsed_wall = max(0.0, time.perf_counter() - t_comp)
                 comp_total_output = (comp_total_res.stdout or "") + (comp_total_res.stderr or "")
 
@@ -1492,10 +1512,10 @@ def run_lzo_gpu(file_path, alg, level, bs, lsz, orig_hash, telemetry=None, bench
                 ]
                 t_dec = time.perf_counter()
                 if telemetry is None:
-                    dec_total_res, _ = run_command_with_telemetry_cwd(cmd_dec_total, cwd=gpu_dir, telemetry=None, env=gpu_env)
+                    dec_total_res, _ = run_command_with_telemetry_cwd(cmd_dec_total, cwd=gpu_run_cwd, telemetry=None, env=gpu_env)
                     dec_total_tel = {}
                 else:
-                    dec_total_res, dec_total_tel = run_command_with_telemetry_cwd(cmd_dec_total, cwd=gpu_dir, telemetry=telemetry, env=gpu_env)
+                    dec_total_res, dec_total_tel = run_command_with_telemetry_cwd(cmd_dec_total, cwd=gpu_run_cwd, telemetry=telemetry, env=gpu_env)
                 dec_elapsed_wall = max(0.0, time.perf_counter() - t_dec)
                 dec_total_output = (dec_total_res.stdout or "") + (dec_total_res.stderr or "")
 

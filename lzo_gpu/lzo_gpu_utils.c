@@ -70,13 +70,9 @@ static void lzo_strip_suffix_if_present(char* s, const char* suffix) {
     }
 }
 
-static void lzo_compose_source_filename(char* out, size_t out_sz, const char* source_alg, int bits, int want_debug) {
+static void lzo_compose_source_filename(char* out, size_t out_sz, const char* source_alg, int want_debug) {
     if (!out || out_sz == 0 || !source_alg || !*source_alg) return;
-    if (bits == 999) {
-        snprintf(out, out_sz, "%s_999.cl", source_alg);
-    } else if (bits == 99) {
-        snprintf(out, out_sz, "%s_99.cl", source_alg);
-    } else if (want_debug) {
+    if (want_debug) {
         snprintf(out, out_sz, "%s_debug.cl", source_alg);
     } else {
         snprintf(out, out_sz, "%s.cl", source_alg);
@@ -99,7 +95,7 @@ static int lzo_source_is_newer_than_binary(const char* source_path, const char* 
     return src_mtime > bin_mtime;
 }
 
-static int lzo_validate_program_kernels(cl_program prog, const char* source_alg, int bits, int decomp_only) {
+static int lzo_validate_program_kernels(cl_program prog, const char* source_alg, int decomp_only) {
     cl_int err = CL_SUCCESS;
     cl_kernel kcomp = NULL;
     cl_kernel kdec = NULL;
@@ -111,12 +107,7 @@ static int lzo_validate_program_kernels(cl_program prog, const char* source_alg,
     snprintf(dec_name, sizeof(dec_name), "%s_block_decompress", source_alg);
 
     if (!decomp_only) {
-        if (bits == 999)
-            snprintf(comp_name, sizeof(comp_name), "%s_block_compress_999", source_alg);
-        else if (bits == 99)
-            snprintf(comp_name, sizeof(comp_name), "%s_block_compress_99", source_alg);
-        else
-            snprintf(comp_name, sizeof(comp_name), "%s_block_compress", source_alg);
+        snprintf(comp_name, sizeof(comp_name), "%s_block_compress", source_alg);
 
         kcomp = clCreateKernel(prog, comp_name, &err);
         if (err != CL_SUCCESS || !kcomp) {
@@ -634,8 +625,8 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
     strncpy(base_name, alg_name, sizeof(base_name) - 1);
     base_name[sizeof(base_name) - 1] = '\0';
 
-    /* Guard against invalid D_BITS (e.g. 0), which can cause unstable kernel builds. */
-    if (bits != 999 && bits != 99 && (bits < 10 || bits > 20)) {
+    /* Guard against invalid D_BITS, which can cause unstable kernel builds. */
+    if (bits < 11 || bits > 15) {
         bits = LZO_DEFAULT_COMP_LEVEL;
     }
 
@@ -658,7 +649,7 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
     strncpy(source_alg_name, base_name, sizeof(source_alg_name) - 1);
     source_alg_name[sizeof(source_alg_name) - 1] = '\0';
     lzo_strip_suffix_if_present(source_alg_name, "_decomp");
-    lzo_compose_source_filename(source_name_for_stale, sizeof(source_name_for_stale), source_alg_name, bits, want_debug);
+    lzo_compose_source_filename(source_name_for_stale, sizeof(source_name_for_stale), source_alg_name, want_debug);
     if (lzo_find_file_path(source_name_for_stale, source_path_for_stale, sizeof(source_path_for_stale)) == 0) {
         source_path_for_stale_ok = 1;
     }
@@ -700,7 +691,7 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
                             /* Rebuild with the same fast-math flags used by build_kernel */
                             const char *opts = "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable";
                             err = clBuildProgram(prog, 1, &dev, opts, NULL, NULL);
-                            if (err == CL_SUCCESS && lzo_validate_program_kernels(prog, source_alg_name, bits, decomp_only)) {
+                            if (err == CL_SUCCESS && lzo_validate_program_kernels(prog, source_alg_name, decomp_only)) {
                                 if (build_log) build_log[0] = '\0';
                                 free(bin); fclose(fb); return prog;
                             } else {
@@ -735,6 +726,8 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
         char resolved_src[PATH_MAX]; size_t src_len = 0; char* src = NULL;
         int dbg_flag = want_debug;
         char source_alg[64];
+        char base_src[128];
+        int found_src = 0;
 
         strncpy(source_alg, base_name, sizeof(source_alg) - 1);
         source_alg[sizeof(source_alg) - 1] = '\0';
@@ -745,24 +738,25 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
             }
         }
 
-        char base_src[128];
-        if (bits == 999) {
-            snprintf(base_src, sizeof(base_src), "%s_999.cl", source_alg);
-        } else if (bits == 99) {
-            snprintf(base_src, sizeof(base_src), "%s_99.cl", source_alg);
-        } else if (dbg_flag)
-            snprintf(base_src, sizeof(base_src), "%s_debug.cl", source_alg);
-        else
-            snprintf(base_src, sizeof(base_src), "%s.cl", source_alg);
+        snprintf(base_src, sizeof(base_src), "%s.cl", source_alg);
 
         /* Try to find and load the base source */
         if (lzo_find_file_path(base_src, resolved_src, sizeof(resolved_src)) == 0) {
             src = lzo_read_file(resolved_src, &src_len);
-        } else {
+            found_src = 1;
+        }
+
+        if (!found_src) {
             if (build_log) snprintf(build_log, build_log_len, "source file %s not found", base_src);
             return NULL;
         }
-        if (!src) { if (build_log) snprintf(build_log, build_log_len, "failed to read %s", base_src); return NULL; }
+
+        if (!src) {
+            if (build_log) snprintf(build_log, build_log_len, "failed to read %s", base_src);
+            return NULL;
+        } else {
+            /* source loaded */
+        }
 
         prog = clCreateProgramWithSource(ctx, 1, (const char**)&src, &src_len, &err);
         if (err != CL_SUCCESS) { if (build_log) snprintf(build_log, build_log_len, "clCreateProgramWithSource failed (err=%d)", err); free(src); return NULL; }
@@ -778,19 +772,14 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
             if (sl) *sl = '\0'; else src_dir[0] = '.', src_dir[1] = '\0';
         }
         char build_opts[512];
-        if (bits == 999) {
-            snprintf(build_opts, sizeof(build_opts),
-                 "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I\"%s\" -I. -I./lzo_gpu -I../lzo_gpu -I.. -D LZO_GPU_DEBUG_COUNTERS_RUNTIME=%d",
-                 src_dir, dbg_flag ? 1 : 0);
-        } else if (bits == 99) {
-            /* Level 99 kernel has D_BITS hardcoded (D_BITS=14, 4-way dict). */
-            snprintf(build_opts, sizeof(build_opts),
-                 "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I\"%s\" -I. -I./lzo_gpu -I../lzo_gpu -I.. -D LZO_GPU_DEBUG_COUNTERS_RUNTIME=%d",
-                 src_dir, dbg_flag ? 1 : 0);
+        if (dbg_flag) {
+           snprintf(build_opts, sizeof(build_opts),
+               "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I\"%s\" -I. -I./lzo_gpu -I../lzo_gpu -I.. -D D_BITS=%d -D LZO_GPU_DEBUG_COUNTERS_RUNTIME=1",
+               src_dir, bits);
         } else {
-            snprintf(build_opts, sizeof(build_opts),
-                 "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I\"%s\" -I. -I./lzo_gpu -I../lzo_gpu -I.. -D D_BITS=%d -D LZO_GPU_DEBUG_COUNTERS_RUNTIME=%d",
-                 src_dir, bits, dbg_flag ? 1 : 0);
+           snprintf(build_opts, sizeof(build_opts),
+               "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I\"%s\" -I. -I./lzo_gpu -I../lzo_gpu -I.. -D D_BITS=%d",
+               src_dir, bits);
         }
         err = clBuildProgram(prog, 1, &dev, build_opts, NULL, NULL);
         if (err != CL_SUCCESS) {
@@ -836,22 +825,9 @@ int lzo_load_comp_kernel(cl_context ctx, cl_device_id dev, const char *alg_name,
     char* p_dbg = strstr(prog_base_name, "_debug");
     if (p_dbg) *p_dbg = '\0';
 
-    if (debug) {
-        size_t base_len = strlen(prog_base_name);
-        const char* suffix = "_debug";
-        size_t suffix_len = strlen(suffix);
-        if (base_len + suffix_len >= sizeof(effective_alg)) {
-            if (build_log && build_log[0] == '\0') {
-                snprintf(build_log, build_log_len, "algorithm name too long: %s", prog_base_name);
-            }
-            return -1;
-        }
-        memcpy(effective_alg, prog_base_name, base_len);
-        memcpy(effective_alg + base_len, suffix, suffix_len + 1);
-    } else {
-        strncpy(effective_alg, prog_base_name, sizeof(effective_alg)-1);
-        effective_alg[sizeof(effective_alg)-1] = '\0';
-    }
+    (void)debug;
+    strncpy(effective_alg, prog_base_name, sizeof(effective_alg)-1);
+    effective_alg[sizeof(effective_alg)-1] = '\0';
 
     /* Load base algorithm program */
     prog = lzo_load_program_with_dbits(ctx, dev, effective_alg, comp_level, build_log, build_log_len);
@@ -865,13 +841,6 @@ int lzo_load_comp_kernel(cl_context ctx, cl_device_id dev, const char *alg_name,
         const char* suffix = "_block_compress";
         size_t base_len = strlen(prog_base_name);
         size_t suffix_len = strlen(suffix);
-        if (comp_level == 999) {
-            suffix = "_block_compress_999";
-            suffix_len = strlen(suffix);
-        } else if (comp_level == 99) {
-            suffix = "_block_compress_99";
-            suffix_len = strlen(suffix);
-        }
         if (base_len + suffix_len >= sizeof(krn_name)) {
             if (build_log && build_log[0] == '\0') {
                 snprintf(build_log, build_log_len, "kernel name too long for %s", prog_base_name);

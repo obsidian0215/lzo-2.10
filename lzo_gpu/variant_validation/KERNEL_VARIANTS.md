@@ -1,87 +1,77 @@
-# LZO GPU 内核变体记录
+# LZO GPU 内核变体账本
 
-更新时间：2026-04-16
+更新时间：2026-04-20
 
-## 1. 使用约定
+## 当前已采纳基线
 
-- 本文件登记 `lzo_gpu` 的内核组件，覆盖 `kernel_comp` 与 `kernel_dec`；
-- 记录组织方式固定为：`vendor -> optimization_object -> stage -> operation`；
-- 对 `lzo1x` / `lzo1y` / `D_BITS=13/14/15`，只要属于同一机制，也优先复用同一个 `variant_id`，把算法与级别差异写到结果里，而不是额外发明一套名字。
-- 若变体属于 `hash_table_overhead` 这类跨组件特殊轴，必须与 `HOST_VARIANTS.md` 同步建账，并在两边使用同一个 special-axis 标记。
+### 压缩内核
 
-## 2. 当前默认源码基线（2026-04-16 收敛）
+- 名称：`intel_lzo_gpu_lzo1x_d14_baseline_lock`
+- 适用：`lzo1x`, `D_BITS=14`
+- 当前默认实现要点：
+  - 单 `primary hash`
+  - `epoch12 | offset20` 的 32-bit packed dict entry
+  - 四位置批量探测与集中写回
+  - `match-extension` 的 8/16/32B 展开比较
+- 证据：`intel/records/kernel_comp/intel_lzo_gpu_lzo1x_d14_baseline_lock.md`
+- 结论：`adopt`
 
-- `lzo1x.cl` / `lzo1y.cl` 已把 **主备 hash / secondary hash probe** 从默认慢路径中移除；
-- 默认压缩路径回收到 **单 primary hash** 基线；
-- 默认解压路径已去掉会增加分支深度、但没有额外向量收益的 `COPY_MATCH(offset == 3)` 专门分支；
-- `copy_match` 调用点已统一收敛为直接走 `COPY_MATCH()`，不再在调用点额外分叉 `UA_COPYN vs COPY_MATCH`；
-- 这类“源码收敛”属于 **baseline cleanup**；其中 `kernel_dec / match_copy / copy_match_branch_prune` 已完成稳定复核并可随默认源码一并采纳；
-- `fingerprint` 与 `主备 hash / dual probe` 不再留在默认实现中，而是作为单独变体继续建账与验证；
-- `simplified_current` 相对 `baseline_pre_simplify` 的稳定复核已完成：`AvgBench +1.37%`、`AvgBenchDec -0.06%`、`AvgCompKernel +0.41%`、`AvgDecKernel -0.55%`，`Bench/Comp ratio delta = 0`；
-- 负向尾部分别为 `Bench -2.72%`、`BenchDec -7.18%`、`Comp -5.16%`、`Dec -18.83%`；其中 `Bench/Comp` 侧仍落在同场 `control_a/control_b` 噪声包络内，`DecKernel` 个别样本尾部偏深，但未形成系统性均值退化；
-- 结论：当前简化后源码可正式接替 `pre_simplify` 复核包，作为新的默认源码基线。
+### 解压内核
 
-## 3. NVIDIA
-
-### 3.1 `kernel_comp / hash_dict / fingerprint`
-
-#### `fp_filter_pending`
-
-- 显示名称：`Fingerprint 过滤（待验证）`
-- 状态：`pending`
-- 适用算法：`lzo1x` / `lzo1y`
-- 动机：在 primary hash 保持单路的前提下，尝试用轻量 fingerprint 过滤掉一部分 false match compare，观察其是否能覆盖 packed-entry 解码成本。
-- 设计与实现：建议以 `epoch + fp + low position` 的 packed-entry 形式落到专用候选目录，并分别测试 `fp4/fp8` 或开/关版本。
-- 整体结果：当前默认源码未保留该机制，正式结果尚未建账。
-- 判定：`pending`
-- 证据：`lzo-2.10/lzo_gpu/lzo1x.cl`、`lzo-2.10/lzo_gpu/lzo1y.cl`
-
-### 3.2 `kernel_comp / hash_dict / primary_secondary_hash`
-
-#### `dual_hash_probe_pending`
-
-- 显示名称：`主备 hash / dual probe（待验证）`
-- 状态：`pending`
-- 适用算法：`lzo1x` / `lzo1y`
-- 动机：历史默认源码里曾在 slow path 同时探测主 hash 与备 hash；现在先把它移出默认基线，再独立验证它是否真的值得保留。
-- 设计与实现：候选版本应在同一 `sequence` 上计算 `DINDEX` 与 `DINDEX_ALT`，并明确记录 store policy、命中优先级与 `D_BITS` 固定值。
-- 整体结果：默认源码移除该机制后的 `simplified_current` 已完成稳定复核并可作为新基线；但把 dual probe 作为独立候选重新引入时，仍未形成正式 benchmark / manual 建账。
-- 判定：`pending`
+- 名称：`mainline lzo1x.cl（由 intel_lzo_gpu_lzo1x_d14_short_match_helper_r1 采纳并入）`
+- 适用：`lzo1x`, `D_BITS=14`
+- 动机：
+  - `baseline_lock` 的 decode hot path 已经较强，但 gate-10 与 fullset 都证明：对“短、非重叠 match”额外拉一条极窄 helper，可以稳定提升 decode 吞吐且不伤 ratio。
+- 具体操作：
+  - 在主线 `lzo1x.cl` 中增加 `lzo1x_fast_direct_match_copy_18()`。
+  - 在 `copy_match:` 前置 gate：`if (offset >= mlen && mlen <= 18u)`。
+  - 命中时直接做 16B + tail 的 short-match copy；其余路径继续回落到原始 `COPY_MATCH()`。
+  - **没有采纳** 被证伪的 D2.1 条件：`mlen >= 8u && mlen <= 18u`。
+- 验证结果：
+  - gate-10（bench1/manual5）：
+    - `bench_dec_kernel_mbs avg=+8.7595%`, `median=+13.3255%`
+    - `dec_kernel_tp_mbs avg=+7.8498%`, `median=+8.6113%`
+    - `dec_total_no_oci_tp_mbs avg=+3.6027%`, `median=+2.3485%`
+  - fullset（bench1/manual5）：
+    - `bench_dec_kernel_mbs avg=+10.1537%`, `median=+11.1561%`
+    - `dec_kernel_tp_mbs avg=+9.5475%`, `median=+1.2871%`
+    - `dec_total_no_oci_tp_mbs avg=+4.9429%`, `median=+2.9542%`
+    - `bench_comp_kernel_mbs avg=-0.0284%`
+    - `comp_total_no_oci_tp_mbs avg=+0.0531%`, `median=+0.3268%`
+    - `ratio_pct = 0.0000%`
 - 证据：
-  - `lzo-2.10/lzo_gpu/lzo1x.cl`
-  - `lzo-2.10/lzo_gpu/lzo1y.cl`
-  - `lzo-2.10/lzo_gpu/variant_validation/nvidia/results/lzo_simplified_current_stable_recheck_20260415/summary_comparison.txt`
+  - 主线源码：`lzo_gpu/lzo1x.cl`
+  - gate-10 结果：`intel/results/kernel_dec/d2_r1_gate10_b1m5_intel_lzo_gpu_lzo1x_d14_baseline_lock_vs_intel_lzo_gpu_lzo1x_d14_short_match_helper_r1/`
+  - fullset 结果：`intel/results/kernel_dec/d2_r1_fullset_b1m5_intel_lzo_gpu_lzo1x_d14_baseline_lock_vs_intel_lzo_gpu_lzo1x_d14_short_match_helper_r1/`
+- 结论：`adopt`
 
-### 3.2B `kernel_comp / hash_dict / hash_table_overhead`
+## 当前 Intel 候选
 
-#### `hash_table_overhead_ab`
+当前无需要继续沿用的旧 decode 候选。后续若继续推进 decode，应新开变体编号，不再把已被证伪的 D2.1 或早期 D1 重新包装成“当前候选”。
 
-- 显示名称：`Dictionary / hash table 容量与管理开销`
-- 状态：`pending`
-- special-axis：`hash_table_overhead`
-- 适用算法：`lzo1x` / `lzo1y`
-- 动机：当前 dictionary/hash table 全局内存按 active work-item slot 扩张；需要把容量、slot 布局、padding/reuse 策略对 kernel 吞吐与 host buffer 开销的影响正式建账。
-- 设计与实现：在保持 `block=64KB`、`localsize=1`、`level=14` 不变的前提下，只扫描 dictionary/hash table 容量、entry 布局或管理逻辑；host 侧同步记录 alloc/upload/download 段。
-- 整体结果：尚未形成正式 A/B 结果，当前先作为特殊轴占位。
-- 判定：`pending`
-- 证据：
-  - `lzo-2.10/lzo_gpu/lzo1x.cl`
-  - `lzo-2.10/lzo_gpu/lzo1y.cl`
-  - `lzo-2.10/lzo_gpu/variant_validation/HOST_VARIANTS.md`
+## Intel 已验证未采纳项
 
-### 3.3 `kernel_dec / match_copy / copy_match_branch_prune`
+1. `intel_lzo_gpu_lzo1x_d14_copy_match_prune_o4_r1`
+   - 结果：`watch / not adopt`
+   - 原因：ratio 不变，但 `bench_dec_kernel_mbs avg=-1.6435%`、`manual dec_kernel_tp_mbs avg=-1.3760%`，主指标仍以负向为主；`dec_total_no_oci_tp` 虽均值为正，但中位数为负，未达到采纳标准。
+   - 证据：`intel/records/kernel_dec/intel_lzo_gpu_lzo1x_d14_copy_match_prune_o4_r1.md`
 
-| variant_id | 状态 | 整体结果与判定 | 证据 |
-| --- | --- | --- | --- |
-| `copy_match_branch_prune_baseline_20260416` | `adopt` | 以 `baseline_pre_simplify` 为锚点的稳定复核表明：简化后源码 `ratio` 完全不变，`AvgBench +1.37%`、`AvgCompKernel +0.41%`；解压均值基本持平（`AvgBenchDec -0.06%`、`AvgDecKernel -0.55%`）。负向尾部里 `Bench/Comp` 仍落在同场 control 噪声包络内，`DecKernel` 最差样本 `-18.83%` 偏深但未形成系统性退化，因此该分支裁剪随当前默认源码一起收敛为新基线。 | `lzo-2.10/lzo_gpu/variant_validation/nvidia/results/lzo_simplified_current_stable_recheck_20260415/summary_comparison.txt`；`lzo-2.10/lzo_gpu/lzo1x.cl`；`lzo-2.10/lzo_gpu/lzo1y.cl` |
+2. `intel_lzo_gpu_lzo1x_d14_short_match_helper_len8_18_r3`
+   - 结果：`reject`
+   - 原因：把 D2 helper 从“`<=18B`”缩窄成“`8..18B`”后，gate-10 `bench1/manual5` 三项 decode 主指标全部翻负：
+     - `bench_dec_kernel_mbs avg=-2.4617%`
+     - `dec_kernel_tp_mbs avg=-3.9419%`
+     - `dec_total_no_oci_tp_mbs avg=-2.0195%`
+   - 结论：这不是“更稳的微调”，而是误删了 D2 对 `3..7B` 高频短匹配的有效覆盖。
+   - 证据：`intel/results/kernel_dec/d2_micro_gate10_b1_m5_intel_lzo_gpu_lzo1x_d14_baseline_lock_vs_intel_lzo_gpu_lzo1x_d14_short_match_helper_len8_18_r3/`
 
-## 4. Intel
+3. `intel_lzo_gpu_lzo1x_d14_rel_offset_r1`
+   - 结果：`reject`
+   - 原因：LZ4 M1 风格的 relative-offset loop 不能机械平移到当前 `lzo1x` 解压状态机；历史验证显示它没有形成可采纳的 decode 收益。
+   - 证据：`TEMP_LZ4_ADOPTED_MIGRATION_DESIGN_20260421.md`
 
-> Intel/Linux 侧当前还没有正式结果，先保留同名条目，后续直接在本章补平台差异。
+## 已知低优先级 / 已拒绝方向
 
-| stage | operation | 代表变体 | 状态 |
-| --- | --- | --- | --- |
-| `hash_dict` | `fingerprint_filter` | `fp_filter_pending` | `pending` |
-| `hash_dict` | `primary_secondary_hash` | `dual_hash_probe_pending` | `pending` |
-| `hash_dict` | `hash_table_overhead` | `hash_table_overhead_ab` | `pending` |
-| `match_copy` | `copy_match_branch_prune` | `copy_match_branch_prune_baseline_20260416` | `pending` |
+- `hash_table_overhead`：当前 `LZO_GPU_REFACTOR_PLAN.md` 已明确记录多条正式 `reject`，包括“少分表 + 少并行”与“保留并行但共享单槽表”的两类路线；后续不再优先尝试。
+- `fingerprint_filter`：当前视为待验证机制而非默认路径，且已有历史经验表明热路径额外元数据很容易拖慢压缩吞吐。
+- `primary_secondary_hash`：仍可作为独立候选，但不属于当前最优先 Intel 首轮落点；先完成 `copy_match_branch_prune` 与 host 传输轴验证。

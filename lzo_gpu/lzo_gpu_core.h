@@ -44,7 +44,6 @@ typedef struct {
     cl_uint comp_cached_blk;
     cl_uint comp_cached_worst_blk;
     cl_uint comp_cached_pool_size;
-    int comp_cached_is_999;
 
     size_t comp_cached_input_size;
     size_t comp_cached_blk_size;
@@ -62,7 +61,7 @@ extern unsigned long g_kernel_load_us;
 /* Parameter object to reduce lzo_compress_core argument count from 18 to 6 */
 typedef struct {
     /* Algorithm and quality settings */
-    int level;              /* Dictionary size in bits (10-14) */
+    int level;              /* Dictionary size in bits (11-20) */
     int alg_id;             /* Algorithm ID (0=lzo1x, 1=lzo1y) */
 
     /* I/O and memory settings */
@@ -79,7 +78,6 @@ int lzo_compress_core(
     cl_command_queue queue,
     cl_device_id device,
     cl_kernel kernel,
-    cl_kernel pack_kernel,
     const char* input_path,
     const char* output_path,
     const lzo_compress_params_t* params,

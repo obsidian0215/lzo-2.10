@@ -41,7 +41,8 @@ endif
 ## attempt to precompile kernels that aren't actually in the tree.
 CL_SOURCES := $(wildcard *.cl)
 
-all: build_kernel lzo_gpu precompile-combos
+# all: build_kernel lzo_gpu precompile-combos
+all: build_kernel lzo_gpu
 
 build_kernel: build_kernel.c lzo_gpu_utils.c
 	$(CC) $(CFLAGS) -o build_kernel$(EXEEXT) build_kernel.c lzo_gpu_utils.c $(LDFLAGS)
@@ -74,13 +75,9 @@ precompile: $(PRECOMPILE_HELPER)
 precompile-combos: $(PRECOMPILE_HELPER)
 	@echo "Generate binaries for all algorithms and dictionary sizes"
 	@for alg in lzo1x lzo1y; do \
-		for bits in 11 12 13 14 15; do \
+		for bits in 13 14 15; do \
 			echo "Building $${alg}_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits})..."; \
 			./$(PRECOMPILE_HELPER) $${alg}.cl $${alg}_$${bits}.clbin "-I. -D D_BITS=$${bits}" || exit 1; \
-		done; \
-		for bits in 99 999; do \
-			echo "Building $${alg}_$${bits}.clbin from $${alg}_$${bits}.cl..."; \
-			./$(PRECOMPILE_HELPER) $${alg}_$${bits}.cl $${alg}_$${bits}.clbin "-I." || exit 1; \
 		done; \
 	done
 

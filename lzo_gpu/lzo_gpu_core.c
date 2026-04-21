@@ -34,37 +34,6 @@ static int lzo_env_flag_enabled(const char* name) {
     return (strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 || strcasecmp(v, "yes") == 0);
 }
 
-static unsigned lzo_env_u32(const char* name, unsigned defv) {
-    const char* v = getenv(name);
-    char* endp = NULL;
-    unsigned long n;
-    if (!v || !*v) return defv;
-    n = strtoul(v, &endp, 10);
-    if (endp == v || *endp != '\0') return defv;
-    if (n == 0 || n > UINT_MAX) return defv;
-    return (unsigned)n;
-}
-
-static unsigned lzo_choose_comp_wi_per_cu(unsigned default_value) {
-    unsigned wi_per_cu = lzo_env_u32("LZO_GPU_COMP_WI_PER_CU", 0U);
-    if (wi_per_cu == 0U) {
-        wi_per_cu = lzo_env_u32("LZO_GPU_WI_PER_CU", default_value);
-    }
-    if (wi_per_cu < 32U) wi_per_cu = 32U;
-    if (wi_per_cu > 1024U) wi_per_cu = 1024U;
-    return wi_per_cu;
-}
-
-static double lzo_env_f64(const char* name, double defv) {
-    const char* v = getenv(name);
-    char* endp = NULL;
-    double d;
-    if (!v || !*v) return defv;
-    d = strtod(v, &endp);
-    if (endp == v || *endp != '\0' || !isfinite(d)) return defv;
-    return d;
-}
-
 enum {
     LZO_DBG_COMP_SEARCH_ITERS = 0,
     LZO_DBG_COMP_MATCH_FOUND,
@@ -72,6 +41,26 @@ enum {
     LZO_DBG_COMP_MATCH_BYTES,
     LZO_DBG_COMP_INPUT_BYTES,
     LZO_DBG_COMP_OUTPUT_BYTES,
+    LZO_DBG_COMP_DICT_LOOKUPS,
+    LZO_DBG_COMP_DICT_STORES,
+    LZO_DBG_COMP_EPOCH_VALID_HITS,
+    LZO_DBG_COMP_EPOCH_MISMATCH_MISS,
+    LZO_DBG_COMP_LIVE_SLOT_OVERWRITES,
+    LZO_DBG_COMP_STALE_SLOT_OVERWRITES,
+    LZO_DBG_COMP_LITERAL_OPS,
+    LZO_DBG_COMP_MATCH_OPS,
+    LZO_DBG_COMP_M2_MATCHES,
+    LZO_DBG_COMP_M3_MATCHES,
+    LZO_DBG_COMP_M4_MATCHES,
+    LZO_DBG_COMP_TAIL_LITERAL_BYTES,
+    LZO_DBG_COMP_MATCH_MISS_AFTER_VALID_HIT,
+    LZO_DBG_COMP_MATCH_MISS_AFTER_EPOCH_MISMATCH,
+    LZO_DBG_COMP_SHARED_OWNER_BLOCKS,
+    LZO_DBG_COMP_NOSHARE_FASTPATH_BLOCKS,
+    LZO_DBG_COMP_SLOT_OVERWRITE_SAME_OWNER,
+    LZO_DBG_COMP_SLOT_OVERWRITE_CROSS_OWNER,
+    LZO_DBG_COMP_SHARED_TABLE_PROBE_COUNT,
+    LZO_DBG_COMP_SHARED_TABLE_WRITE_COUNT,
     LZO_DBG_COMP_N
 };
 
@@ -81,11 +70,25 @@ enum {
     LZO_DBG_DEC_MATCH_BYTES,
     LZO_DBG_DEC_SMALL_OFFSETS,
     LZO_DBG_DEC_OUTPUT_ERROR,
+    LZO_DBG_DEC_LITERAL_OPS,
+    LZO_DBG_DEC_MATCH_OPS,
+    LZO_DBG_DEC_OVERLAP_MATCHES,
+    LZO_DBG_DEC_M2_MATCHES,
+    LZO_DBG_DEC_M3_MATCHES,
+    LZO_DBG_DEC_M4_MATCHES,
+    LZO_DBG_DEC_FIRST_LITERAL_RUN_BYTES,
+    LZO_DBG_DEC_FIRST_LITERAL_RUN_OPS,
+    LZO_DBG_DEC_POST_MATCH_LITERAL_BYTES,
+    LZO_DBG_DEC_POST_MATCH_LITERAL_OPS,
+    LZO_DBG_DEC_EOF_MARKERS,
     LZO_DBG_DEC_N
 };
 
 static int lzo_debug_counters_enabled(void) {
-    return 0;
+    const char* v = getenv("LZO_GPU_DEBUG");
+    if (!v || !*v) return 0;
+    return (strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 ||
+            strcasecmp(v, "yes") == 0 || strcasecmp(v, "on") == 0);
 }
 
 static void lzo_print_comp_debug_stats(const uint32_t* stats, size_t num_blocks, const char* tag) {
@@ -95,6 +98,26 @@ static void lzo_print_comp_debug_stats(const uint32_t* stats, size_t num_blocks,
     unsigned long long match_bytes = 0;
     unsigned long long input_bytes = 0;
     unsigned long long output_bytes = 0;
+    unsigned long long dict_lookups = 0;
+    unsigned long long dict_stores = 0;
+    unsigned long long epoch_valid_hits = 0;
+    unsigned long long epoch_mismatch_miss = 0;
+    unsigned long long live_slot_overwrites = 0;
+    unsigned long long stale_slot_overwrites = 0;
+    unsigned long long literal_ops = 0;
+    unsigned long long match_ops = 0;
+    unsigned long long m2_matches = 0;
+    unsigned long long m3_matches = 0;
+    unsigned long long m4_matches = 0;
+    unsigned long long tail_literal_bytes = 0;
+    unsigned long long match_miss_after_valid_hit = 0;
+    unsigned long long match_miss_after_epoch_mismatch = 0;
+    unsigned long long shared_owner_blocks = 0;
+    unsigned long long noshare_fastpath_blocks = 0;
+    unsigned long long slot_overwrite_same_owner = 0;
+    unsigned long long slot_overwrite_cross_owner = 0;
+    unsigned long long shared_table_probe_count = 0;
+    unsigned long long shared_table_write_count = 0;
 
     if (!stats || num_blocks == 0) return;
 
@@ -106,10 +129,30 @@ static void lzo_print_comp_debug_stats(const uint32_t* stats, size_t num_blocks,
         match_bytes += stats[base + LZO_DBG_COMP_MATCH_BYTES];
         input_bytes += stats[base + LZO_DBG_COMP_INPUT_BYTES];
         output_bytes += stats[base + LZO_DBG_COMP_OUTPUT_BYTES];
+        dict_lookups += stats[base + LZO_DBG_COMP_DICT_LOOKUPS];
+        dict_stores += stats[base + LZO_DBG_COMP_DICT_STORES];
+        epoch_valid_hits += stats[base + LZO_DBG_COMP_EPOCH_VALID_HITS];
+        epoch_mismatch_miss += stats[base + LZO_DBG_COMP_EPOCH_MISMATCH_MISS];
+        live_slot_overwrites += stats[base + LZO_DBG_COMP_LIVE_SLOT_OVERWRITES];
+        stale_slot_overwrites += stats[base + LZO_DBG_COMP_STALE_SLOT_OVERWRITES];
+        literal_ops += stats[base + LZO_DBG_COMP_LITERAL_OPS];
+        match_ops += stats[base + LZO_DBG_COMP_MATCH_OPS];
+        m2_matches += stats[base + LZO_DBG_COMP_M2_MATCHES];
+        m3_matches += stats[base + LZO_DBG_COMP_M3_MATCHES];
+        m4_matches += stats[base + LZO_DBG_COMP_M4_MATCHES];
+        tail_literal_bytes += stats[base + LZO_DBG_COMP_TAIL_LITERAL_BYTES];
+        match_miss_after_valid_hit += stats[base + LZO_DBG_COMP_MATCH_MISS_AFTER_VALID_HIT];
+        match_miss_after_epoch_mismatch += stats[base + LZO_DBG_COMP_MATCH_MISS_AFTER_EPOCH_MISMATCH];
+        shared_owner_blocks += stats[base + LZO_DBG_COMP_SHARED_OWNER_BLOCKS];
+        noshare_fastpath_blocks += stats[base + LZO_DBG_COMP_NOSHARE_FASTPATH_BLOCKS];
+        slot_overwrite_same_owner += stats[base + LZO_DBG_COMP_SLOT_OVERWRITE_SAME_OWNER];
+        slot_overwrite_cross_owner += stats[base + LZO_DBG_COMP_SLOT_OVERWRITE_CROSS_OWNER];
+        shared_table_probe_count += stats[base + LZO_DBG_COMP_SHARED_TABLE_PROBE_COUNT];
+        shared_table_write_count += stats[base + LZO_DBG_COMP_SHARED_TABLE_WRITE_COUNT];
     }
 
     fprintf(stderr,
-            "%s blocks=%zu search_iters=%llu match_found=%llu literal_bytes=%llu match_bytes=%llu input_bytes=%llu output_bytes=%llu\n",
+            "%s blocks=%zu search_iters=%llu match_found=%llu literal_bytes=%llu match_bytes=%llu input_bytes=%llu output_bytes=%llu dict_lookups=%llu dict_stores=%llu epoch_valid_hits=%llu epoch_mismatch_miss=%llu live_slot_overwrites=%llu stale_slot_overwrites=%llu\n",
             (tag ? tag : "[LZO-DBG][COMP]"),
             num_blocks,
             search_iters,
@@ -117,7 +160,30 @@ static void lzo_print_comp_debug_stats(const uint32_t* stats, size_t num_blocks,
             literal_bytes,
             match_bytes,
             input_bytes,
-            output_bytes);
+            output_bytes,
+            dict_lookups,
+            dict_stores,
+            epoch_valid_hits,
+            epoch_mismatch_miss,
+            live_slot_overwrites,
+            stale_slot_overwrites);
+    fprintf(stderr,
+            "%s detail literal_ops=%llu match_ops=%llu m2_matches=%llu m3_matches=%llu m4_matches=%llu tail_literal_bytes=%llu match_miss_after_valid_hit=%llu match_miss_after_epoch_mismatch=%llu shared_owner_blocks=%llu noshare_fastpath_blocks=%llu slot_overwrite_same_owner=%llu slot_overwrite_cross_owner=%llu shared_table_probe_count=%llu shared_table_write_count=%llu\n",
+            (tag ? tag : "[LZO-DBG][COMP]"),
+            literal_ops,
+            match_ops,
+            m2_matches,
+            m3_matches,
+            m4_matches,
+            tail_literal_bytes,
+            match_miss_after_valid_hit,
+            match_miss_after_epoch_mismatch,
+            shared_owner_blocks,
+            noshare_fastpath_blocks,
+            slot_overwrite_same_owner,
+            slot_overwrite_cross_owner,
+            shared_table_probe_count,
+            shared_table_write_count);
 }
 
 static void lzo_print_dec_debug_stats(const uint32_t* stats, size_t num_blocks, const char* tag) {
@@ -126,6 +192,17 @@ static void lzo_print_dec_debug_stats(const uint32_t* stats, size_t num_blocks, 
     unsigned long long match_bytes = 0;
     unsigned long long small_offsets = 0;
     unsigned long long output_errors = 0;
+    unsigned long long literal_ops = 0;
+    unsigned long long match_ops = 0;
+    unsigned long long overlap_matches = 0;
+    unsigned long long m2_matches = 0;
+    unsigned long long m3_matches = 0;
+    unsigned long long m4_matches = 0;
+    unsigned long long first_literal_run_bytes = 0;
+    unsigned long long first_literal_run_ops = 0;
+    unsigned long long post_match_literal_bytes = 0;
+    unsigned long long post_match_literal_ops = 0;
+    unsigned long long eof_markers = 0;
 
     if (!stats || num_blocks == 0) return;
 
@@ -136,74 +213,42 @@ static void lzo_print_dec_debug_stats(const uint32_t* stats, size_t num_blocks, 
         match_bytes += stats[base + LZO_DBG_DEC_MATCH_BYTES];
         small_offsets += stats[base + LZO_DBG_DEC_SMALL_OFFSETS];
         output_errors += stats[base + LZO_DBG_DEC_OUTPUT_ERROR];
+        literal_ops += stats[base + LZO_DBG_DEC_LITERAL_OPS];
+        match_ops += stats[base + LZO_DBG_DEC_MATCH_OPS];
+        overlap_matches += stats[base + LZO_DBG_DEC_OVERLAP_MATCHES];
+        m2_matches += stats[base + LZO_DBG_DEC_M2_MATCHES];
+        m3_matches += stats[base + LZO_DBG_DEC_M3_MATCHES];
+        m4_matches += stats[base + LZO_DBG_DEC_M4_MATCHES];
+        first_literal_run_bytes += stats[base + LZO_DBG_DEC_FIRST_LITERAL_RUN_BYTES];
+        first_literal_run_ops += stats[base + LZO_DBG_DEC_FIRST_LITERAL_RUN_OPS];
+        post_match_literal_bytes += stats[base + LZO_DBG_DEC_POST_MATCH_LITERAL_BYTES];
+        post_match_literal_ops += stats[base + LZO_DBG_DEC_POST_MATCH_LITERAL_OPS];
+        eof_markers += stats[base + LZO_DBG_DEC_EOF_MARKERS];
     }
 
     fprintf(stderr,
-            "%s blocks=%zu tokens=%llu literal_bytes=%llu match_bytes=%llu small_offsets=%llu output_errors=%llu\n",
+            "%s blocks=%zu tokens=%llu literal_bytes=%llu match_bytes=%llu small_offsets=%llu output_errors=%llu literal_ops=%llu match_ops=%llu overlap_matches=%llu\n",
             (tag ? tag : "[LZO-DBG][DECOMP]"),
             num_blocks,
             tokens,
             literal_bytes,
             match_bytes,
             small_offsets,
-            output_errors);
-}
-
-static double lzo_estimate_file_entropy_prefix(const char* path, size_t sample_bytes) {
-    int fd = -1;
-    unsigned char* buf = NULL;
-    const size_t chunk = 64 * 1024;
-    size_t freq[256] = {0};
-    size_t remain = sample_bytes;
-    size_t total = 0;
-    double entropy = -1.0;
-
-    if (!path || sample_bytes == 0) return -1.0;
-
-    {
-        int open_flags = O_RDONLY;
-#ifdef O_BINARY
-        open_flags |= O_BINARY;
-#endif
-        fd = open(path, open_flags);
-    }
-    if (fd < 0) goto cleanup;
-
-    buf = (unsigned char*)malloc(chunk);
-    if (!buf) goto cleanup;
-
-    while (remain > 0) {
-        size_t want = (remain < chunk) ? remain : chunk;
-        ssize_t nr = read(fd, buf, want);
-        size_t i;
-        if (nr < 0) {
-            if (errno == EINTR) continue;
-            goto cleanup;
-        }
-        if (nr == 0) break;
-        for (i = 0; i < (size_t)nr; i++) {
-            freq[buf[i]]++;
-        }
-        total += (size_t)nr;
-        remain -= (size_t)nr;
-    }
-
-    if (total > 0) {
-        const double inv_log2 = 1.0 / log(2.0);
-        size_t i;
-        entropy = 0.0;
-        for (i = 0; i < 256; i++) {
-            if (freq[i] != 0) {
-                double p = (double)freq[i] / (double)total;
-                entropy -= p * (log(p) * inv_log2);
-            }
-        }
-    }
-
-cleanup:
-    if (fd >= 0) close(fd);
-    if (buf) free(buf);
-    return entropy;
+            output_errors,
+            literal_ops,
+            match_ops,
+            overlap_matches);
+    fprintf(stderr,
+            "%s detail m2_matches=%llu m3_matches=%llu m4_matches=%llu first_literal_run_bytes=%llu first_literal_run_ops=%llu post_match_literal_bytes=%llu post_match_literal_ops=%llu eof_markers=%llu\n",
+            (tag ? tag : "[LZO-DBG][DECOMP]"),
+            m2_matches,
+            m3_matches,
+            m4_matches,
+            first_literal_run_bytes,
+            first_literal_run_ops,
+            post_match_literal_bytes,
+            post_match_literal_ops,
+            eof_markers);
 }
 
 static int lzo_zero_buffer(cl_command_queue queue, cl_mem buf, size_t bytes) {
@@ -370,48 +415,6 @@ static int lzo_readback_to_file_chunked(cl_command_queue queue,
     return 0;
 }
 
-typedef struct {
-    cl_mem d_in;
-    cl_mem d_out;
-    cl_mem d_len;
-    cl_mem d_packed_out;
-    cl_mem d_packed_off;
-    size_t in_cap;
-    size_t out_cap;
-    size_t len_cap;
-    size_t packed_out_cap;
-    size_t packed_off_cap;
-    cl_event upload_ev;
-    cl_event kernel_ev;
-    int inflight;
-    size_t in_size;
-    size_t block_count;
-    size_t block_base;
-} lzo_pipeline_slot_t;
-
-static size_t lzo_env_size_mb_to_bytes(const char* name, size_t default_mb) {
-    unsigned mb = lzo_env_u32(name, (unsigned)default_mb);
-    return (size_t)mb * 1024ULL * 1024ULL;
-}
-
-static void lzo_pipeline_slot_release(lzo_pipeline_slot_t* slot) {
-    if (!slot) return;
-    if (slot->upload_ev) {
-        clReleaseEvent(slot->upload_ev);
-        slot->upload_ev = NULL;
-    }
-    if (slot->kernel_ev) {
-        clReleaseEvent(slot->kernel_ev);
-        slot->kernel_ev = NULL;
-    }
-    if (slot->d_in) clReleaseMemObject(slot->d_in);
-    if (slot->d_out) clReleaseMemObject(slot->d_out);
-    if (slot->d_len) clReleaseMemObject(slot->d_len);
-    if (slot->d_packed_out) clReleaseMemObject(slot->d_packed_out);
-    if (slot->d_packed_off) clReleaseMemObject(slot->d_packed_off);
-    memset(slot, 0, sizeof(*slot));
-}
-
 static int lzo_env_flag_value(const char* name, int* is_set) {
     const char* env = getenv(name);
     if (is_set) *is_set = 0;
@@ -471,836 +474,12 @@ static size_t lzo_sanitize_local_size(cl_device_id device, size_t requested, siz
     return l;
 }
 
-static int lzo_should_use_device_compaction(size_t packed_bytes, size_t sparse_bytes, size_t num_blocks, cl_kernel pack_kernel) {
-    int force_set = 0;
-    int force_value = lzo_env_flag_value("LZO_GPU_FORCE_COMPACTION", &force_set);
-    int enable_set = 0;
-    int enable_value = lzo_env_flag_value("LZO_GPU_ENABLE_COMPACTION", &enable_set);
-    int enable_compaction = enable_set ? enable_value : 0;
-    if (!pack_kernel) return 0;
-    if (force_set) return force_value;
-    if (!enable_compaction) return 0;
-    if (packed_bytes == 0 || sparse_bytes == 0 || packed_bytes >= sparse_bytes) return 0;
-    {
-        unsigned min_blocks = lzo_env_unsigned_value("LZO_GPU_COMPACTION_MIN_BLOCKS", 8U);
-        unsigned min_gain_pct = lzo_env_unsigned_value("LZO_GPU_COMPACTION_MIN_GAIN_PCT", 5U);
-        size_t saved_bytes;
-        if (num_blocks < (size_t)min_blocks) return 0;
-        saved_bytes = sparse_bytes - packed_bytes;
-        return saved_bytes * 100U >= sparse_bytes * (size_t)min_gain_pct;
-    }
-}
-
-static int lzo_read_exact_fd(int fd, unsigned char* dst, size_t need, unsigned long* read_us_accum) {
-    size_t done = 0;
-    uint64_t t_read_start = core_now_ns();
-    while (done < need) {
-        ssize_t nr = read(fd, dst + done, need - done);
-        if (nr < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (nr == 0) return -1;
-        done += (size_t)nr;
-    }
-    if (read_us_accum) {
-        *read_us_accum += (unsigned long)((core_now_ns() - t_read_start) / 1000ULL);
-    }
-    return 0;
-}
-
-static int lzo_pipeline_open_output_file(const char* output_path,
-                                         size_t orig_size,
-                                         size_t blk_size,
-                                         size_t nblk,
-                                         int alg_id,
-                                         FILE** out_fp,
-                                         long* lens_offset_out) {
-    FILE* fout;
-    uint16_t magic = 0x4C5A;
-    uint32_t header[4];
-    uint32_t zeros[4096] = {0};
-    size_t remain = nblk;
-
-    if (!output_path || !out_fp || !lens_offset_out) return -1;
-
-    fout = fopen(output_path, "wb");
-    if (!fout) return -1;
-
-    header[0] = (uint32_t)orig_size;
-    header[1] = (uint32_t)blk_size;
-    header[2] = (uint32_t)nblk;
-    header[3] = (uint32_t)alg_id;
-
-    if (fwrite(&magic, sizeof(magic), 1, fout) != 1) {
-        fclose(fout);
-        return -1;
-    }
-    if (fwrite(header, sizeof(uint32_t), 4, fout) != 4) {
-        fclose(fout);
-        return -1;
-    }
-
-    *lens_offset_out = ftell(fout);
-    if (*lens_offset_out < 0) {
-        fclose(fout);
-        return -1;
-    }
-
-    while (remain > 0) {
-        size_t step = (remain < (size_t)4096) ? remain : (size_t)4096;
-        if (fwrite(zeros, sizeof(uint32_t), step, fout) != step) {
-            fclose(fout);
-            return -1;
-        }
-        remain -= step;
-    }
-
-    *out_fp = fout;
-    return 0;
-}
-
-
-static int lzo_pipeline_finalize_output_file(FILE* out_fp,
-                                             long lens_offset,
-                                             size_t nblk,
-                                             const cl_uint* lens) {
-    int ret = 0;
-
-    if (!out_fp || !lens) return -1;
-
-    if (fseek(out_fp, lens_offset, SEEK_SET) != 0) {
-        ret = -1;
-    } else if (fwrite(lens, sizeof(uint32_t), nblk, out_fp) != nblk) {
-        ret = -1;
-    }
-
-    if (fflush(out_fp) != 0) {
-        ret = -1;
-    }
-    if (fclose(out_fp) != 0) {
-        ret = -1;
-    }
-    return ret;
-}
-
-static int lzo_pipeline_drain_slot(
-    cl_context ctx,
-    cl_command_queue queue,
-    lzo_pipeline_slot_t* slot,
-    cl_kernel pack_kernel,
-    size_t worst_blk,
-    int debug_sched,
-    int discard_output,
-    FILE* out_fp,
-    cl_uint* lens_all,
-    size_t nblk_total,
-    size_t* comp_total_out,
-    unsigned long* upload_us_accum,
-    unsigned long* kernel_us_accum,
-    unsigned long* download_us_accum,
-    unsigned long* write_us_accum
-) {
-    cl_int err;
-    cl_uint* lens_chunk = NULL;
-    if (!slot || !slot->inflight) return 0;
-    if (!slot->kernel_ev) return -1;
-
-    clWaitForEvents(1, &slot->kernel_ev);
-    {
-        cl_ulong q = 0, s = 0, st = 0, e = 0;
-        if (clGetEventProfilingInfo(slot->kernel_ev, CL_PROFILING_COMMAND_QUEUED, sizeof(q), &q, NULL) == CL_SUCCESS &&
-            clGetEventProfilingInfo(slot->kernel_ev, CL_PROFILING_COMMAND_SUBMIT, sizeof(s), &s, NULL) == CL_SUCCESS &&
-            clGetEventProfilingInfo(slot->kernel_ev, CL_PROFILING_COMMAND_START, sizeof(st), &st, NULL) == CL_SUCCESS &&
-            clGetEventProfilingInfo(slot->kernel_ev, CL_PROFILING_COMMAND_END, sizeof(e), &e, NULL) == CL_SUCCESS) {
-            if (kernel_us_accum) {
-                *kernel_us_accum += (unsigned long)((e - st) / 1000ULL);
-            }
-            if (debug_sched) {
-                fprintf(stderr,
-                        "[LZO-PROF-PIPE] queue_to_submit=%.3f us submit_to_start=%.3f us device_exec=%.3f us blocks=%zu\n",
-                        (double)(s - q) / 1000.0,
-                        (double)(st - s) / 1000.0,
-                        (double)(e - st) / 1000.0,
-                        slot->block_count);
-            }
-        }
-    }
-
-    if (slot->upload_ev) {
-        if (upload_us_accum) {
-            *upload_us_accum += lzo_event_elapsed_us(slot->upload_ev);
-        }
-        clReleaseEvent(slot->upload_ev);
-        slot->upload_ev = NULL;
-    }
-
-    {
-        uint64_t t_down_start = core_now_ns();
-        void* mapped_len = clEnqueueMapBuffer(queue, slot->d_len, CL_TRUE, CL_MAP_READ,
-                                              0, slot->block_count * sizeof(cl_uint),
-                                              0, NULL, NULL, &err);
-        if (err != CL_SUCCESS || mapped_len == NULL) {
-            return -1;
-        }
-        lens_chunk = (cl_uint*)malloc(slot->block_count * sizeof(cl_uint));
-        if (!lens_chunk) {
-            clEnqueueUnmapMemObject(queue, slot->d_len, mapped_len, 0, NULL, NULL);
-            return -1;
-        }
-        memcpy(lens_chunk, mapped_len, slot->block_count * sizeof(cl_uint));
-        err = clEnqueueUnmapMemObject(queue, slot->d_len, mapped_len, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            free(lens_chunk);
-            return -1;
-        }
-        clFinish(queue);
-        if (download_us_accum) {
-            *download_us_accum += (unsigned long)((core_now_ns() - t_down_start) / 1000ULL);
-        }
-
-        {
-            size_t i;
-            for (i = 0; i < slot->block_count; i++) {
-                size_t global_idx = slot->block_base + i;
-                cl_uint clen = lens_chunk[i];
-                if (global_idx < nblk_total) {
-                    lens_all[global_idx] = clen;
-                }
-                if (comp_total_out) *comp_total_out += (size_t)clen;
-            }
-        }
-
-        if (!discard_output) {
-            size_t packed_total = 0;
-            size_t sparse_total = slot->block_count * worst_blk;
-            int use_compaction;
-            size_t i;
-            for (i = 0; i < slot->block_count; i++) {
-                packed_total += (size_t)lens_chunk[i];
-            }
-            use_compaction = lzo_should_use_device_compaction(packed_total, sparse_total, slot->block_count, pack_kernel);
-
-            if (use_compaction && packed_total > 0) {
-                cl_uint* packed_offsets = (cl_uint*)malloc(slot->block_count * sizeof(cl_uint));
-                unsigned char* packed_chunk = (unsigned char*)malloc(packed_total);
-                if (!packed_offsets || !packed_chunk) {
-                    free(packed_offsets);
-                    free(packed_chunk);
-                    free(lens_chunk);
-                    return -1;
-                }
-                {
-                    size_t off = 0;
-                    for (i = 0; i < slot->block_count; i++) {
-                        packed_offsets[i] = (cl_uint)off;
-                        off += (size_t)lens_chunk[i];
-                    }
-                }
-
-                slot->d_packed_off = core_get_or_create_buffer(ctx, &slot->d_packed_off, &slot->packed_off_cap,
-                                                               slot->block_count * sizeof(cl_uint), CL_MEM_READ_ONLY, &err);
-                if (err != CL_SUCCESS || !slot->d_packed_off) {
-                    free(packed_offsets);
-                    free(packed_chunk);
-                    free(lens_chunk);
-                    return -1;
-                }
-                slot->d_packed_out = core_get_or_create_buffer(ctx, &slot->d_packed_out, &slot->packed_out_cap,
-                                                               packed_total, CL_MEM_WRITE_ONLY, &err);
-                if (err != CL_SUCCESS || !slot->d_packed_out) {
-                    free(packed_offsets);
-                    free(packed_chunk);
-                    free(lens_chunk);
-                    return -1;
-                }
-                err = clEnqueueWriteBuffer(queue, slot->d_packed_off, CL_TRUE, 0,
-                                           slot->block_count * sizeof(cl_uint), packed_offsets, 0, NULL, NULL);
-                if (err != CL_SUCCESS) {
-                    free(packed_offsets);
-                    free(packed_chunk);
-                    free(lens_chunk);
-                    return -1;
-                }
-
-                {
-                    cl_uint worst_blk_cl = (cl_uint)worst_blk;
-                    cl_uint total_blocks_cl = (cl_uint)slot->block_count;
-                    size_t pack_local = (size_t)lzo_env_unsigned_value("LZO_GPU_PACK_LSZ", 64U);
-                    if (pack_local == 0) pack_local = 1;
-                    if (pack_local > 256) pack_local = 256;
-                    if (pack_local > slot->block_count && slot->block_count > 0) {
-                        size_t p2 = 1;
-                        while ((p2 << 1) <= slot->block_count) p2 <<= 1;
-                        pack_local = p2;
-                    }
-                    size_t pack_global = slot->block_count ? (slot->block_count * pack_local) : pack_local;
-                    uint64_t t_pack_start = core_now_ns();
-                    err  = clSetKernelArg(pack_kernel, 0, sizeof(cl_mem), &slot->d_out);
-                    err |= clSetKernelArg(pack_kernel, 1, sizeof(cl_mem), &slot->d_len);
-                    err |= clSetKernelArg(pack_kernel, 2, sizeof(cl_mem), &slot->d_packed_out);
-                    err |= clSetKernelArg(pack_kernel, 3, sizeof(cl_mem), &slot->d_packed_off);
-                    err |= clSetKernelArg(pack_kernel, 4, sizeof(cl_uint), &worst_blk_cl);
-                    err |= clSetKernelArg(pack_kernel, 5, sizeof(cl_uint), &total_blocks_cl);
-                    if (err != CL_SUCCESS) {
-                        free(packed_offsets);
-                        free(packed_chunk);
-                        free(lens_chunk);
-                        return -1;
-                    }
-                    err = clEnqueueNDRangeKernel(queue, pack_kernel, 1, NULL, &pack_global, &pack_local, 0, NULL, NULL);
-                    if (err != CL_SUCCESS) {
-                        free(packed_offsets);
-                        free(packed_chunk);
-                        free(lens_chunk);
-                        return -1;
-                    }
-                    clFinish(queue);
-                    if (kernel_us_accum) {
-                        *kernel_us_accum += (unsigned long)((core_now_ns() - t_pack_start) / 1000ULL);
-                    }
-                }
-
-                {
-                    uint64_t t_out_down_start = core_now_ns();
-                    void* mapped_packed = clEnqueueMapBuffer(queue, slot->d_packed_out, CL_TRUE, CL_MAP_READ,
-                                                             0, packed_total, 0, NULL, NULL, &err);
-                    if (err == CL_SUCCESS && mapped_packed) {
-                        memcpy(packed_chunk, mapped_packed, packed_total);
-                        clEnqueueUnmapMemObject(queue, slot->d_packed_out, mapped_packed, 0, NULL, NULL);
-                        clFinish(queue);
-                    } else {
-                        err = clEnqueueReadBuffer(queue, slot->d_packed_out, CL_TRUE, 0, packed_total, packed_chunk, 0, NULL, NULL);
-                        if (err != CL_SUCCESS) {
-                            free(packed_offsets);
-                            free(packed_chunk);
-                            free(lens_chunk);
-                            return -1;
-                        }
-                    }
-                    if (download_us_accum) {
-                        *download_us_accum += (unsigned long)((core_now_ns() - t_out_down_start) / 1000ULL);
-                    }
-                }
-
-                {
-                    uint64_t t_write_start = core_now_ns();
-                    if (out_fp && fwrite(packed_chunk, 1, packed_total, out_fp) != packed_total) {
-                        free(packed_offsets);
-                        free(packed_chunk);
-                        free(lens_chunk);
-                        return -1;
-                    }
-                    if (write_us_accum) {
-                        *write_us_accum += (unsigned long)((core_now_ns() - t_write_start) / 1000ULL);
-                    }
-                }
-                free(packed_offsets);
-                free(packed_chunk);
-            } else {
-                uint64_t t_out_down_start = core_now_ns();
-                void* mapped_out = clEnqueueMapBuffer(queue, slot->d_out, CL_TRUE, CL_MAP_READ,
-                                                      0, slot->block_count * worst_blk,
-                                                      0, NULL, NULL, &err);
-                if (err != CL_SUCCESS || mapped_out == NULL) {
-                    free(lens_chunk);
-                    return -1;
-                }
-                if (download_us_accum) {
-                    *download_us_accum += (unsigned long)((core_now_ns() - t_out_down_start) / 1000ULL);
-                }
-
-                {
-                    uint64_t t_write_start = core_now_ns();
-                    unsigned char* out_chunk = (unsigned char*)mapped_out;
-                    for (i = 0; i < slot->block_count; i++) {
-                        cl_uint clen = lens_chunk[i];
-                        if (clen > 0 && out_fp) {
-                            if (fwrite(out_chunk + i * worst_blk, 1, clen, out_fp) != clen) {
-                                clEnqueueUnmapMemObject(queue, slot->d_out, mapped_out, 0, NULL, NULL);
-                                free(lens_chunk);
-                                return -1;
-                            }
-                        }
-                    }
-                    if (write_us_accum) {
-                        *write_us_accum += (unsigned long)((core_now_ns() - t_write_start) / 1000ULL);
-                    }
-                }
-
-                err = clEnqueueUnmapMemObject(queue, slot->d_out, mapped_out, 0, NULL, NULL);
-                if (err != CL_SUCCESS) {
-                    free(lens_chunk);
-                    return -1;
-                }
-            }
-        }
-        free(lens_chunk);
-    }
-
-    if (slot->kernel_ev) {
-        clReleaseEvent(slot->kernel_ev);
-        slot->kernel_ev = NULL;
-    }
-    slot->inflight = 0;
-    return 0;
-}
-
-static int lzo_compress_core_pipeline(
-    cl_context ctx,
-    cl_command_queue queue,
-    cl_device_id device,
-    cl_kernel kernel,
-    cl_kernel pack_kernel,
-    const char* input_path,
-    const char* output_path,
-    const lzo_compress_params_t* params,
-    lzo_gpu_workspace_t* ws,
-    unsigned long* time_us_out,
-    size_t* output_size_out,
-    timing_t* t_out,
-    size_t in_sz,
-    size_t blk,
-    size_t nblk,
-    uint64_t t_total_start,
-    int debug_sched
-) {
-    cl_int err = CL_SUCCESS;
-    int ret = -1;
-    int fd = -1;
-    int use_standard_copy = params->standard_copy ? 1 : 0;
-    int overlap_enabled = lzo_env_flag_value("LZO_PIPELINE_OVERLAP_ENABLE", NULL);
-    int use_overlap = overlap_enabled && use_standard_copy;
-    int discard_output = (!output_path || strcmp(output_path, "/dev/null") == 0);
-    cl_command_queue transfer_queue = queue;
-
-    size_t chunk_blocks_cfg = (size_t)lzo_env_u32("LZO_PIPELINE_CHUNK_BLOCKS", 512U);
-    if (chunk_blocks_cfg < 64) chunk_blocks_cfg = 64;
-    if (chunk_blocks_cfg > 4096) chunk_blocks_cfg = 4096;
-    if (chunk_blocks_cfg > nblk) chunk_blocks_cfg = nblk;
-
-    size_t worst_blk = core_lzo_worst(blk);
-    size_t chunk_bytes_max = chunk_blocks_cfg * blk;
-
-    unsigned long read_us = 0;
-    unsigned long upload_us = 0;
-    unsigned long kernel_exec_us = 0;
-    unsigned long download_us = 0;
-    unsigned long write_us = 0;
-    unsigned long buffer_alloc_us = 0;
-    size_t comp_total = 0;
-
-    unsigned char* host_stage[2] = {NULL, NULL};
-    int host_stage_aligned[2] = {0, 0};
-    lzo_pipeline_slot_t slots[2];
-    cl_uint* lens_all = NULL;
-    FILE* out_fp = NULL;
-    long out_lens_offset = 0;
-    cl_mem d_dict = NULL;
-    size_t d_dict_cap = 0;
-
-    size_t local_size = 1;
-    size_t target_items = chunk_blocks_cfg;
-    size_t global_size = 1;
-    uint32_t pool_size = 1;
-    uint32_t epoch_base_start = 0;
-    int is_999 = (params->level == 999);
-    int is_99 = (params->level == 99);
-
-    memset(slots, 0, sizeof(slots));
-
-    if (use_overlap) {
-        cl_command_queue q_tmp = NULL;
-#if defined(CL_VERSION_2_0)
-        {
-            const cl_queue_properties qprops[] = {
-                CL_QUEUE_PROPERTIES,
-                (cl_queue_properties)CL_QUEUE_PROFILING_ENABLE,
-                0
-            };
-            q_tmp = clCreateCommandQueueWithProperties(ctx, device, qprops, &err);
-        }
-#else
-        q_tmp = clCreateCommandQueue(ctx, device, CL_QUEUE_PROFILING_ENABLE, &err);
-#endif
-        if (err != CL_SUCCESS || !q_tmp) {
-            use_overlap = 0;
-            transfer_queue = queue;
-        } else {
-            transfer_queue = q_tmp;
-        }
-    }
-
-    if (!discard_output) {
-        if (lzo_pipeline_open_output_file(output_path, in_sz, blk, nblk,
-                                          params->alg_id, &out_fp,
-                                          &out_lens_offset) != 0) {
-            perror("pipeline output open");
-            goto cleanup;
-        }
-    }
-
-    lens_all = (cl_uint*)malloc(nblk * sizeof(cl_uint));
-    if (!lens_all) {
-        perror("malloc lens_all");
-        goto cleanup;
-    }
-
-    {
-        int i;
-        for (i = 0; i < 2; i++) {
-            int rc = lzo_aligned_alloc_portable((void**)&host_stage[i], ALIGN_BYTES, chunk_bytes_max);
-            if (rc == 0 && host_stage[i] != NULL) {
-                host_stage_aligned[i] = 1;
-            } else {
-                host_stage_aligned[i] = 0;
-                host_stage[i] = (unsigned char*)malloc(chunk_bytes_max);
-            }
-            if (!host_stage[i]) {
-                perror("malloc host_stage");
-                goto cleanup;
-            }
-        }
-    }
-
-    {
-        int open_flags = O_RDONLY;
-#ifdef O_BINARY
-        open_flags |= O_BINARY;
-#endif
-        fd = open(input_path, open_flags);
-    }
-    if (fd < 0) {
-        perror("open input");
-        goto cleanup;
-    }
-
-    {
-        cl_uint cus = 0;
-        cl_ulong global_mem = 0;
-        cl_ulong max_alloc = 0;
-        size_t dict_per_block;
-        size_t occ_cap = 0;
-        size_t mem_cap = 0;
-        size_t safe_mem = 0;
-        size_t safe_alloc = 0;
-
-        if (is_999) {
-            dict_per_block = 458752ULL;
-        } else if (is_99) {
-            dict_per_block = (1ULL << 14) * 4 * sizeof(uint32_t);
-        } else {
-            dict_per_block = (1ULL << params->level) * sizeof(uint32_t);
-        }
-
-        local_size = (params->local_size_param > 0) ? (size_t)params->local_size_param : 1;
-
-        (void)clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cus), &cus, NULL);
-        (void)clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem), &global_mem, NULL);
-        (void)clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, NULL);
-
-        {
-            unsigned sched_wi_per_cu = lzo_choose_comp_wi_per_cu(128U);
-            occ_cap = (cus > 0) ? ((size_t)cus * (size_t)sched_wi_per_cu) : 4096U;
-            if (occ_cap < 1024U) occ_cap = 1024U;
-        }
-        if (is_999) {
-            if (occ_cap > 64) occ_cap = 64;
-        }
-
-        if (dict_per_block > 0) {
-            size_t cap_by_global = SIZE_MAX;
-            size_t cap_by_alloc = SIZE_MAX;
-
-            if (global_mem > 0) {
-                safe_mem = (size_t)(global_mem / 6ULL);
-                cap_by_global = safe_mem / dict_per_block;
-            }
-            if (max_alloc > 0) {
-                /* Reserve headroom to avoid hitting driver hard limits exactly. */
-                safe_alloc = (size_t)(max_alloc * 9ULL / 10ULL);
-                cap_by_alloc = safe_alloc / dict_per_block;
-            }
-            mem_cap = (cap_by_global < cap_by_alloc) ? cap_by_global : cap_by_alloc;
-        }
-        if (mem_cap == 0) mem_cap = 1;
-
-        if (target_items > occ_cap) target_items = occ_cap;
-        if (target_items > mem_cap) target_items = mem_cap;
-        if (target_items == 0) target_items = 1;
-
-        local_size = lzo_sanitize_local_size(device, local_size, target_items);
-        global_size = ((target_items + local_size - 1) / local_size) * local_size;
-        if (global_size == 0) {
-            global_size = 1;
-            local_size = 1;
-        }
-        pool_size = (uint32_t)global_size;
-
-        {
-            uint64_t t_ba_start = core_now_ns();
-            d_dict = core_get_or_create_buffer(ctx, &ws->d_dict, &ws->dict_size,
-                                               global_size * dict_per_block,
-                                               CL_MEM_READ_WRITE, &err);
-            if (err != CL_SUCCESS || !d_dict) {
-                fprintf(stderr, "[PIPE] failed to allocate dictionary buffer: %d\n", err);
-                goto cleanup;
-            }
-            d_dict_cap = ws->dict_size;
-            buffer_alloc_us += (unsigned long)((core_now_ns() - t_ba_start) / 1000ULL);
-        }
-    }
-
-    if (!is_999) {
-        if (ws->comp_epoch_base == 0) ws->comp_epoch_base = 1;
-        if ((uint32_t)nblk + 2U >= 4095U || ws->comp_epoch_base + (uint32_t)nblk + 1U > 4095U) {
-            if (d_dict && d_dict_cap > 0) {
-                (void)lzo_zero_buffer(queue, d_dict, d_dict_cap);
-            }
-            ws->comp_epoch_base = 1;
-        }
-        epoch_base_start = ws->comp_epoch_base;
-        ws->comp_epoch_base += (uint32_t)nblk + 1U;
-    }
-
-    if (debug_sched) {
-        double blk_per_wi = (target_items > 0) ? ((double)chunk_blocks_cfg / (double)target_items) : 0.0;
-        fprintf(stderr,
-                "[LZO-SCHED-PIPE] level=%d total_blocks=%zu chunk_blocks=%zu bs=%zu lsz=%zu target_wi=%zu g=%zu blk_per_wi=%.2f\n",
-                params->level, nblk, chunk_blocks_cfg, blk, local_size, target_items, global_size, blk_per_wi);
-    }
-
-    {
-        size_t block_cursor = 0;
-        size_t chunk_idx = 0;
-
-        while (block_cursor < nblk) {
-            size_t slot_idx = chunk_idx & 1U;
-            lzo_pipeline_slot_t* slot = &slots[slot_idx];
-            size_t chunk_blocks = chunk_blocks_cfg;
-            size_t chunk_bytes;
-            cl_event ev_upload = NULL;
-            uint64_t t_ba_start;
-
-            if (chunk_blocks > (nblk - block_cursor)) {
-                chunk_blocks = nblk - block_cursor;
-            }
-
-            if (slot->inflight) {
-                if (lzo_pipeline_drain_slot(ctx, queue, slot, pack_kernel, worst_blk, debug_sched,
-                                            discard_output, out_fp, lens_all,
-                                            nblk, &comp_total,
-                                            &upload_us,
-                                            &kernel_exec_us, &download_us, &write_us) != 0) {
-                    fprintf(stderr, "[PIPE] failed draining inflight slot\n");
-                    goto cleanup;
-                }
-            }
-
-            chunk_bytes = chunk_blocks * blk;
-            if (block_cursor + chunk_blocks == nblk) {
-                chunk_bytes = in_sz - block_cursor * blk;
-            }
-
-            if (lzo_read_exact_fd(fd, host_stage[slot_idx], chunk_bytes, &read_us) != 0) {
-                fprintf(stderr, "[PIPE] failed reading chunk at block %zu\n", block_cursor);
-                goto cleanup;
-            }
-
-            t_ba_start = core_now_ns();
-            {
-                cl_mem_flags in_flags = CL_MEM_READ_ONLY;
-                if (!use_standard_copy) in_flags |= CL_MEM_ALLOC_HOST_PTR;
-                slot->d_in = core_get_or_create_buffer(ctx, &slot->d_in, &slot->in_cap,
-                                                       chunk_bytes, in_flags, &err);
-            }
-            if (err != CL_SUCCESS || !slot->d_in) {
-                fprintf(stderr, "[PIPE] failed allocating slot input buffer: %d\n", err);
-                goto cleanup;
-            }
-            slot->d_out = core_get_or_create_buffer(ctx, &slot->d_out, &slot->out_cap,
-                                                    chunk_blocks * worst_blk, CL_MEM_WRITE_ONLY, &err);
-            if (err != CL_SUCCESS || !slot->d_out) {
-                fprintf(stderr, "[PIPE] failed allocating slot output buffer: %d\n", err);
-                goto cleanup;
-            }
-            slot->d_len = core_get_or_create_buffer(ctx, &slot->d_len, &slot->len_cap,
-                                                    chunk_blocks * sizeof(cl_uint), CL_MEM_READ_WRITE, &err);
-            if (err != CL_SUCCESS || !slot->d_len) {
-                fprintf(stderr, "[PIPE] failed allocating slot len buffer: %d\n", err);
-                goto cleanup;
-            }
-            buffer_alloc_us += (unsigned long)((core_now_ns() - t_ba_start) / 1000ULL);
-
-            if (use_standard_copy) {
-                cl_command_queue upload_queue = use_overlap ? transfer_queue : queue;
-                err = clEnqueueWriteBuffer(upload_queue, slot->d_in, CL_FALSE, 0, chunk_bytes,
-                                           host_stage[slot_idx], 0, NULL, &ev_upload);
-                if (err != CL_SUCCESS) {
-                    fprintf(stderr, "[PIPE] clEnqueueWriteBuffer failed: %d\n", err);
-                    goto cleanup;
-                }
-            } else {
-                uint64_t t_up_start = core_now_ns();
-                void* mapped_in = clEnqueueMapBuffer(queue, slot->d_in, CL_TRUE, CL_MAP_WRITE,
-                                                     0, chunk_bytes, 0, NULL, NULL, &err);
-                if (err != CL_SUCCESS || mapped_in == NULL) {
-                    fprintf(stderr, "[PIPE] clEnqueueMapBuffer failed: %d\n", err);
-                    goto cleanup;
-                }
-                memcpy(mapped_in, host_stage[slot_idx], chunk_bytes);
-                err = clEnqueueUnmapMemObject(queue, slot->d_in, mapped_in, 0, NULL, &ev_upload);
-                if (err != CL_SUCCESS) {
-                    fprintf(stderr, "[PIPE] clEnqueueUnmapMemObject failed: %d\n", err);
-                    goto cleanup;
-                }
-                upload_us += (unsigned long)((core_now_ns() - t_up_start) / 1000ULL);
-            }
-
-            {
-                cl_uint in_sz_cl = (cl_uint)chunk_bytes;
-                cl_uint blk_cl = (cl_uint)blk;
-                cl_uint worst_blk_cl = (cl_uint)worst_blk;
-                cl_uint epoch_base = epoch_base_start + (cl_uint)block_cursor;
-                cl_event ev_kernel = NULL;
-
-                CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &slot->d_in));
-                CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &slot->d_out));
-                CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &slot->d_len));
-                CHECK(clSetKernelArg(kernel, 3, sizeof(cl_uint), &in_sz_cl));
-                CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uint), &blk_cl));
-                CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uint), &worst_blk_cl));
-                CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem), &d_dict));
-                if (is_999) {
-                    cl_uint swd_pool_count_cl = pool_size;
-                    cl_uint try_lazy_cl = 2;
-                    cl_uint max_chain_cl = 4096;
-                    CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uint), &swd_pool_count_cl));
-                    CHECK(clSetKernelArg(kernel, 8, sizeof(cl_uint), &try_lazy_cl));
-                    CHECK(clSetKernelArg(kernel, 9, sizeof(cl_uint), &max_chain_cl));
-                } else {
-                    CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uint), &pool_size));
-                    CHECK(clSetKernelArg(kernel, 8, sizeof(cl_uint), &epoch_base));
-                }
-
-                err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL,
-                                             &global_size, &local_size,
-                                             (ev_upload ? 1 : 0), (ev_upload ? &ev_upload : NULL),
-                                             &ev_kernel);
-                if (err != CL_SUCCESS || ev_kernel == NULL) {
-                    fprintf(stderr, "[PIPE] clEnqueueNDRangeKernel failed: %d\n", err);
-                    if (ev_upload) clReleaseEvent(ev_upload);
-                    goto cleanup;
-                }
-
-                if (use_standard_copy) {
-                    slot->upload_ev = ev_upload;
-                } else if (ev_upload) {
-                    clReleaseEvent(ev_upload);
-                }
-
-                slot->kernel_ev = ev_kernel;
-                slot->inflight = 1;
-                slot->in_size = chunk_bytes;
-                slot->block_count = chunk_blocks;
-                slot->block_base = block_cursor;
-            }
-
-            block_cursor += chunk_blocks;
-            chunk_idx++;
-        }
-    }
-
-    {
-        while (slots[0].inflight || slots[1].inflight) {
-            int drain_idx;
-            if (!slots[0].inflight) {
-                drain_idx = 1;
-            } else if (!slots[1].inflight) {
-                drain_idx = 0;
-            } else {
-                /* Preserve global block order in output stream. */
-                drain_idx = (slots[0].block_base <= slots[1].block_base) ? 0 : 1;
-            }
-
-            if (lzo_pipeline_drain_slot(ctx, queue, &slots[drain_idx], pack_kernel, worst_blk, debug_sched,
-                                        discard_output, out_fp, lens_all,
-                                        nblk, &comp_total,
-                                        &upload_us,
-                                        &kernel_exec_us, &download_us, &write_us) != 0) {
-                fprintf(stderr, "[PIPE] failed draining tail slot\n");
-                goto cleanup;
-            }
-        }
-    }
-
-    if (!discard_output) {
-        uint64_t t_write_start = core_now_ns();
-        if (lzo_pipeline_finalize_output_file(out_fp, out_lens_offset, nblk, lens_all) != 0) {
-            fprintf(stderr, "[PIPE] failed finalizing compressed file\n");
-            goto cleanup;
-        }
-        out_fp = NULL;
-        write_us += (unsigned long)((core_now_ns() - t_write_start) / 1000ULL);
-    }
-
-    clFinish(queue);
-
-    {
-        uint64_t t_total_end = core_now_ns();
-        unsigned long total_us = (unsigned long)((t_total_end - t_total_start) / 1000ULL);
-        if (time_us_out) *time_us_out = total_us;
-        if (output_size_out) *output_size_out = comp_total;
-
-        if (t_out) {
-            t_out->in_size = (unsigned long long)in_sz;
-            t_out->out_size = (unsigned long long)comp_total;
-            t_out->algo_config = (unsigned long long)params->level;
-            t_out->file_read_us = read_us;
-            t_out->ocl_setup_us = g_ocl_init_us + g_kernel_load_us;
-            t_out->buffer_alloc_us = buffer_alloc_us;
-            t_out->data_upload_us = upload_us;
-            t_out->kernel_exec_us = kernel_exec_us;
-            t_out->download_total_us = download_us;
-            t_out->file_write_us = write_us;
-            t_out->blk_size_bytes = (unsigned long)blk;
-            t_out->nblk = (unsigned long)nblk;
-            t_out->global_size = (unsigned long)global_size;
-            t_out->local_size = (unsigned long)local_size;
-        }
-
-    }
-
-    ret = 0;
-
-cleanup:
-    if (fd >= 0) close(fd);
-    if (out_fp) fclose(out_fp);
-    if (lens_all) free(lens_all);
-    if (host_stage[0]) {
-        if (host_stage_aligned[0]) lzo_aligned_free_portable(host_stage[0]);
-        else free(host_stage[0]);
-    }
-    if (host_stage[1]) {
-        if (host_stage_aligned[1]) lzo_aligned_free_portable(host_stage[1]);
-        else free(host_stage[1]);
-    }
-    lzo_pipeline_slot_release(&slots[0]);
-    lzo_pipeline_slot_release(&slots[1]);
-    if (transfer_queue && transfer_queue != queue) clReleaseCommandQueue(transfer_queue);
-    if (ret != 0 && !discard_output && output_path && strcmp(output_path, "/dev/null") != 0) {
-        unlink(output_path);
-    }
-    return ret;
-}
-
 /* Core compression implementation */
 int lzo_compress_core(
     cl_context ctx,
     cl_command_queue queue,
     cl_device_id device,
     cl_kernel kernel,
-    cl_kernel pack_kernel,
     const char* input_path,
     const char* output_path,
     const lzo_compress_params_t* params,
@@ -1313,7 +492,7 @@ int lzo_compress_core(
     cl_int err;
     uint64_t t_total_start = core_now_ns();
     int debug_sched = lzo_env_flag_enabled("LZO_GPU_DEBUG_SCHED");
-    int debug_counters = lzo_debug_counters_enabled();
+    int debug_counters = (params->debug || lzo_debug_counters_enabled()) ? 1 : 0;
 
     int use_standard_copy = params->standard_copy ? 1 : 0;
     cl_mem d_in = NULL;
@@ -1328,71 +507,6 @@ int lzo_compress_core(
     if (in_sz == 0) {
         /* Handle empty file */
         return -1;
-    }
-
-    {
-        size_t blk_probe = 0, nblk_probe = 0;
-        size_t blk_bytes_probe = (params->block_size > 0) ? params->block_size : 0;
-        size_t pipeline_threshold = lzo_env_size_mb_to_bytes("LZO_PIPELINE_THRESHOLD_MB", 64);
-        int pipeline_enabled = lzo_env_flag_enabled("LZO_PIPELINE_ENABLE");
-        int entropy_gate_enabled = lzo_env_flag_enabled("LZO_PIPELINE_ENTROPY_ENABLE");
-        size_t entropy_sample_kb = (size_t)lzo_env_u32("LZO_PIPELINE_ENTROPY_SAMPLE_KB", 256U);
-        double entropy_max = lzo_env_f64("LZO_PIPELINE_ENTROPY_MAX", 7.60);
-        int allow_pipeline;
-
-        lzo_choose_blocking_adaptive(NULL, in_sz, device, blk_bytes_probe, 0,
-                                     &blk_probe, &nblk_probe, params->debug);
-
-        if (entropy_sample_kb < 16) entropy_sample_kb = 16;
-        if (entropy_sample_kb > 4096) entropy_sample_kb = 4096;
-        if (entropy_max < 0.0) entropy_max = 0.0;
-        if (entropy_max > 8.0) entropy_max = 8.0;
-
-        allow_pipeline = (pipeline_enabled && !skip_input_upload && in_sz >= pipeline_threshold && nblk_probe >= 2 && !debug_counters);
-
-        if (debug_counters && debug_sched) {
-            fprintf(stderr, "[LZO-PIPE-GATE] disabled because LZO_GPU_DEBUG_COUNTERS=1\n");
-        }
-
-        if (allow_pipeline && entropy_gate_enabled) {
-            double entropy = lzo_estimate_file_entropy_prefix(input_path, entropy_sample_kb * 1024ULL);
-            if (entropy >= 0.0) {
-                if (debug_sched) {
-                    fprintf(stderr,
-                            "[LZO-PIPE-GATE] entropy=%.3f max=%.3f sample_kb=%zu decision=%s\n",
-                            entropy, entropy_max, entropy_sample_kb,
-                            (entropy <= entropy_max) ? "pipeline" : "fallback");
-                }
-                if (entropy > entropy_max) {
-                    allow_pipeline = 0;
-                }
-            } else if (debug_sched) {
-                fprintf(stderr,
-                        "[LZO-PIPE-GATE] entropy sampling failed, keep size-threshold decision\n");
-            }
-        }
-
-        if (allow_pipeline) {
-            return lzo_compress_core_pipeline(
-                ctx,
-                queue,
-                device,
-                kernel,
-                pack_kernel,
-                input_path,
-                output_path,
-                params,
-                ws,
-                time_us_out,
-                output_size_out,
-                t_out,
-                in_sz,
-                blk_probe,
-                nblk_probe,
-                t_total_start,
-                debug_sched
-            );
-        }
     }
 
     /* 2. 准备输入缓冲区 (如果是 Daemon 模式,此处通常会命中预分配好的常驻缓冲) */
@@ -1533,45 +647,29 @@ int lzo_compress_core(
 
     cl_uint in_sz_cl = (cl_uint)in_sz, blk_cl = (cl_uint)blk, worst_blk_cl = (cl_uint)worst_blk;
 
-    /* Dictionary pool follows active work-items for one-work-item-per-block scheduling. */
     size_t local_size = 1;
-    unsigned sched_wi_per_cu = 256U;
     local_size = (params->local_size_param > 0) ? (size_t)params->local_size_param : 1;
     if (params->local_size_param > 0 && params->debug) {
         fprintf(stderr, "[CORE] using local_size=%zu\n", local_size);
     }
 
-    int is_999 = (params->level == 999);
-    int is_99 = (params->level == 99);
     size_t target_items = nblk;
     if (target_items == 0) target_items = 1;
     {
         cl_uint cus = 0;
         cl_ulong global_mem = 0;
         cl_ulong max_alloc = 0;
-        size_t dict_per_block;
+        size_t dict_per_block = (1ULL << params->level) * sizeof(uint32_t);
         size_t occ_cap = 0;
         size_t mem_cap = 0;
         size_t safe_mem = 0;
         size_t safe_alloc = 0;
 
-        if (is_999) {
-            dict_per_block = 458752ULL;
-        } else if (is_99) {
-            dict_per_block = (1ULL << 14) * 4 * sizeof(uint32_t);
-        } else {
-            dict_per_block = (1ULL << params->level) * sizeof(uint32_t);
-        }
-
         (void)clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cus), &cus, NULL);
         (void)clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem), &global_mem, NULL);
         (void)clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, NULL);
-        sched_wi_per_cu = lzo_choose_comp_wi_per_cu(128U);
-        occ_cap = (cus > 0) ? ((size_t)cus * (size_t)sched_wi_per_cu) : 4096U;
+        occ_cap = (cus > 0) ? ((size_t)cus * (size_t)LZO_OCC_FACTOR_DEFAULT) : 4096U;
         if (occ_cap < 1024U) occ_cap = 1024U;
-        if (is_999) {
-            if (occ_cap > 64) occ_cap = 64;
-        }
 
         if (dict_per_block > 0) {
             size_t cap_by_global = SIZE_MAX;
@@ -1610,34 +708,23 @@ int lzo_compress_core(
     if (debug_sched) {
         double blk_per_wi = (target_items > 0) ? ((double)nblk / (double)target_items) : 0.0;
         fprintf(stderr,
-                "[LZO-SCHED] alg=%d level=%d blocks=%zu bs=%zu lsz=%zu target_wi=%zu g=%zu wi_per_cu=%u blk_per_wi=%.2f\n",
-                params->alg_id, params->level, nblk, blk, local_size, target_items, global_size, sched_wi_per_cu, blk_per_wi);
+                "[LZO-SCHED] alg=%d level=%d blocks=%zu bs=%zu lsz=%zu target_wi=%zu g=%zu blk_per_wi=%.2f\n",
+                params->alg_id, params->level, nblk, blk, local_size, target_items, global_size, blk_per_wi);
     }
 
-    if (!is_999) {
-        if (ws->comp_epoch_base == 0) ws->comp_epoch_base = 1;
-        if ((uint32_t)nblk + 2U >= 4095U || ws->comp_epoch_base + (uint32_t)nblk + 1U > 4095U) {
-            if (ws->d_dict && ws->dict_size > 0) {
-                (void)lzo_zero_buffer(queue, ws->d_dict, ws->dict_size);
-            }
-            ws->comp_epoch_base = 1;
+    if (ws->comp_epoch_base == 0) ws->comp_epoch_base = 1;
+    if ((uint32_t)nblk + 2U >= 4095U || ws->comp_epoch_base + (uint32_t)nblk + 1U > 4095U) {
+        if (ws->d_dict && ws->dict_size > 0) {
+            (void)lzo_zero_buffer(queue, ws->d_dict, ws->dict_size);
         }
+        ws->comp_epoch_base = 1;
     }
-    uint32_t epoch_base = is_999 ? 0U : ws->comp_epoch_base;
-    if (!is_999) {
-        ws->comp_epoch_base += (uint32_t)nblk + 1U;
-    }
+    uint32_t epoch_base = ws->comp_epoch_base;
+    ws->comp_epoch_base += (uint32_t)nblk + 1U;
 
     {
-        size_t dict_per_block;
-        if (is_999) {
-            dict_per_block = 458752ULL;
-        } else if (is_99) {
-            dict_per_block = (1ULL << 14) * 4 * sizeof(uint32_t);
-        } else {
-            /* 32-bit packed dictionary: epoch_12|offset_20 in one uint32 per hash entry. */
-            dict_per_block = (1ULL << params->level) * sizeof(uint32_t);
-        }
+        /* 32-bit packed dictionary: epoch_12|offset_20 in one uint32 per hash entry. */
+        size_t dict_per_block = (1ULL << params->level) * sizeof(uint32_t);
         size_t total_dict_size = (size_t)pool_size * dict_per_block;
         size_t prev_dict_size = ws->dict_size;
 
@@ -1650,11 +737,22 @@ int lzo_compress_core(
             (void)lzo_zero_buffer_range(queue, d_dict, prev_dict_size, ws->dict_size - prev_dict_size);
         }
 
-        if (is_999) {
-            /* 999 kernel: 10 args — swd_pool, swd_pool_count, try_lazy, max_chain */
-            cl_uint swd_pool_count = pool_size;
-            cl_uint try_lazy_val = 2U;
-            cl_uint max_chain_val = 4096U;
+        int need_set_stable_args = 1;
+        if (skip_input_upload &&
+            ws->comp_kernel_args_set &&
+            ws->comp_cached_kernel == kernel &&
+            ws->comp_cached_d_in == d_in &&
+            ws->comp_cached_d_out == d_out &&
+            ws->comp_cached_d_len == d_len &&
+            ws->comp_cached_d_dict == d_dict &&
+            ws->comp_cached_in_sz == in_sz_cl &&
+            ws->comp_cached_blk == blk_cl &&
+            ws->comp_cached_worst_blk == worst_blk_cl &&
+            ws->comp_cached_pool_size == (cl_uint)pool_size) {
+            need_set_stable_args = 0;
+        }
+
+        if (need_set_stable_args) {
             CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_in));
             CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_out));
             CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &d_len));
@@ -1662,72 +760,40 @@ int lzo_compress_core(
             CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uint), &blk_cl));
             CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uint), &worst_blk_cl));
             CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem), &d_dict));
-            CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uint), &swd_pool_count));
-            CHECK(clSetKernelArg(kernel, 8, sizeof(cl_uint), &try_lazy_val));
-            CHECK(clSetKernelArg(kernel, 9, sizeof(cl_uint), &max_chain_val));
-            ws->comp_kernel_args_set = 0;
-            ws->comp_cached_kernel = NULL;
-        } else {
-            int need_set_stable_args = 1;
-            if (skip_input_upload &&
-                ws->comp_kernel_args_set &&
-                ws->comp_cached_kernel == kernel &&
-                ws->comp_cached_d_in == d_in &&
-                ws->comp_cached_d_out == d_out &&
-                ws->comp_cached_d_len == d_len &&
-                ws->comp_cached_d_dict == d_dict &&
-                ws->comp_cached_in_sz == in_sz_cl &&
-                ws->comp_cached_blk == blk_cl &&
-                ws->comp_cached_worst_blk == worst_blk_cl &&
-                ws->comp_cached_pool_size == (cl_uint)pool_size &&
-                ws->comp_cached_is_999 == 0) {
-                need_set_stable_args = 0;
-            }
+            CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uint), &pool_size));
 
-            if (need_set_stable_args) {
-                CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_in));
-                CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_out));
-                CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &d_len));
-                CHECK(clSetKernelArg(kernel, 3, sizeof(cl_uint), &in_sz_cl));
-                CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uint), &blk_cl));
-                CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uint), &worst_blk_cl));
-                CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem), &d_dict));
-                CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uint), &pool_size));
+            ws->comp_kernel_args_set = 1;
+            ws->comp_cached_kernel = kernel;
+            ws->comp_cached_d_in = d_in;
+            ws->comp_cached_d_out = d_out;
+            ws->comp_cached_d_len = d_len;
+            ws->comp_cached_d_dict = d_dict;
+            ws->comp_cached_in_sz = in_sz_cl;
+            ws->comp_cached_blk = blk_cl;
+            ws->comp_cached_worst_blk = worst_blk_cl;
+            ws->comp_cached_pool_size = (cl_uint)pool_size;
+            ws->comp_cached_input_size = in_sz;
+            ws->comp_cached_blk_size = blk;
+            ws->comp_cached_nblk = nblk;
+        }
 
-                ws->comp_kernel_args_set = 1;
-                ws->comp_cached_kernel = kernel;
-                ws->comp_cached_d_in = d_in;
-                ws->comp_cached_d_out = d_out;
-                ws->comp_cached_d_len = d_len;
-                ws->comp_cached_d_dict = d_dict;
-                ws->comp_cached_in_sz = in_sz_cl;
-                ws->comp_cached_blk = blk_cl;
-                ws->comp_cached_worst_blk = worst_blk_cl;
-                ws->comp_cached_pool_size = (cl_uint)pool_size;
-                ws->comp_cached_is_999 = 0;
-                ws->comp_cached_input_size = in_sz;
-                ws->comp_cached_blk_size = blk;
-                ws->comp_cached_nblk = nblk;
-            }
+        CHECK(clSetKernelArg(kernel, 8, sizeof(cl_uint), &epoch_base));
 
-            CHECK(clSetKernelArg(kernel, 8, sizeof(cl_uint), &epoch_base));
-
-            if (dbg_comp_enabled) {
-                size_t dbg_comp_bytes = nblk * LZO_DBG_COMP_N * sizeof(uint32_t);
-                dbg_comp_buf = clCreateBuffer(ctx, CL_MEM_READ_WRITE, dbg_comp_bytes, NULL, &err);
-                if (err != CL_SUCCESS || !dbg_comp_buf || lzo_zero_buffer(queue, dbg_comp_buf, dbg_comp_bytes) != 0) {
-                    if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
-                    dbg_comp_buf = NULL;
-                    dbg_comp_enabled = 0;
-                    fprintf(stderr, "[LZO-DBG][COMP] warning: failed to enable debug counters\n");
-                }
+        if (dbg_comp_enabled) {
+            size_t dbg_comp_bytes = nblk * LZO_DBG_COMP_N * sizeof(uint32_t);
+            dbg_comp_buf = clCreateBuffer(ctx, CL_MEM_READ_WRITE, dbg_comp_bytes, NULL, &err);
+            if (err != CL_SUCCESS || !dbg_comp_buf || lzo_zero_buffer(queue, dbg_comp_buf, dbg_comp_bytes) != 0) {
+                if (dbg_comp_buf) clReleaseMemObject(dbg_comp_buf);
+                dbg_comp_buf = NULL;
+                dbg_comp_enabled = 0;
+                fprintf(stderr, "[LZO-DBG][COMP] warning: failed to enable debug counters\n");
             }
-            if (kernel_has_dbg) {
-                cl_mem dbg_arg = dbg_comp_enabled ? dbg_comp_buf : d_len;
-                cl_uint dbg_flag = dbg_comp_enabled ? 1U : 0U;
-                CHECK(clSetKernelArg(kernel, 9, sizeof(cl_mem), &dbg_arg));
-                CHECK(clSetKernelArg(kernel, 10, sizeof(cl_uint), &dbg_flag));
-            }
+        }
+        if (kernel_has_dbg) {
+            cl_mem dbg_arg = dbg_comp_enabled ? dbg_comp_buf : d_len;
+            cl_uint dbg_flag = dbg_comp_enabled ? 1U : 0U;
+            CHECK(clSetKernelArg(kernel, 9, sizeof(cl_mem), &dbg_arg));
+            CHECK(clSetKernelArg(kernel, 10, sizeof(cl_uint), &dbg_flag));
         }
     }
 
@@ -2106,7 +1172,7 @@ int lzo_decompress_core(
     {
         cl_uint kernel_num_args = 0;
         int kernel_has_dbg = 0;
-        int dbg_dec_enabled = lzo_debug_counters_enabled();
+        int dbg_dec_enabled = (debug || lzo_debug_counters_enabled()) ? 1 : 0;
         if (clGetKernelInfo(kernel, CL_KERNEL_NUM_ARGS, sizeof(kernel_num_args), &kernel_num_args, NULL) == CL_SUCCESS) {
             kernel_has_dbg = (kernel_num_args >= 10U);
         }

@@ -73,4 +73,5 @@ lzo_hybrid/*.cl
 .cache
 benchmark_bandwidth
 *_debug.cl
+lzo_gpu_v2/
 # end

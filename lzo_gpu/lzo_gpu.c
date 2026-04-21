@@ -74,6 +74,27 @@ static inline void print_ns(const char* tag, uint64_t ns) {
 static size_t g_cli_fixed_block_bytes = 0; /* 0 = not specified */
 static int g_cli_fixed_block_exact = 0; /* 1 = user specified bytes (B suffix) -> respect exact */
 static size_t g_cli_local_size = 0;       /* 0 = not specified */
+static int g_cli_debug_kernel = 0;
+
+enum {
+    BENCH_LZO_DBG_DEC_TOKENS = 0,
+    BENCH_LZO_DBG_DEC_LITERAL_BYTES,
+    BENCH_LZO_DBG_DEC_MATCH_BYTES,
+    BENCH_LZO_DBG_DEC_SMALL_OFFSETS,
+    BENCH_LZO_DBG_DEC_OUTPUT_ERROR,
+    BENCH_LZO_DBG_DEC_LITERAL_OPS,
+    BENCH_LZO_DBG_DEC_MATCH_OPS,
+    BENCH_LZO_DBG_DEC_OVERLAP_MATCHES,
+    BENCH_LZO_DBG_DEC_M2_MATCHES,
+    BENCH_LZO_DBG_DEC_M3_MATCHES,
+    BENCH_LZO_DBG_DEC_M4_MATCHES,
+    BENCH_LZO_DBG_DEC_FIRST_LITERAL_RUN_BYTES,
+    BENCH_LZO_DBG_DEC_FIRST_LITERAL_RUN_OPS,
+    BENCH_LZO_DBG_DEC_POST_MATCH_LITERAL_BYTES,
+    BENCH_LZO_DBG_DEC_POST_MATCH_LITERAL_OPS,
+    BENCH_LZO_DBG_DEC_EOF_MARKERS,
+    BENCH_LZO_DBG_DEC_N
+};
 
 #define CHECK(expr)  do{ cl_int _e=(expr);                       \
         if(_e!=CL_SUCCESS){                                      \
@@ -288,11 +309,12 @@ static inline void show_help(char *prog_name)
     fprintf(stderr, "  -d, --decompress     Decompress mode\n");
     fprintf(stderr, "  -o, --output FILE    Output file (use '-' for stdout)\n");
     fprintf(stderr, "  -a, --alg ALG        Algorithm (lzo1x, lzo1y) (default: lzo1x)\n");
-    fprintf(stderr, "  -L, --level LEVEL    Compression level: 11-15=D_BITS (default: 14), 99=enhanced greedy, 999=optimal (SWD)\n");
+    fprintf(stderr, "  -L, --level LEVEL    Compression level: 11-15=D_BITS (default: 14)\n");
     fprintf(stderr, "  -B, --block-size N   Block size (B/KB/MB) (default: 64KB)\n");
     fprintf(stderr, "  -v, --verbose        Enable performance statistics\n");
     fprintf(stderr, "  --local N            Local work-group size (default: 1)\n");
     fprintf(stderr, "  --bench [N]          Stable benchmark (compress+decompress+verify), optional N seconds (default: 3)\n");
+    fprintf(stderr, "  --debug-kernel       Use debug-enabled kernels and print diagnostic counters\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Streaming:\n");
     fprintf(stderr, "  input '-'            Read input from stdin (standalone mode only)\n");
@@ -308,13 +330,7 @@ static inline void show_help(char *prog_name)
     fprintf(stderr, "  %s -h|--help                                 # show this help\n", prog_name);
     fprintf(stderr, "\nEnvironment variables (grouped — standalone / client->daemon / advanced):\n");
     fprintf(stderr, "    LZO_STANDARD_COPY=0|1    0=zero-copy (map into pinned buffer), 1=standard host->device copy (explicit upload). Applies to both compression and decompression.\n");
-    fprintf(stderr, "    LZO_GPU_ENABLE_COMPACTION=0|1  Enable device compaction/pack path (default: 0).\n");
-    fprintf(stderr, "    LZO_GPU_FORCE_COMPACTION=0|1   Force off/on device compaction, overrides adaptive gate.\n");
-    fprintf(stderr, "    LZO_PIPELINE_ENABLE=0|1        Enable chunked pipeline compression path (default: 0).\n");
-    fprintf(stderr, "    LZO_PIPELINE_OVERLAP_ENABLE=0|1 Enable upload/compute overlap on standard-copy pipeline path (default: 0).\n");
-    fprintf(stderr, "    LZO_PIPELINE_THRESHOLD_MB=N    Min input size to enable pipeline when on (default: 64).\n");
-    fprintf(stderr, "    LZO_PIPELINE_CHUNK_BLOCKS=N    Pipeline chunk blocks (default: 512).\n");
-    fprintf(stderr, "    LZO_PIPELINE_ENTROPY_ENABLE=0|1  Enable entropy gate for pipeline.\n");
+    fprintf(stderr, "    LZO_GPU_DEBUG=0|1        1=load debug-enabled kernels and print diagnostic counters.\n");
 }
 
 static int cmp_double_asc(const void *a, const void *b) {
@@ -351,7 +367,12 @@ static double elapsed_sec(const struct timespec *start, const struct timespec *e
 }
 
 static int lzo_debug_counters_enabled_cli(void) {
-    return 0;
+    const char* env;
+    if (g_cli_debug_kernel) return 1;
+    env = getenv("LZO_GPU_DEBUG");
+    if (!env || !*env) return 0;
+    return (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0 ||
+            strcasecmp(env, "yes") == 0 || strcasecmp(env, "on") == 0);
 }
 
 static int path_is_dash(const char* path) {
@@ -457,8 +478,6 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
     /* load compression kernel */
     cl_program prog_c = NULL;
     cl_kernel krn_c = NULL;
-    cl_kernel pack_krn = NULL;
-    cl_int err = CL_SUCCESS;
     char build_log[8192] = {0};
     int kernel_has_dbg = 0;
     int debug_counters = lzo_debug_counters_enabled_cli();
@@ -470,10 +489,6 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
     }
     uint64_t tk2 = now_ns();
     g_kernel_load_us = (unsigned long)((tk2 - tk1) / 1000);
-
-    err = CL_SUCCESS;
-    pack_krn = clCreateKernel(prog_c, "lzo_pack_compressed_blocks", &err);
-    if (err != CL_SUCCESS || !pack_krn) pack_krn = NULL;
 
     int standard_copy = lzo_resolve_standard_copy(dev);
     size_t block_size = g_cli_fixed_block_bytes;
@@ -496,7 +511,7 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
     size_t output_size = 0;
     timing_t t_out = {0};
 
-    int ret = lzo_compress_core(ctx, q, dev, krn_c, pack_krn, in_path, output_path, &params, 0, &ws, &time_us, &output_size, &t_out);
+    int ret = lzo_compress_core(ctx, q, dev, krn_c, in_path, output_path, &params, 0, &ws, &time_us, &output_size, &t_out);
     uint64_t t_total_end = now_ns();
     unsigned long overall_us = (unsigned long)((t_total_end - t_total_start) / 1000ULL);
 
@@ -520,7 +535,6 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
                     overall_us / 1000.0);
         }
     }
-    if (pack_krn) clReleaseKernel(pack_krn);
     if (krn_c) clReleaseKernel(krn_c);
     if (prog_c) clReleaseProgram(prog_c);
     if (q) { clReleaseCommandQueue(q); q = NULL; }
@@ -544,10 +558,7 @@ static int do_decompress_mode(const char* lz_path, const char* output_path, int 
     const char* alg_name = (a[3] == 1) ? "lzo1y" : "lzo1x";
     int debug_counters = lzo_debug_counters_enabled_cli();
     char decomp_base[64];
-    if (debug_counters)
-        snprintf(decomp_base, sizeof(decomp_base), "%s_decomp_debug", alg_name);
-    else
-        snprintf(decomp_base, sizeof(decomp_base), "%s_decomp", alg_name);
+    snprintf(decomp_base, sizeof(decomp_base), "%s_decomp", alg_name);
 
     uint64_t t_total_start = now_ns();
 
@@ -658,7 +669,6 @@ static int run_lzo_bench(const char *in_path,
 
     cl_program prog_c = NULL;
     cl_kernel krn_c = NULL;
-    cl_kernel pack_krn = NULL;
     cl_int err = CL_SUCCESS;
     int kernel_has_dbg = 0;
     char build_log[8192] = {0};
@@ -673,17 +683,10 @@ static int run_lzo_bench(const char *in_path,
         return 1;
     }
 
-    err = CL_SUCCESS;
-    pack_krn = clCreateKernel(prog_c, "lzo_pack_compressed_blocks", &err);
-    if (err != CL_SUCCESS || !pack_krn) pack_krn = NULL;
-
     char decomp_base[64];
     /* For decompression path, use decomp-only marker to skip unnecessary comp-kernel validation. */
-    if (debug_counters && comp_level != 999 && comp_level != 99)
-        snprintf(decomp_base, sizeof(decomp_base), "%s_decomp_debug", alg_name);
-    else
-        snprintf(decomp_base, sizeof(decomp_base), "%s_decomp", alg_name);
-    int decomp_bits = (comp_level == 999 || comp_level == 99) ? LZO_DEFAULT_COMP_LEVEL : comp_level;
+    snprintf(decomp_base, sizeof(decomp_base), "%s_decomp", alg_name);
+    int decomp_bits = comp_level;
     cl_program prog_d = lzo_load_program_with_dbits(ctx, dev, decomp_base, decomp_bits, build_log, sizeof(build_log));
     if (!prog_d) {
         if (build_log[0]) {
@@ -803,6 +806,17 @@ static int run_lzo_bench(const char *in_path,
     unsigned long long dbg_dec_matches_total = 0;
     unsigned long long dbg_dec_small_offsets_total = 0;
     unsigned long long dbg_dec_output_errors_total = 0;
+    unsigned long long dbg_dec_literal_ops_total = 0;
+    unsigned long long dbg_dec_match_ops_total = 0;
+    unsigned long long dbg_dec_overlap_matches_total = 0;
+    unsigned long long dbg_dec_m2_matches_total = 0;
+    unsigned long long dbg_dec_m3_matches_total = 0;
+    unsigned long long dbg_dec_m4_matches_total = 0;
+    unsigned long long dbg_dec_first_literal_run_bytes_total = 0;
+    unsigned long long dbg_dec_first_literal_run_ops_total = 0;
+    unsigned long long dbg_dec_post_match_literal_bytes_total = 0;
+    unsigned long long dbg_dec_post_match_literal_ops_total = 0;
+    unsigned long long dbg_dec_eof_markers_total = 0;
 
     /* --- Host-side optimization: pre-allocate reusable resources --- */
     /* Decompression CL buffers (reused across iterations, grown if needed) */
@@ -833,7 +847,7 @@ static int run_lzo_bench(const char *in_path,
         cl_mem d_dbg_dec = NULL;
 
         int skip_input_upload = 1;
-        int rc = lzo_compress_core(ctx, q, dev, krn_c, pack_krn, in_path, NULL,
+        int rc = lzo_compress_core(ctx, q, dev, krn_c, in_path, NULL,
                        &params, skip_input_upload, &ws, &time_us, &out_size, &tc);
         if (rc != 0) {
             verify_ok = 0;
@@ -1005,12 +1019,12 @@ static int run_lzo_bench(const char *in_path,
 
             int dbg_dec_enabled = (debug_counters && kernel_has_dbg_dec);
             if (dbg_dec_enabled) {
-                size_t dbg_bytes = nblk * 5 * sizeof(cl_uint);
+                size_t dbg_bytes = nblk * BENCH_LZO_DBG_DEC_N * sizeof(cl_uint);
                 d_dbg_dec = clCreateBuffer(ctx, CL_MEM_READ_WRITE, dbg_bytes, NULL, &err);
                 if (err != CL_SUCCESS || !d_dbg_dec) {
                     dbg_dec_enabled = 0;
                 } else {
-                    h_dbg_dec = (cl_uint*)calloc(nblk * 5, sizeof(cl_uint));
+                    h_dbg_dec = (cl_uint*)calloc(nblk * BENCH_LZO_DBG_DEC_N, sizeof(cl_uint));
                     if (!h_dbg_dec) {
                         dbg_dec_enabled = 0;
                     } else {
@@ -1072,16 +1086,27 @@ static int run_lzo_bench(const char *in_path,
         }
 
         if (d_dbg_dec && h_dbg_dec) {
-            size_t dbg_bytes = nblk * 5 * sizeof(cl_uint);
+            size_t dbg_bytes = nblk * BENCH_LZO_DBG_DEC_N * sizeof(cl_uint);
             err = clEnqueueReadBuffer(q, d_dbg_dec, CL_TRUE, 0, dbg_bytes, h_dbg_dec, 0, NULL, NULL);
             if (err == CL_SUCCESS) {
                 for (size_t i = 0; i < nblk; ++i) {
-                    size_t base = i * 5;
-                    dbg_dec_tokens_total += h_dbg_dec[base + 0];
-                    dbg_dec_literals_total += h_dbg_dec[base + 1];
-                    dbg_dec_matches_total += h_dbg_dec[base + 2];
-                    dbg_dec_small_offsets_total += h_dbg_dec[base + 3];
-                    dbg_dec_output_errors_total += h_dbg_dec[base + 4];
+                    size_t base = i * BENCH_LZO_DBG_DEC_N;
+                    dbg_dec_tokens_total += h_dbg_dec[base + BENCH_LZO_DBG_DEC_TOKENS];
+                    dbg_dec_literals_total += h_dbg_dec[base + BENCH_LZO_DBG_DEC_LITERAL_BYTES];
+                    dbg_dec_matches_total += h_dbg_dec[base + BENCH_LZO_DBG_DEC_MATCH_BYTES];
+                    dbg_dec_small_offsets_total += h_dbg_dec[base + BENCH_LZO_DBG_DEC_SMALL_OFFSETS];
+                    dbg_dec_output_errors_total += h_dbg_dec[base + BENCH_LZO_DBG_DEC_OUTPUT_ERROR];
+                    dbg_dec_literal_ops_total += h_dbg_dec[base + BENCH_LZO_DBG_DEC_LITERAL_OPS];
+                    dbg_dec_match_ops_total += h_dbg_dec[base + BENCH_LZO_DBG_DEC_MATCH_OPS];
+                    dbg_dec_overlap_matches_total += h_dbg_dec[base + BENCH_LZO_DBG_DEC_OVERLAP_MATCHES];
+                    dbg_dec_m2_matches_total += h_dbg_dec[base + BENCH_LZO_DBG_DEC_M2_MATCHES];
+                    dbg_dec_m3_matches_total += h_dbg_dec[base + BENCH_LZO_DBG_DEC_M3_MATCHES];
+                    dbg_dec_m4_matches_total += h_dbg_dec[base + BENCH_LZO_DBG_DEC_M4_MATCHES];
+                    dbg_dec_first_literal_run_bytes_total += h_dbg_dec[base + BENCH_LZO_DBG_DEC_FIRST_LITERAL_RUN_BYTES];
+                    dbg_dec_first_literal_run_ops_total += h_dbg_dec[base + BENCH_LZO_DBG_DEC_FIRST_LITERAL_RUN_OPS];
+                    dbg_dec_post_match_literal_bytes_total += h_dbg_dec[base + BENCH_LZO_DBG_DEC_POST_MATCH_LITERAL_BYTES];
+                    dbg_dec_post_match_literal_ops_total += h_dbg_dec[base + BENCH_LZO_DBG_DEC_POST_MATCH_LITERAL_OPS];
+                    dbg_dec_eof_markers_total += h_dbg_dec[base + BENCH_LZO_DBG_DEC_EOF_MARKERS];
                 }
             }
         }
@@ -1204,12 +1229,24 @@ static int run_lzo_bench(const char *in_path,
         printf("Bench Decompress : kernel_tp=%.2f MB/s verify=%s\n",
             median_double(dec_tp, n), verify_ok ? "OK" : "FAIL");
         if (debug_counters) {
-            printf("[LZO-DBG][DECOMP] tokens=%llu literal_bytes=%llu match_bytes=%llu small_offsets=%llu output_errors=%llu\n",
+            printf("[LZO-DBG][DECOMP] tokens=%llu literal_bytes=%llu match_bytes=%llu small_offsets=%llu output_errors=%llu literal_ops=%llu match_ops=%llu overlap_matches=%llu\n",
                 dbg_dec_tokens_total,
                 dbg_dec_literals_total,
                 dbg_dec_matches_total,
                 dbg_dec_small_offsets_total,
-                dbg_dec_output_errors_total);
+                dbg_dec_output_errors_total,
+                dbg_dec_literal_ops_total,
+                dbg_dec_match_ops_total,
+                dbg_dec_overlap_matches_total);
+            printf("[LZO-DBG][DECOMP][detail] m2_matches=%llu m3_matches=%llu m4_matches=%llu first_literal_run_bytes=%llu first_literal_run_ops=%llu post_match_literal_bytes=%llu post_match_literal_ops=%llu eof_markers=%llu\n",
+                dbg_dec_m2_matches_total,
+                dbg_dec_m3_matches_total,
+                dbg_dec_m4_matches_total,
+                dbg_dec_first_literal_run_bytes_total,
+                dbg_dec_first_literal_run_ops_total,
+                dbg_dec_post_match_literal_bytes_total,
+                dbg_dec_post_match_literal_ops_total,
+                dbg_dec_eof_markers_total);
         }
     } else {
         fprintf(stderr, "bench error: no successful iteration\n");
@@ -1221,7 +1258,6 @@ static int run_lzo_bench(const char *in_path,
     free(ratio_pct);
     free(input_ref);
     lzo_gpu_workspace_free(&ws);
-    if (pack_krn) clReleaseKernel(pack_krn);
     if (krn_d) clReleaseKernel(krn_d);
     if (prog_d) clReleaseProgram(prog_d);
     if (krn_c) clReleaseKernel(krn_c);
@@ -1278,6 +1314,10 @@ int run_lzo_standalone(int argc, char** argv)
             }
             continue;
         }
+        if (strcmp(arg, "--debug-kernel") == 0) {
+            g_cli_debug_kernel = 1;
+            continue;
+        }
         if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
             g_verbose = 1;
             continue;
@@ -1299,8 +1339,8 @@ int run_lzo_standalone(int argc, char** argv)
             }
             const char* level_arg = argv[++i];
             comp_level = atoi(level_arg);
-            if (comp_level != 999 && comp_level != 99 && (comp_level < 11 || comp_level > 15)) {
-                fprintf(stderr, "error: dictionary size must be between 11 and 15 bits (got %d)\n", comp_level);
+            if (comp_level < 11 || comp_level > 20) {
+                fprintf(stderr, "error: dictionary size must be between 11 and 20 bits (got %d)\n", comp_level);
                 return 1;
             }
             continue;

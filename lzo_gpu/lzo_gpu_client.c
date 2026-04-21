@@ -343,16 +343,16 @@ int run_lzo_client(int argc, char** argv)
             if (i + 1 < argc) {
                 i++;
                 int val = atoi(argv[i]);
-                if (val == 999 || (val >= 11 && val <= 16)) {
+                if (val >= 11 && val <= 20) {
                     level = val;
                 } else {
                     // 尝试兼容旧参数
-                    if (strcmp(argv[i], "1") == 0) level = 12;
-                    else if (strcmp(argv[i], "1k") == 0) level = 10;
-                    else if (strcmp(argv[i], "1l") == 0) level = 11;
-                    else if (strcmp(argv[i], "1o") == 0) level = 14;
+                    if (strcmp(argv[i], "1") == 0) level = 14;
+                    else if (strcmp(argv[i], "1k") == 0) level = 12;
+                    else if (strcmp(argv[i], "1l") == 0) level = 13;
+                    else if (strcmp(argv[i], "1o") == 0) level = 15;
                     else {
-                        fprintf(stderr, "错误: level必须是 11-16 (bits)\n");
+                        fprintf(stderr, "错误: level必须是 11-20 (bits)\n");
                         free(inputs); return 1;
                     }
                 }
