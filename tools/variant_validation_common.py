@@ -354,7 +354,15 @@ def discover_samples(
             line = raw_line.strip()
             if not line or line.startswith("#"):
                 continue
+            if line.startswith("/root/samples/"):
+                line = str(samples_root / line.removeprefix("/root/samples/"))
             path = Path(line)
+            if path.is_absolute() and (not path.exists() or not path.is_file()):
+                try:
+                    rel = path.relative_to(DEFAULT_SAMPLES_ROOT)
+                    path = samples_root / rel
+                except ValueError:
+                    pass
             if not path.is_absolute():
                 path = samples_root / path
             if not path.exists() or not path.is_file():

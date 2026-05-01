@@ -1,6 +1,6 @@
 # LZO GPU 当前基线实现完整分析
 
-更新时间：2026-04-20
+更新时间：2026-04-30
 
 ## 分析范围与基线锚点
 
@@ -25,26 +25,20 @@
 本次文档默认采用的基线语义是：
 
 - Intel 锁定基线：`intel_lzo_gpu_lzo1x_d14_baseline_lock`
-- 当前 mainline **已经并入 D2 short-match helper**，因此不再与 `baseline_lock` 完全同码
+- 当前 mainline **已经并入 v2 已采纳的解压 token fast path、short8 direct-copy、真实解压输出路径优化**，因此不再与 `baseline_lock` 完全同码
 - 当前核心字典条目设计：`12-bit epoch + 20-bit offset`
 - 当前压缩主路径：单 primary hash + 四位置批量 probe/writeback
-- 当前解压主路径：`COPY_MATCH()` 分层专分支 + D2 的 `<=18B` 非重叠 short-match direct helper
+- 当前解压主路径：`COPY_MATCH()` 分层专分支 + `post_lit` token fast path + `<=18B` 非重叠 short-match direct helper，其中 `<=8B` 使用单次 8B copy
 - 当前 host 主路径：Intel 默认 `mapped/zero-copy`，`standard_copy` 已被 formal gate-10 判定为 `reject`
 
-本轮确认的哈希锚点如下：
+本轮确认的基线锚点如下：
 
-- `lzo_gpu/lzo_gpu`
-  - `sha256=380f2105ce965d656fe013ee3868d623666c14febf168a47160d6a8504ef9e7c`
-- `lzo_gpu/lzo1x.cl`
-  - `sha256=8fca0865716800f32c13cebb15af6711b53e9f971f99395b9861760345e8776a`
-- `variant_validation/intel/.../baseline_lock/artifacts/lzo_gpu`
-  - `sha256=899e009c799516400bf8d89331f0abf2f25b6b4f08efef644a13d36b2773f4b3`
-- `variant_validation/intel/.../baseline_lock/artifacts/lzo1x.cl`
-  - `sha256=e685faba359b1a9271b655fcb90ee8d8b135cdc2b7d06147902814859c5f3cdc`
-- `variant_validation/intel/.../short_match_helper_r1/artifacts/lzo1x.cl`
-  - `sha256=eaf515cc911e0a7faa1722908b8ea007e80a552f2702329d5025da662d83737b`
+- 历史 locked baseline：`intel_lzo_gpu_lzo1x_d14_baseline_lock`，仍用于说明原始实现结构。
+- 当前主线：历史 locked baseline 之后继续并入 v2 已采纳的 GPU 解压优化与真实输出路径优化。
+- 当前仓库还没有重新生成新的 locked variant id；因此本文描述的是“当前主线真实实现”，不是旧 `baseline_lock` 工件的逐字节快照。
+- `.clbin` 预加载、debug counter、bench 环境打印不作为性能优化锚点；它们只属于构建、诊断或测试可观测性能力。
 
-这意味着：**当前主线已经从 `baseline_lock` 前进到“baseline_lock + D2 decode helper”**。当前仓库内还没有重新生成新的 locked variant id，但运行中的主线实现已经切换到 D2 采纳版；`short_match_helper_r1` 变体目录中的 `lzo1x.cl` 是 overlay 形式，所以与主线 `lzo1x.cl` 哈希不同，但核心解压逻辑已经合并到主线源码。
+这意味着：**当前主线已经从 `baseline_lock` 前进到“baseline_lock + token fast path + short8 direct-copy + 真实解压输出路径优化”**。后续如果重新生成 formal locked baseline，应以这个状态作为新的锁定对象。
 
 ## 整体结构图
 
@@ -76,6 +70,18 @@ flowchart TD
 ```
 
 ## 零、并行度模型与术语（先导）
+
+### 0.0 当前主线与 v2-only 能力边界
+
+当前 `lzo_gpu` 已经回迁的是 GPU 主线中验证过、且能在原始 host 结构下真实启用的能力：
+
+1. 压缩核心仍是融合式 block kernel，不采纳 LZOG2 多阶段拆分。
+2. 解压核心采纳 `post_lit` token fast path 和 `short8 direct-copy`。
+3. 普通真实解压路径采纳默认关闭 `out_lens` store 与 chunked readback/write 的保守策略。
+4. `lzo1x.cl/lzo1y.cl` 中可以存在 range kernel 入口，但当前原始 `lzo_gpu` host 默认仍加载 `*_block_compress` / `*_block_decompress`，不是 v2 hybrid/range 调度主线。
+
+因此，本文不会把 OpenCL CPU/hybrid、v2 range slots 自动 cap、或 v2 环境配置层写成当前 `lzo_gpu` 默认能力。
+
 
 ### 0.1 术语定义
 
@@ -269,13 +275,15 @@ $$
 
 因此当前解压优化并不是“改协议”，而是在 **保持语义不变** 的前提下，把 copy hot path 尽量变成向量化、少分支的版本。
 
-### 2.3 `COPY_MATCH()` + D2 short-match helper 当前主线形态
+### 2.3 token fast path + short8 direct-match helper 当前主线形态
 
-当前解压主线不是纯 baseline `COPY_MATCH()`，而是先走一层 D2 short-match helper，再回落到原始 `COPY_MATCH()`：
+当前解压主线不是纯 baseline `COPY_MATCH()`，而是在 token 状态机和 direct match copy 两处做了窄化优化：
 
-1. 若 `offset >= len && len <= 18`，直接走 `lzo1x_fast_direct_match_copy_18()`；
-2. 其余场景继续落回 `COPY_MATCH()`；
-3. `COPY_MATCH()` 内部再按重叠关系与 offset 大小选择不同 fast path。
+1. M2/M3/M4 常见 match 分支在解析 token/offset 时提前保存 `post_lit`；
+2. `match_done` 使用 `post_lit`，不再统一回读 `ip[-2] & 3`；
+3. 若 `offset >= mlen && mlen <= 18`，直接走 `lzo1x_fast_direct_match_copy_18()`；
+4. direct helper 内部对 `mlen <= 8` 使用一次 `vload8/vstore8`，`9..18` 保留原 16B 路径；
+5. 其余 overlap 或长 match 继续落回 `COPY_MATCH()`。
 
 其中 `COPY_MATCH()` 仍然是解压侧最重要的热点承载点，它对多类常见场景做了专门特化：
 
@@ -284,13 +292,13 @@ $$
 3. 更大 offset：按 `64 / 32 / 16 / 8 / 4` 不同区间分层拷贝；
 4. 极短尾巴：回退到标量补齐。
 
-本轮 D2 之所以能最终并入主线，本质上是因为它没有推翻这套结构，而是在其前面加了一个**非常窄、非常明确**的非重叠短匹配 fast path：
+这两项之所以能并入主线，是因为它们都直接减少高频路径上的真实工作量：
 
-- gate-10 `bench1/manual5`：`bench_dec_kernel_mbs avg=+8.7595%`，`dec_kernel_tp_mbs avg=+7.8498%`，`dec_total_no_oci_tp_mbs avg=+3.6027%`
-- fullset `bench1/manual5`：`bench_dec_kernel_mbs avg=+10.1537%`，`dec_kernel_tp_mbs avg=+9.5475%`，`dec_total_no_oci_tp_mbs avg=+4.9429%`
-- ratio：两轮都 `0.0000%`
+- `post_lit` 删除了 match 完成后的额外输入回读；
+- `short8 direct-copy` 把高频 `<=8B` direct match 的固定 16B 读写缩成 8B；
+- 二者都不改变压缩文件格式、压缩率、EOF 处理或 overlap 语义。
 
-也正因此，之前的 `D2.1`（把 helper 缩窄到 `8..18B`）会显著退化：它误删了 D2 对 `3..7B` 高频短匹配的有效覆盖，而不是去掉无效工作。
+v2 全样本真实路径对比中，合并后的 GPU 解压 kernel 相对原始 `lzo_gpu`：Windows/Arc 中位 `129.66%`，Linux/Xe 中位 `126.95%`，压缩率差 `0pp`。
 
 ### 2.4 正确性与错误检测
 
@@ -350,6 +358,8 @@ $$
 4. `OUT_DIR`
 5. `cwd`
 6. 原始文件名
+
+当前提交把 `.clbin` 改为显式可选行为：默认从 `.cl` 源码构建 kernel；只有设置 `LZO_GPU_USE_CLBIN=1` 时才尝试加载 bits-specific `.clbin`，失败或缺失时回退源码编译。这个改动的目标是构建/部署可靠性，不属于性能优化，不应与 kernel 改动混在一起分析。
 
 这一层对 formal validation 特别重要，因为 baseline/candidate 很多时候都不是直接运行仓库根目录下的主二进制，而是运行独立 artifact 或 runtime overlay。
 
@@ -438,16 +448,18 @@ daemon 路径的核心价值是：
 1. owner 粒度仍然绑定到 active WI，显存与 cache 压力随 `pool_size` 增长；
 2. 12-bit epoch 需要 host 侧严密管理回卷清零；
 3. GPU 路径的 total 与总功率仍明显受 host CPU 协同影响；
-4. 外部 artifact baseline 工件若运行目录选择错误，会在源码存在的情况下依旧编译失败——这一点已经在 `bench_lzo.py` 中被工具级修复。
+4. 解压 kernel 优化已经能稳定提升 kernel，但 Linux 下 no-ocl 总吞吐只小幅提升，说明 host/readback 策略必须按平台验证；
+5. range kernel 入口已经存在于 kernel 源码，但原始 `lzo_gpu` host 默认还不是 v2 hybrid/range 调度层，不能把 v2-only 测试结论直接当成当前默认路径能力；
+6. 外部 artifact baseline 工件若运行目录选择错误，会在源码存在的情况下依旧编译失败——这一点已经在 `bench_lzo.py` 中被工具级修复。
 
 ## 六、本文件结论
 
 本文件锚定的是当前已经被并入主线、并继续作为后续优化基线的实现：
 
-- 锁定基线：`intel_lzo_gpu_lzo1x_d14_baseline_lock`
-- 当前主线：`baseline_lock + D2 short-match helper`
-- 压缩主线：单 primary hash + 32-bit packed dict + 四位置 batch probe/writeback
-- 解压主线：保留 `COPY_MATCH()` 分层专分支，并在其前增加 `<=18B` 非重叠 short-match direct helper
-- host 主线：Intel 默认 `mapped`，`standard_copy` 已被 reject
+- 历史锁定基线：`intel_lzo_gpu_lzo1x_d14_baseline_lock`
+- 当前主线：`baseline_lock + 解压 token fast path + short8 direct-copy + 真实解压输出路径优化`
+- 压缩主线：单 primary hash + 32-bit packed dict + 四位置 batch probe/writeback；不采纳 LZOG2 多阶段拆分
+- 解压主线：保留 `COPY_MATCH()` 分层专分支，增加 `post_lit` 消除回读，并在 `<=18B` 非重叠 direct helper 中加入 `<=8B` 单次 8B copy
+- host 主线：Intel 默认 `mapped`，`standard_copy` 已被 reject；普通真实解压默认不写无用 `out_lens`，chunked readback/write 只作为真实路径优化
 
 后续若出现新的已采纳项，或我们为当前主线重新生成新的 locked variant id，再推进这份文档中的“锁定基线”锚点；在那之前，本文描述的就是**当前主线真实实现**，而不是旧的 `baseline_lock` 历史快照。

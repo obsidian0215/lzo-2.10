@@ -33,7 +33,7 @@
 
 #define MAGIC_TAG            0x4C5A       /* 'L''Z' */
 #define DEFAULT_THREAD_COUNT 0  /* 0 = auto-detect at runtime */
-#define MIN_BLOCK_SIZE       (64u * 1024u)
+#define MIN_BLOCK_SIZE       (32u * 1024u)
 #define MAX_BLOCK_SIZE       (512u * 1024u)
 #define LZO_WORK_MEM_SIZE    LZO1X_1_MEM_COMPRESS
 

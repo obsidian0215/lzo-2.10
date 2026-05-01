@@ -32,7 +32,8 @@ This binary is also used by `tools/bench_lzo.py` as the CPU reference engine.
 ## Notes
 
 - Thread count defaults to auto (0), resolved at runtime via `sysconf(_SC_NPROCESSORS_ONLN)`.
-- `--cpu-threads N` overrides this (0 = auto, N > 0 = fixed).
+- `-t N` / `--threads N` overrides this (0 = auto, N > 0 = fixed).
+- `-B 48KB` and `-B 64KB` are both supported for comparison with the GPU/OpenCL paths.
 - Fallback to 4 if sysconf is unavailable.
 - `lzo_cpu` is the preferred CPU implementation on the current Intel platform.
 - CPU OpenCL was explored separately through the GPU backend, but the native CPU path remains the recommended CPU baseline.

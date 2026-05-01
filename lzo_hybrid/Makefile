@@ -7,59 +7,137 @@ endif
 endif
 
 CC ?= gcc
+HOSTCC ?= gcc
 
 ifeq ($(OS),Windows_NT)
 EXEEXT ?=.exe
+HOSTEXEEXT ?=
 PTHREAD_LIB ?= -lpthread
 OPENCL_INCLUDE_DIR ?=
 OPENCL_LIB_DIR ?=
 OPENCL_LIB_NAME ?= OpenCL
 OPENCL_CFLAGS := $(if $(OPENCL_INCLUDE_DIR),-I$(OPENCL_INCLUDE_DIR),)
 OPENCL_LDFLAGS := $(if $(OPENCL_LIB_DIR),-L$(OPENCL_LIB_DIR),) -l$(OPENCL_LIB_NAME)
-CFLAGS ?= -std=gnu11 -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 -DNDEBUG -DWIN32_LEAN_AND_MEAN $(OPENCL_CFLAGS)
-LDFLAGS ?= $(OPENCL_LDFLAGS) -lm $(PTHREAD_LIB)
+CFLAGS ?= -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 -DWIN32_LEAN_AND_MEAN $(OPENCL_CFLAGS)
+LDFLAGS ?= $(OPENCL_LDFLAGS) -lm $(PTHREAD_LIB) -lws2_32
+HOST_OPENCL_CFLAGS ?=
+HOST_OPENCL_LDFLAGS ?=-lOpenCL -lm
+PRECOMPILE_HELPER := build_kernel_host$(HOSTEXEEXT)
 else
 EXEEXT ?=
+HOSTEXEEXT ?=$(EXEEXT)
 PTHREAD_CFLAGS ?= -pthread
 PTHREAD_LIB ?= -pthread
 OPENCL_CFLAGS ?=
 OPENCL_LDFLAGS ?=-lOpenCL
-CFLAGS ?= -std=gnu11 -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 -DNDEBUG $(OPENCL_CFLAGS) $(PTHREAD_CFLAGS)
+CFLAGS ?= -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 $(OPENCL_CFLAGS) $(PTHREAD_CFLAGS)
 LDFLAGS ?= $(OPENCL_LDFLAGS) -lm $(PTHREAD_LIB)
+HOST_OPENCL_CFLAGS ?=$(OPENCL_CFLAGS)
+HOST_OPENCL_LDFLAGS ?=$(LDFLAGS)
+PRECOMPILE_HELPER := build_kernel$(EXEEXT)
 endif
 
-CPU_DIR = ../lzo_cpu
-GPU_DIR = ../lzo_gpu
+## Automatically discover .cl sources present in this directory so we don't
+## attempt to precompile kernels that aren't actually in the tree.
+CL_SOURCES := $(wildcard *.cl)
 
-CPPFLAGS = -I$(CPU_DIR) -I$(CPU_DIR)/src -I$(CPU_DIR)/include -I$(CPU_DIR)/include/lzo \
-           -I$(GPU_DIR)
+# all: build_kernel lzo_hybrid precompile-combos
+all: build_kernel lzo_hybrid
 
-CPU_SRCS = $(CPU_DIR)/lzo1x_1.c $(CPU_DIR)/lzo1x_1k.c $(CPU_DIR)/lzo1x_1l.c \
-           $(CPU_DIR)/lzo1x_1o.c $(CPU_DIR)/lzo1x_d1.c $(CPU_DIR)/lzo1x_d2.c \
-           $(CPU_DIR)/lzo1y_1.c $(CPU_DIR)/lzo1y_d1.c $(CPU_DIR)/lzo1y_d2.c \
-           $(CPU_DIR)/src/lzo_init.c $(CPU_DIR)/src/lzo_ptr.c \
-           $(CPU_DIR)/src/lzo_str.c $(CPU_DIR)/src/lzo_util.c $(CPU_DIR)/src/lzo_crc.c
+build_kernel: build_kernel.c lzo_hybrid_utils.c lzo_env_config.c
+	$(CC) $(CFLAGS) -o build_kernel$(EXEEXT) build_kernel.c lzo_hybrid_utils.c lzo_env_config.c $(LDFLAGS)
 
-GPU_UTILS_SRC = $(GPU_DIR)/lzo_gpu_utils.c
+build_kernel_host: build_kernel.c lzo_hybrid_utils.c lzo_env_config.c
+	$(HOSTCC) -O2 -Wall -DCL_TARGET_OPENCL_VERSION=200 $(HOST_OPENCL_CFLAGS) -o build_kernel_host$(HOSTEXEEXT) build_kernel.c lzo_hybrid_utils.c lzo_env_config.c $(HOST_OPENCL_LDFLAGS)
 
-HYBRID_SRCS = lzo_hybrid.c lzo_hybrid_core.c
 
-all: symlinks lzo_hybrid
+# build the unified GPU host CLI
+ifeq ($(OS),Windows_NT)
+LZO_HYBRID_SRCS = lzo_hybrid.c lzo_hybrid_utils.c lzo_hybrid_core.c lzo_env_config.c
+else
+LZO_HYBRID_SRCS = lzo_hybrid.c lzo_hybrid_daemon.c lzo_hybrid_client.c lzo_hybrid_utils.c lzo_hybrid_core.c lzo_env_config.c
+endif
 
-lzo_hybrid: $(HYBRID_SRCS) $(GPU_UTILS_SRC) $(CPU_SRCS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@$(EXEEXT) $(HYBRID_SRCS) $(GPU_UTILS_SRC) $(CPU_SRCS) $(LDFLAGS)
+lzo_hybrid: $(LZO_HYBRID_SRCS)
+	$(CC) $(CFLAGS) -o lzo_hybrid$(EXEEXT) $(LZO_HYBRID_SRCS) $(LDFLAGS)
 
-symlinks:
-	@for f in $(GPU_DIR)/*.cl $(GPU_DIR)/*.clbin; do \
-		[ -e "$$f" ] || continue; \
-		bn=$$(basename "$$f"); \
-		if [ ! -e "$$bn" ]; then ln -sf "$$f" "$$bn"; fi; \
+precompile: $(PRECOMPILE_HELPER)
+# If KERNEL is specified, build only that kernel (basename without .cl)
+	# Usage: make precompile KERNEL=lzo1x_12
+	if [ -n "$(KERNEL)" ]; then \
+		src="$(KERNEL).cl"; \
+		if [ ! -f "$$src" ]; then echo "Kernel source $$src not found"; exit 1; fi; \
+		./$(PRECOMPILE_HELPER) $$src $${src%%.cl}.bin; \
+	else \
+		$(MAKE) precompile-combos; \
+	fi
+
+precompile-combos: $(PRECOMPILE_HELPER)
+	@echo "Generate binaries for all algorithms and dictionary sizes"
+	@for alg in lzo1x lzo1y; do \
+		for bits in 13 14 15; do \
+			echo "Building $${alg}_$${bits}.clbin from $${alg}.cl (D_BITS=$${bits})..."; \
+			./$(PRECOMPILE_HELPER) $${alg}.cl $${alg}_$${bits}.clbin "-I. -D D_BITS=$${bits}" || exit 1; \
+		done; \
 	done
 
+precompile-all: precompile-combos
+
+.PHONY: help check-opencl testdata
+
+help:
+	@echo "Makefile targets for lzo_hybrid:";
+	@echo "  make                 -> build helper and lzo_hybrid";
+	@echo "  make lzo_hybrid         -> build the hybrid host binary (lzo_hybrid)";
+	@echo "  make build_kernel    -> build the kernel precompiler helper";
+	@echo "  make precompile KERNEL=<name> -> precompile one kernel (basename, no .cl)";
+	@echo "  make precompile-all  -> precompile all kernel sources into .bin files";
+	@echo "  make check-opencl    -> quick compile/link check for OpenCL headers and library";
+	@echo "  make testdata [OUTDIR=../samples] -> generate test data suite (calls ../tools/generate-test-data.py --suite)";
+	@echo "  make clean-clbin     -> remove precompiled kernel binaries (.clbin)";
+
+
+check-opencl:
+	@echo "Checking OpenCL installation..."
+	@set -e; \
+	if pkg-config --exists OpenCL 2>/dev/null; then \
+		echo "OpenCL found via pkg-config:"; \
+		pkg-config --modversion OpenCL || true; \
+		echo "CFLAGS: $$(pkg-config --cflags OpenCL 2>/dev/null)"; \
+		echo "LIBS : $$(pkg-config --libs OpenCL 2>/dev/null)"; \
+	else \
+		echo "OpenCL not found via pkg-config"; \
+	fi; \
+	if [ -f /usr/include/CL/cl.h ]; then \
+		echo "OpenCL headers found at /usr/include/CL/"; \
+	elif [ -f /opt/AMDAPP/include/CL/cl.h ]; then \
+		echo "OpenCL headers found at /opt/AMDAPP/include/"; \
+	else \
+		echo "OpenCL headers not found in common locations"; \
+		echo "Please install OpenCL development headers:"; \
+		echo "  Ubuntu/Debian: sudo apt-get install opencl-headers ocl-icd-opencl-dev"; \
+		echo "  CentOS/RHEL: sudo yum install opencl-headers ocl-icd-devel"; \
+	fi; \
+	if ldconfig -p 2>/dev/null | grep -q libOpenCL; then \
+		echo "OpenCL library found in ldconfig"; \
+	else \
+		echo "OpenCL library not found in ldconfig"; \
+		echo "If you have an OpenCL ICD installed, run 'ldconfig' or ensure library path is configured."; \
+	fi
+
+# generate test data suite. Default OUTDIR=../samples so generated data lives at repo root samples/
+testdata:
+	@OUTDIR=$${OUTDIR:-../samples}; \
+	python3 ../tools/generate-test-data.py --suite --out-dir "$$OUTDIR" || (echo "failed to generate test data"; exit 1)
+
 clean:
-	rm -f lzo_hybrid lzo_hybrid.exe *.o
+	rm -f build_kernel build_kernel.exe build_kernel_host lzo_hybrid lzo_hybrid.exe *.bin
+	@echo "Note: precompiled .clbin kernel binaries are preserved by default. Run 'make clean-clbin' to remove them."
 
-distclean: clean
-	rm -f *.cl *.clbin
+clean-clbin:
+	rm -f *.clbin
 
-.PHONY: all clean distclean symlinks
+# remove everything including precompiled kernels
+distclean: clean clean-clbin
+
+.PHONY: all build_kernel lzo_hybrid precompile precompile-combos precompile-all clean clean-clbin distclean

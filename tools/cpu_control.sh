@@ -169,7 +169,10 @@ set_cpu_freq() {
 
     local max_freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq)
     local min_freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq)
-    local target_freq=$(( (max_freq - min_freq) * freq_percent / 100 + min_freq ))
+    local target_freq=$(( max_freq * freq_percent / 100 ))
+    if [ $target_freq -lt $min_freq ]; then
+        target_freq=$min_freq
+    fi
     local use_perf_pct=false
     if [ -f /sys/devices/system/cpu/intel_pstate/status ] && [ "$(cat /sys/devices/system/cpu/intel_pstate/status 2>/dev/null)" = "active" ] \
        && [ -w /sys/devices/system/cpu/intel_pstate/min_perf_pct ] && [ -w /sys/devices/system/cpu/intel_pstate/max_perf_pct ]; then

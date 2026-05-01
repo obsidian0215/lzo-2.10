@@ -23,6 +23,7 @@ class TelemetryProbe:
         self.cpu_domain: Optional[RAPLDomain] = None
         self.core_domain: Optional[RAPLDomain] = None
         self.gpu_domain: Optional[RAPLDomain] = None
+        self.dram_domain: Optional[RAPLDomain] = None
         self.gpu_rapl_nonfunctional = False
         self.has_nvidia_smi = shutil.which("nvidia-smi") is not None
         self.nvidia_energy_supported = False
@@ -94,20 +95,37 @@ class TelemetryProbe:
             return None
 
     def _detect_windows_energy_domains(self) -> None:
-        candidates = [
-            ("RAPL_Package0_PKG", r"\Energy Meter(RAPL_Package0_PKG)\Energy"),
-            ("_Total", r"\Energy Meter(_Total)\Energy"),
-        ]
-        for name, energy_path in candidates:
-            if self._read_windows_counter(energy_path, scale=1e-9) is not None:
-                self.cpu_domain = RAPLDomain(
-                    name=name,
-                    energy_path=energy_path,
-                    max_j=0.0,
-                    source="windows_counter",
-                    energy_scale=1e-9,
-                )
-                break
+        candidates = {
+            "pkg": [
+                ("RAPL_Package0_PKG", r"\Energy Meter(RAPL_Package0_PKG)\Energy"),
+                ("_Total", r"\Energy Meter(_Total)\Energy"),
+            ],
+            "core": [
+                ("RAPL_Package0_PP0", r"\Energy Meter(RAPL_Package0_PP0)\Energy"),
+            ],
+            "gpu": [
+                ("RAPL_Package0_PP1", r"\Energy Meter(RAPL_Package0_PP1)\Energy"),
+            ],
+            "dram": [
+                ("RAPL_Package0_DRAM", r"\Energy Meter(RAPL_Package0_DRAM)\Energy"),
+            ],
+        }
+        detected = {}
+        for role, role_candidates in candidates.items():
+            for name, energy_path in role_candidates:
+                if self._read_windows_counter(energy_path, scale=1e-9) is not None:
+                    detected[role] = RAPLDomain(
+                        name=name,
+                        energy_path=energy_path,
+                        max_j=0.0,
+                        source="windows_counter",
+                        energy_scale=1e-9,
+                    )
+                    break
+        self.cpu_domain = detected.get("pkg")
+        self.core_domain = detected.get("core")
+        self.gpu_domain = detected.get("gpu")
+        self.dram_domain = detected.get("dram")
 
     @staticmethod
     def _windows_average_cpu_property_mhz(prop_name: str) -> Optional[float]:
@@ -162,6 +180,11 @@ class TelemetryProbe:
         for d in domains:
             if d.name == "core":
                 self.core_domain = d
+                break
+
+        for d in domains:
+            if d.name.lower() == "dram":
+                self.dram_domain = d
                 break
 
         gpu_keywords = ("gpu", "uncore", "gt", "graphics")
@@ -278,7 +301,10 @@ class TelemetryProbe:
             cpu_src = ("win_energy_meter:" if self.cpu_domain.source == "windows_counter" else "rapl:") + self.cpu_domain.name
         else:
             cpu_src = "none"
-        core_src = f"rapl:{self.core_domain.name}" if self.core_domain else "none"
+        if self.core_domain:
+            core_src = ("win_energy_meter:" if self.core_domain.source == "windows_counter" else "rapl:") + self.core_domain.name
+        else:
+            core_src = "none"
         if self.gpu_domain:
             gpu_src = ("win_energy_meter:" if self.gpu_domain.source == "windows_counter" else "rapl:") + self.gpu_domain.name
         elif self.nvidia_energy_supported:
@@ -289,7 +315,11 @@ class TelemetryProbe:
             gpu_src = "pkg_minus_idle"
         else:
             gpu_src = "none"
-        return f"cpu={cpu_src};core={core_src};gpu={gpu_src}"
+        if self.dram_domain:
+            dram_src = ("win_energy_meter:" if self.dram_domain.source == "windows_counter" else "rapl:") + self.dram_domain.name
+        else:
+            dram_src = "none"
+        return f"cpu={cpu_src};core={core_src};gpu={gpu_src};dram={dram_src}"
 
     @staticmethod
     def _delta_with_wrap(start_v: Optional[float], end_v: Optional[float], max_v: float) -> float:
@@ -381,7 +411,10 @@ class TelemetryProbe:
             "gpu_freq_mhz": self._gpu_freq_mhz(),
             "cpu_energy_j": self._read_rapl_j(self.cpu_domain),
             "core_energy_j": self._read_rapl_j(self.core_domain),
+            "dram_energy_j": self._read_rapl_j(self.dram_domain),
             "cpu_power_w": None,
+            "core_power_w": None,
+            "dram_power_w": None,
             "gpu_energy_j": None,
             "gpu_power_w": None,
         }
@@ -389,9 +422,18 @@ class TelemetryProbe:
         if self.cpu_domain is not None and self.cpu_domain.source == "windows_counter":
             power_path = self._energy_path_to_power_path(self.cpu_domain.energy_path)
             snap["cpu_power_w"] = self._read_windows_counter(power_path, scale=1e-3)
+        if self.core_domain is not None and self.core_domain.source == "windows_counter":
+            power_path = self._energy_path_to_power_path(self.core_domain.energy_path)
+            snap["core_power_w"] = self._read_windows_counter(power_path, scale=1e-3)
+        if self.dram_domain is not None and self.dram_domain.source == "windows_counter":
+            power_path = self._energy_path_to_power_path(self.dram_domain.energy_path)
+            snap["dram_power_w"] = self._read_windows_counter(power_path, scale=1e-3)
 
         if self.gpu_domain is not None:
             snap["gpu_energy_j"] = self._read_rapl_j(self.gpu_domain)
+            if self.gpu_domain.source == "windows_counter":
+                power_path = self._energy_path_to_power_path(self.gpu_domain.energy_path)
+                snap["gpu_power_w"] = self._read_windows_counter(power_path, scale=1e-3)
         elif self.nvidia_energy_supported:
             mj = self._nvidia_query("energy")
             if mj is not None:
@@ -450,12 +492,15 @@ class TelemetryProbe:
                 "gpu_freq_avg_mhz": 0.0,
                 "cpu_energy_j": 0.0,
                 "core_energy_j": 0.0,
+                "dram_energy_j": 0.0,
                 "gpu_energy_j": 0.0,
                 "cpu_pkg_peak_power_w": 0.0,
                 "cpu_core_peak_power_w": 0.0,
+                "dram_peak_power_w": 0.0,
                 "gpu_peak_power_w": 0.0,
                 "cpu_pkg_avg_power_w": 0.0,
                 "cpu_core_avg_power_w": 0.0,
+                "dram_avg_power_w": 0.0,
                 "gpu_avg_power_w": 0.0,
             }
 
@@ -469,21 +514,29 @@ class TelemetryProbe:
                 "gpu_freq_avg_mhz": float(sum(gpu_freq_vals) / len(gpu_freq_vals)) if gpu_freq_vals else 0.0,
                 "cpu_energy_j": 0.0,
                 "core_energy_j": 0.0,
+                "dram_energy_j": 0.0,
                 "gpu_energy_j": 0.0,
                 "cpu_pkg_peak_power_w": 0.0,
                 "cpu_core_peak_power_w": 0.0,
+                "dram_peak_power_w": 0.0,
                 "gpu_peak_power_w": 0.0,
                 "cpu_pkg_avg_power_w": 0.0,
                 "cpu_core_avg_power_w": 0.0,
+                "dram_avg_power_w": 0.0,
                 "gpu_avg_power_w": 0.0,
             }
 
         cpu_energy = 0.0
         core_energy = 0.0
+        dram_energy = 0.0
         gpu_energy = 0.0
         cpu_power_energy = 0.0
+        core_power_energy = 0.0
+        dram_power_energy = 0.0
+        gpu_power_energy = 0.0
         cpu_pkg_peak = 0.0
         cpu_core_peak = 0.0
+        dram_peak = 0.0
         gpu_peak = 0.0
         elapsed_total = max(1e-9, float((samples[-1].get("ts") or 0.0) - (samples[0].get("ts") or 0.0)))
 
@@ -501,6 +554,11 @@ class TelemetryProbe:
                 s0.get("core_energy_j"),
                 s1.get("core_energy_j"),
                 self.core_domain.max_j if self.core_domain else 0.0,
+            )
+            de_dram = self._delta_with_wrap(
+                s0.get("dram_energy_j"),
+                s1.get("dram_energy_j"),
+                self.dram_domain.max_j if self.dram_domain else 0.0,
             )
 
             de_gpu = 0.0
@@ -524,12 +582,15 @@ class TelemetryProbe:
 
             cpu_energy += de_cpu
             core_energy += de_core
+            dram_energy += de_dram
             gpu_energy += de_gpu
 
             if de_cpu > 0.0:
                 cpu_pkg_peak = max(cpu_pkg_peak, de_cpu / dt)
             if de_core > 0.0:
                 cpu_core_peak = max(cpu_core_peak, de_core / dt)
+            if de_dram > 0.0:
+                dram_peak = max(dram_peak, de_dram / dt)
             if gp_interval > 0.0:
                 gpu_peak = max(gpu_peak, gp_interval)
 
@@ -540,18 +601,44 @@ class TelemetryProbe:
                 cpu_power_energy += cpu_p_interval * dt
                 if cpu_p_interval > cpu_pkg_peak:
                     cpu_pkg_peak = cpu_p_interval
+            p0 = s0.get("core_power_w")
+            p1 = s1.get("core_power_w")
+            if p0 is not None and p1 is not None:
+                core_p_interval = max(0.0, (float(p0) + float(p1)) * 0.5)
+                core_power_energy += core_p_interval * dt
+                if core_p_interval > cpu_core_peak:
+                    cpu_core_peak = core_p_interval
+            p0 = s0.get("dram_power_w")
+            p1 = s1.get("dram_power_w")
+            if p0 is not None and p1 is not None:
+                dram_p_interval = max(0.0, (float(p0) + float(p1)) * 0.5)
+                dram_power_energy += dram_p_interval * dt
+                if dram_p_interval > dram_peak:
+                    dram_peak = dram_p_interval
+            p0 = s0.get("gpu_power_w")
+            p1 = s1.get("gpu_power_w")
+            if p0 is not None and p1 is not None:
+                gpu_p_interval = max(0.0, (float(p0) + float(p1)) * 0.5)
+                gpu_power_energy += gpu_p_interval * dt
+                if gpu_p_interval > gpu_peak:
+                    gpu_peak = gpu_p_interval
 
         if gpu_peak <= 0.0 and gpu_energy > 0.0 and elapsed_total > 0.0:
             gpu_peak = gpu_energy / elapsed_total
 
         cpu_pkg_avg = (cpu_energy / elapsed_total) if elapsed_total > 0.0 and cpu_energy > 0.0 else 0.0
         cpu_core_avg = (core_energy / elapsed_total) if elapsed_total > 0.0 and core_energy > 0.0 else 0.0
+        dram_avg = (dram_energy / elapsed_total) if elapsed_total > 0.0 and dram_energy > 0.0 else 0.0
         gpu_avg = (gpu_energy / elapsed_total) if elapsed_total > 0.0 and gpu_energy > 0.0 else 0.0
 
         if cpu_power_energy > 0.0 and elapsed_total > 0.0:
             cpu_pkg_avg = float(cpu_power_energy / elapsed_total)
-            if cpu_core_avg <= 0.0:
-                cpu_core_avg = cpu_pkg_avg
+        if core_power_energy > 0.0 and elapsed_total > 0.0:
+            cpu_core_avg = float(core_power_energy / elapsed_total)
+        if dram_power_energy > 0.0 and elapsed_total > 0.0:
+            dram_avg = float(dram_power_energy / elapsed_total)
+        if gpu_power_energy > 0.0 and elapsed_total > 0.0:
+            gpu_avg = float(gpu_power_energy / elapsed_total)
 
         if cpu_pkg_avg <= 0.0:
             cpu_power_vals = [float(s.get("cpu_power_w") or 0.0) for s in samples if float(s.get("cpu_power_w") or 0.0) > 0.0]
@@ -564,12 +651,15 @@ class TelemetryProbe:
             "gpu_freq_avg_mhz": float(sum(gpu_freq_vals) / len(gpu_freq_vals)) if gpu_freq_vals else 0.0,
             "cpu_energy_j": float(cpu_energy),
             "core_energy_j": float(core_energy),
+            "dram_energy_j": float(dram_energy),
             "gpu_energy_j": float(gpu_energy),
             "cpu_pkg_peak_power_w": float(cpu_pkg_peak),
             "cpu_core_peak_power_w": float(cpu_core_peak),
+            "dram_peak_power_w": float(dram_peak),
             "gpu_peak_power_w": float(gpu_peak),
             "cpu_pkg_avg_power_w": float(cpu_pkg_avg),
             "cpu_core_avg_power_w": float(cpu_core_avg),
+            "dram_avg_power_w": float(dram_avg),
             "gpu_avg_power_w": float(gpu_avg),
         }
 

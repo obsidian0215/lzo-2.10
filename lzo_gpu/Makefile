@@ -41,8 +41,7 @@ endif
 ## attempt to precompile kernels that aren't actually in the tree.
 CL_SOURCES := $(wildcard *.cl)
 
-# all: build_kernel lzo_gpu precompile-combos
-all: build_kernel lzo_gpu
+all: lzo_gpu
 
 build_kernel: build_kernel.c lzo_gpu_utils.c
 	$(CC) $(CFLAGS) -o build_kernel$(EXEEXT) build_kernel.c lzo_gpu_utils.c $(LDFLAGS)
@@ -87,7 +86,7 @@ precompile-all: precompile-combos
 
 help:
 	@echo "Makefile targets for lzo_gpu:";
-	@echo "  make                 -> build helper, host and precompile all kernels";
+	@echo "  make                 -> build the GPU host binary (lzo_gpu)";
 	@echo "  make lzo_gpu         -> build the GPU host binary (lzo_gpu)";
 	@echo "  make build_kernel    -> build the kernel precompiler helper";
 	@echo "  make precompile KERNEL=<name> -> precompile one kernel (basename, no .cl)";

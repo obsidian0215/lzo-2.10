@@ -69,9 +69,10 @@ exp_results/
 build/
 archived/
 lzo_hybrid/lzo_hybrid
-lzo_hybrid/*.cl
+# lzo_hybrid/*.cl
 .cache
 benchmark_bandwidth
 *_debug.cl
 lzo_gpu_v2/
+*tmp*
 # end

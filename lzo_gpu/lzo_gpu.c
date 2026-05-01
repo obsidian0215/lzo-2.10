@@ -126,6 +126,57 @@ static int lzo_resolve_standard_copy(cl_device_id device)
     return lzo_device_host_unified_memory(device) ? 0 : 1;
 }
 
+static void lzo_print_bench_env(cl_device_id device, int standard_copy,
+                                const char* alg_name, int comp_level,
+                                int debug_counters, double bench_seconds) {
+    char dev_name[256] = {0};
+    char vendor[256] = {0};
+    char driver[256] = {0};
+    char version[256] = {0};
+    char opencl_c[256] = {0};
+    cl_uint cu = 0;
+    cl_ulong global_mem = 0;
+    cl_ulong max_alloc = 0;
+    cl_bool unified = CL_FALSE;
+    size_t max_wg = 0;
+    cl_command_queue_properties queue_props = 0;
+
+    if (!device) return;
+    (void)clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(dev_name), dev_name, NULL);
+    (void)clGetDeviceInfo(device, CL_DEVICE_VENDOR, sizeof(vendor), vendor, NULL);
+    (void)clGetDeviceInfo(device, CL_DRIVER_VERSION, sizeof(driver), driver, NULL);
+    (void)clGetDeviceInfo(device, CL_DEVICE_VERSION, sizeof(version), version, NULL);
+    (void)clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_VERSION, sizeof(opencl_c), opencl_c, NULL);
+    (void)clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cu), &cu, NULL);
+    (void)clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem), &global_mem, NULL);
+    (void)clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, NULL);
+    (void)clGetDeviceInfo(device, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(unified), &unified, NULL);
+    (void)clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(max_wg), &max_wg, NULL);
+    if (q) (void)clGetCommandQueueInfo(q, CL_QUEUE_PROPERTIES, sizeof(queue_props), &queue_props, NULL);
+
+    printf("[LZO-BENCH-ENV] device=\"%s\" vendor=\"%s\" driver=\"%s\" device_version=\"%s\" opencl_c=\"%s\"\n",
+           dev_name[0] ? dev_name : "unknown",
+           vendor[0] ? vendor : "unknown",
+           driver[0] ? driver : "unknown",
+           version[0] ? version : "unknown",
+           opencl_c[0] ? opencl_c : "unknown");
+    printf("[LZO-BENCH-DEVICE] cu=%u global_mem=%llu max_alloc=%llu unified_memory=%d max_wg=%zu queue_profiling=%d\n",
+           (unsigned)cu,
+           (unsigned long long)global_mem,
+           (unsigned long long)max_alloc,
+           unified == CL_TRUE ? 1 : 0,
+           max_wg,
+           (queue_props & CL_QUEUE_PROFILING_ENABLE) ? 1 : 0);
+    printf("[LZO-BENCH-CONFIG] alg=%s level=%d block=%zu local=%zu standard_copy=%d debug_kernel=%d bench_seconds=%.3f\n",
+           alg_name ? alg_name : "unknown",
+           comp_level,
+           g_cli_fixed_block_bytes,
+           g_cli_local_size ? g_cli_local_size : 1,
+           standard_copy,
+           debug_counters,
+           bench_seconds);
+}
+
 static cl_device_type preferred_opencl_device_type(void)
 {
     const char* pref = getenv("FORCE_OPENCL_DEVICE");
@@ -330,6 +381,7 @@ static inline void show_help(char *prog_name)
     fprintf(stderr, "  %s -h|--help                                 # show this help\n", prog_name);
     fprintf(stderr, "\nEnvironment variables (grouped — standalone / client->daemon / advanced):\n");
     fprintf(stderr, "    LZO_STANDARD_COPY=0|1    0=zero-copy (map into pinned buffer), 1=standard host->device copy (explicit upload). Applies to both compression and decompression.\n");
+    fprintf(stderr, "    LZO_GPU_USE_CLBIN=0|1    1=try precompiled .clbin kernels. Default is source build.\n");
     fprintf(stderr, "    LZO_GPU_DEBUG=0|1        1=load debug-enabled kernels and print diagnostic counters.\n");
 }
 
@@ -373,6 +425,31 @@ static int lzo_debug_counters_enabled_cli(void) {
     if (!env || !*env) return 0;
     return (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0 ||
             strcasecmp(env, "yes") == 0 || strcasecmp(env, "on") == 0);
+}
+
+static int lzo_format_program_name(char* out, size_t out_sz, const char* base_name, int debug_enabled) {
+    static const char debug_suffix[] = "_debug";
+    size_t base_len;
+    size_t suffix_len = sizeof(debug_suffix) - 1;
+
+    if (!out || out_sz == 0) return -1;
+    if (!base_name) {
+        out[0] = '\0';
+        return -1;
+    }
+    base_len = strlen(base_name);
+    if (base_len >= out_sz) {
+        out[0] = '\0';
+        return -1;
+    }
+    memcpy(out, base_name, base_len + 1);
+    if (!debug_enabled) return 0;
+    if (base_len + suffix_len >= out_sz) {
+        out[0] = '\0';
+        return -1;
+    }
+    memcpy(out + base_len, debug_suffix, suffix_len + 1);
+    return 0;
 }
 
 static int path_is_dash(const char* path) {
@@ -572,16 +649,21 @@ static int do_decompress_mode(const char* lz_path, const char* output_path, int 
     cl_int err;
     char build_log[8192] = {0};
     const int decomp_bits = LZO_DEFAULT_COMP_LEVEL;
+    char decomp_prog_name[64];
 
     uint64_t tk1 = now_ns();
     /* Fallback to base decompressor */
     if (!prog_d) {
-        prog_d = lzo_load_program_with_dbits(ctx, dev, decomp_base, decomp_bits, build_log, sizeof(build_log));
+        if (lzo_format_program_name(decomp_prog_name, sizeof(decomp_prog_name), decomp_base, debug_counters) != 0) {
+            fprintf(stderr, "error: decompressor program name too long for %s\n", decomp_base);
+            return 1;
+        }
+        prog_d = lzo_load_program_with_dbits(ctx, dev, decomp_prog_name, decomp_bits, build_log, sizeof(build_log));
         if (!prog_d) {
             if (build_log[0]) {
-                fprintf(stderr, "error: unable to load decompressor for %s (D_BITS=%d): %s\n", decomp_base, decomp_bits, build_log);
+                fprintf(stderr, "error: unable to load decompressor for %s (D_BITS=%d): %s\n", decomp_prog_name, decomp_bits, build_log);
             } else {
-                fprintf(stderr, "error: unable to load decompressor for %s (D_BITS=%d)\n", decomp_base, decomp_bits);
+                fprintf(stderr, "error: unable to load decompressor for %s (D_BITS=%d)\n", decomp_prog_name, decomp_bits);
             }
             return 1;
         }
@@ -666,6 +748,7 @@ static int run_lzo_bench(const char *in_path,
         return 1;
     }
     standard_copy = lzo_resolve_standard_copy(dev);
+    lzo_print_bench_env(dev, standard_copy, alg_name, comp_level, debug_counters, bench_seconds);
 
     cl_program prog_c = NULL;
     cl_kernel krn_c = NULL;
@@ -687,7 +770,17 @@ static int run_lzo_bench(const char *in_path,
     /* For decompression path, use decomp-only marker to skip unnecessary comp-kernel validation. */
     snprintf(decomp_base, sizeof(decomp_base), "%s_decomp", alg_name);
     int decomp_bits = comp_level;
-    cl_program prog_d = lzo_load_program_with_dbits(ctx, dev, decomp_base, decomp_bits, build_log, sizeof(build_log));
+    char decomp_prog_name[64];
+    if (lzo_format_program_name(decomp_prog_name, sizeof(decomp_prog_name), decomp_base, debug_counters) != 0) {
+        fprintf(stderr, "bench error: decompressor program name too long for %s\n", decomp_base);
+        clReleaseKernel(krn_c);
+        clReleaseProgram(prog_c);
+        if (q) { clReleaseCommandQueue(q); q = NULL; }
+        if (ctx) { clReleaseContext(ctx); ctx = NULL; }
+        free(input_ref);
+        return 1;
+    }
+    cl_program prog_d = lzo_load_program_with_dbits(ctx, dev, decomp_prog_name, decomp_bits, build_log, sizeof(build_log));
     if (!prog_d) {
         if (build_log[0]) {
             fprintf(stderr, "bench error: failed to load decompressor program (D_BITS=%d): %s\n", comp_level, build_log);

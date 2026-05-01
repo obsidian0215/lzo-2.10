@@ -21,16 +21,11 @@
 
 /* Block size and GPU parallelism configuration */
 #define LZO_OCC_FACTOR_DEFAULT 256
+#define LZO_GPU_COMP_AUTO_SLOTS_PER_CU 18
 #define LZO_ALIGN_BYTES_DEFAULT 4096  /* 4KB alignment for block sizes for memory efficiency */
 #define LZO_MIN_BLOCK_BYTES_DEFAULT (4 * 1024)   /* 4KB minimum */
 #define LZO_MAX_BLOCK_BYTES_DEFAULT (4 * 1024 * 1024)  /* 4MB maximum */
 #define LZO_MAX_NBLOCKS_DEFAULT (64 * 1024)  /* Maximum blocks per job */
-/* Entropy calculation configuration */
-#define LZO_ADAPTIVE_SAMPLE_SIZE (64 * 1024)  /* 64KB sample for entropy */
-#define LZO_ADAPTIVE_LOW_ENTROPY 4.0
-#define LZO_ADAPTIVE_HIGH_ENTROPY 7.0
-#define LZO_ADAPTIVE_ENTROPY_ENABLED 1  /* 0=size-only (fast), 1=entropy-aware */
-
 /* OpenCL configuration */
 /* Default work-group size. Set to 4 (empirically best balance in our param-scan) */
 #define LZO_LOCAL_SIZE_DEFAULT 1
