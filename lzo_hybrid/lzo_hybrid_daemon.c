@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <limits.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <signal.h>
@@ -136,6 +137,17 @@ static void remove_pidfile(void);
 
 
 #include "lzo_hybrid_protocol.h"
+
+int lzo_hybrid_daemon_hybrid_file_request(char operation,
+                                          const char* input_path,
+                                          const char* output_path,
+                                          int alg,
+                                          int level,
+                                          int block_size,
+                                          uint32_t local_size,
+                                          uint32_t cpu_share_pct,
+                                          uint32_t cpu_threads,
+                                          unsigned long* elapsed_us);
 
 /*
  * 初始化OpenCL资源 (仅在守护进程启动时执行一次)
@@ -405,6 +417,46 @@ int handle_compress_request(request_t* req, response_t* resp, worker_res_t* work
 
     printf("[DAEMON] 处理压缩请求: %s -> %s (level=%d)\n",
            req->input_path, req->output_path, req->level);
+    if (req->alg < 0 || req->alg > 1) req->alg = 0;
+    if (req->level < 10 || req->level > 18) req->level = LZO_DEFAULT_COMP_LEVEL;
+
+    if (req->cpu_share_pct > 0 || req->adaptive) {
+        unsigned long elapsed_us = 0;
+        uint32_t cpu_share = req->adaptive ? 50U : req->cpu_share_pct;
+        int ret;
+        if (cpu_share > 100U) cpu_share = 100U;
+        printf("[DAEMON][HYBRID] 压缩: cpu_share=%u%% cpu_threads=%u adaptive=%u\n",
+               cpu_share, req->cpu_threads, req->adaptive);
+        ret = lzo_hybrid_daemon_hybrid_file_request('C',
+                                                    req->input_path,
+                                                    req->output_path,
+                                                    req->alg,
+                                                    req->level,
+                                                    req->block_size,
+                                                    req->local_size,
+                                                    cpu_share,
+                                                    req->cpu_threads,
+                                                    &elapsed_us);
+        if (ret == 0) {
+            struct stat st;
+            resp->status = 0;
+            resp->time_us = elapsed_us;
+            resp->timing.in_size = req->input_size;
+            resp->timing.algo_config = req->level;
+            resp->timing.blk_size_bytes = (size_t)req->block_size;
+            resp->timing.ocl_setup_us = 0;
+            resp->out_size = 0;
+            if (stat(req->output_path, &st) == 0 && st.st_size > 0) resp->out_size = (size_t)st.st_size;
+            resp->timing.out_size = resp->out_size;
+            snprintf(resp->message, sizeof(resp->message), "Hybrid success (daemon request, init excluded)");
+            return 0;
+        }
+        resp->status = -1;
+        resp->out_size = 0;
+        resp->time_us = 0;
+        snprintf(resp->message, sizeof(resp->message), "Hybrid compression failed");
+        return ret;
+    }
 
     // 根据alg和level选择合适的worker私有kernel
     cl_kernel kernel = get_compress_kernel_for_worker(worker, req->alg, req->level);
@@ -527,6 +579,46 @@ int handle_decompress_request(request_t* req, response_t* resp, worker_res_t* wo
 
     printf("[DAEMON] 处理解压缩请求: %s -> %s\n",
            req->input_path, req->output_path);
+
+    if (req->cpu_share_pct > 0 || req->adaptive) {
+        unsigned long elapsed_us = 0;
+        uint32_t cpu_share = req->adaptive ? 50U : req->cpu_share_pct;
+        int req_alg = req->alg;
+        int ret;
+        if (cpu_share > 100U) cpu_share = 100U;
+        if (req_alg < 0 || req_alg > 1) req_alg = detect_alg_from_lzo_header(req->input_path);
+        printf("[DAEMON][HYBRID] 解压: cpu_share=%u%% cpu_threads=%u adaptive=%u\n",
+               cpu_share, req->cpu_threads, req->adaptive);
+        ret = lzo_hybrid_daemon_hybrid_file_request('D',
+                                                    req->input_path,
+                                                    req->output_path,
+                                                    req_alg,
+                                                    req->level,
+                                                    req->block_size,
+                                                    req->local_size,
+                                                    cpu_share,
+                                                    req->cpu_threads,
+                                                    &elapsed_us);
+        if (ret == 0) {
+            struct stat st;
+            resp->status = 0;
+            resp->time_us = elapsed_us;
+            resp->timing.in_size = req->input_size;
+            resp->timing.algo_config = req->level;
+            resp->timing.blk_size_bytes = (size_t)req->block_size;
+            resp->timing.ocl_setup_us = 0;
+            resp->out_size = 0;
+            if (stat(req->output_path, &st) == 0 && st.st_size > 0) resp->out_size = (size_t)st.st_size;
+            resp->timing.out_size = resp->out_size;
+            snprintf(resp->message, sizeof(resp->message), "Hybrid success (daemon request, init excluded)");
+            return 0;
+        }
+        resp->status = -1;
+        resp->out_size = 0;
+        resp->time_us = 0;
+        snprintf(resp->message, sizeof(resp->message), "Hybrid decompression failed");
+        return ret;
+    }
 
     unsigned long time_us;
     size_t output_size;

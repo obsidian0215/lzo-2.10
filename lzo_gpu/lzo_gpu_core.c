@@ -1241,18 +1241,23 @@ int lzo_decompress_core(
     unsigned long download_us = 0;
     unsigned long write_us = 0;
     {
-        size_t chunk_threshold_kb = (size_t)lzo_env_unsigned_value("LZO_GPU_DECOMP_CHUNKED_THRESHOLD_KB", 1048576U);
+        size_t chunk_threshold_kb = (size_t)lzo_env_unsigned_value("LZO_GPU_DECOMP_CHUNKED_THRESHOLD_KB", 16384U);
         size_t chunk_readback_kb = (size_t)lzo_env_unsigned_value("LZO_GPU_DECOMP_READBACK_KB", 8192U);
         int force_chunked_set = 0;
         int force_chunked = lzo_env_flag_value("LZO_GPU_DECOMP_FORCE_CHUNKED", &force_chunked_set);
         int disable_chunked = lzo_env_flag_enabled("LZO_GPU_DECOMP_DISABLE_CHUNKED");
         /*
          * Architecture policy:
-         * - mapped backend (iGPU unified memory) keeps contiguous mapped write path by default;
-         * - chunked readback is enabled by default only for standard-copy backend (dGPU-like path)
-         *   and large outputs above threshold.
+         * - Windows has shown consistent real-file readback/write benefit from chunked output
+         *   on both iGPU-style and dGPU-style paths, so auto enables it for large outputs;
+         * - Linux remains conservative and keeps chunked disabled by default unless forced.
          */
-        int chunked_backend_ok = use_standard_copy_decomp ? 1 : 0;
+        int chunked_backend_ok =
+#if defined(_WIN32) || defined(_WIN64)
+            1;
+#else
+            0;
+#endif
         int use_chunked_output = 0;
 
         if (force_chunked_set) {

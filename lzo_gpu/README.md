@@ -62,6 +62,10 @@ OPENCL_LIB_NAME=OpenCL
 | --- | --- |
 | `FORCE_OPENCL_DEVICE` | 设备优先级：`GPU` / `CPU` / `DEFAULT` / `ALL` |
 | `LZO_STANDARD_COPY` | `0`=mapped/zero-copy 优先，`1`=显式 host->device copy |
+| `LZO_GPU_DECOMP_FORCE_CHUNKED` | `0/1` 强制关闭/开启解压 chunked readback/write |
+| `LZO_GPU_DECOMP_DISABLE_CHUNKED` | `1` 禁用解压 chunked readback/write |
+| `LZO_GPU_DECOMP_CHUNKED_THRESHOLD_KB` | 解压 chunked 输出阈值，默认 `16384` |
+| `LZO_GPU_DECOMP_READBACK_KB` | 解压 chunked 回读大小，默认 `8192` |
 | `LZO_GPU_DEBUG` | 启用 debug-enabled kernel 与 counters |
 
 ## Current implementation notes
@@ -70,3 +74,4 @@ OPENCL_LIB_NAME=OpenCL
 - 解压主线已实现并参与 bench roundtrip 校验；
 - 运行时会复用 OpenCL context、kernel 与 workspace buffer；
 - 支持 `.clbin` 以减少重复 bench 的内核编译成本。
+- 真实解压到文件时支持 chunked readback/write：Windows 默认对大输出启用，Linux 默认关闭，可用环境变量强制覆盖。

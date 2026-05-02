@@ -74,7 +74,7 @@
 已保留两项 host/readback 侧有效修改：
 
 - 默认不写无用 `out_lens`：普通真实解压路径不消费每个 block 的输出长度，默认不给 kernel 传 `out_lens` buffer，避免无价值 global store；需要诊断时可通过 `LZO_GPU_DECOMP_TRACK_OUT_LENS=1` 恢复。
-- chunked readback/write：真实解压到文件时可按 chunk 从 OpenCL buffer 回读并写文件，降低大输出文件一次性 download/map + fwrite 的尾部开销。当前策略保守：Windows 下默认可启用，Linux 下默认关闭，避免在 Linux host path 上引入退化。
+- chunked readback/write：真实解压到文件时可按 chunk 从 OpenCL buffer 回读并写文件，降低大输出文件一次性 download/map + fwrite 的尾部开销。当前策略是 Windows 下对大输出（默认阈值 16MB）可自动启用，Linux 默认关闭，避免在 Linux host path 上引入退化。
 
 这两项只影响真实文件路径，不应通过 bench kernel 指标判断采纳价值。
 

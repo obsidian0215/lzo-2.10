@@ -19,6 +19,9 @@ typedef struct {
     int standard_copy;
     size_t input_size;
     uint32_t local_size;
+    uint32_t cpu_share_pct;  /* 0=GPU-only, 100=OpenCL CPU-only, 1..99=mixed */
+    uint32_t cpu_threads;    /* OpenCL CPU worker slots; 0=auto */
+    uint32_t adaptive;       /* reserved: future adaptive split */
 } request_t;
 
 /* 服务端响应结构 */

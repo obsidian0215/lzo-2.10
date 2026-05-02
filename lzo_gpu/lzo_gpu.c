@@ -381,6 +381,10 @@ static inline void show_help(char *prog_name)
     fprintf(stderr, "  %s -h|--help                                 # show this help\n", prog_name);
     fprintf(stderr, "\nEnvironment variables (grouped — standalone / client->daemon / advanced):\n");
     fprintf(stderr, "    LZO_STANDARD_COPY=0|1    0=zero-copy (map into pinned buffer), 1=standard host->device copy (explicit upload). Applies to both compression and decompression.\n");
+    fprintf(stderr, "    LZO_GPU_DECOMP_FORCE_CHUNKED=0|1       Force decompression chunked readback/write.\n");
+    fprintf(stderr, "    LZO_GPU_DECOMP_DISABLE_CHUNKED=1       Disable decompression chunked readback/write.\n");
+    fprintf(stderr, "    LZO_GPU_DECOMP_CHUNKED_THRESHOLD_KB=N  Chunked output threshold, default 16384 KB.\n");
+    fprintf(stderr, "    LZO_GPU_DECOMP_READBACK_KB=N           Chunked readback size, default 8192 KB.\n");
     fprintf(stderr, "    LZO_GPU_USE_CLBIN=0|1    1=try precompiled .clbin kernels. Default is source build.\n");
     fprintf(stderr, "    LZO_GPU_DEBUG=0|1        1=load debug-enabled kernels and print diagnostic counters.\n");
 }

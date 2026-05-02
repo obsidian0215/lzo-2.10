@@ -460,6 +460,6 @@ daemon 路径的核心价值是：
 - 当前主线：`baseline_lock + 解压 token fast path + short8 direct-copy + 真实解压输出路径优化`
 - 压缩主线：单 primary hash + 32-bit packed dict + 四位置 batch probe/writeback；不采纳 LZOG2 多阶段拆分
 - 解压主线：保留 `COPY_MATCH()` 分层专分支，增加 `post_lit` 消除回读，并在 `<=18B` 非重叠 direct helper 中加入 `<=8B` 单次 8B copy
-- host 主线：Intel 默认 `mapped`，`standard_copy` 已被 reject；普通真实解压默认不写无用 `out_lens`，chunked readback/write 只作为真实路径优化
+- host 主线：Intel 默认 `mapped`，`standard_copy` 已被 reject；普通真实解压默认不写无用 `out_lens`，chunked readback/write 只作为真实路径优化，Windows 下对大输出默认启用，Linux 默认关闭
 
 后续若出现新的已采纳项，或我们为当前主线重新生成新的 locked variant id，再推进这份文档中的“锁定基线”锚点；在那之前，本文描述的就是**当前主线真实实现**，而不是旧的 `baseline_lock` 历史快照。

@@ -52,6 +52,16 @@ static void fill_request_env_flags(request_t* req) {
  * stdio buffer control is hardcoded to 1MB.
  */
 static request_t g_cli_req_flags; /* global overrides parsed from CLI */
+static void set_gpu_ratio_request(request_t* req, double gpu_ratio) {
+    long cpu_share;
+    if (gpu_ratio < 0.0) gpu_ratio = 0.0;
+    if (gpu_ratio > 1.0) gpu_ratio = 1.0;
+    cpu_share = (long)((1.0 - gpu_ratio) * 100.0 + 0.5);
+    if (cpu_share < 0) cpu_share = 0;
+    if (cpu_share > 100) cpu_share = 100;
+    req->cpu_share_pct = (uint32_t)cpu_share;
+}
+
 static void parse_client_cli_opts(int argc, char** argv, request_t* req) {
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -70,6 +80,31 @@ static void parse_client_cli_opts(int argc, char** argv, request_t* req) {
         if (strcmp(a, "--local") == 0 && i + 1 < argc) { argv[i] = "--"; req->local_size = atoi(argv[++i]); argv[i] = "--"; continue; }
         if (strcmp(a, "--zero-copy") == 0) { req->standard_copy = 0; argv[i] = "--"; continue; }
         if (strcmp(a, "--standard-copy") == 0) { req->standard_copy = 1; argv[i] = "--"; continue; }
+        if (strcmp(a, "--cpu-threads") == 0 && i + 1 < argc) { argv[i] = "--"; req->cpu_threads = (uint32_t)strtoul(argv[++i], NULL, 10); argv[i] = "--"; continue; }
+        if (strncmp(a, "--cpu-threads=", 14) == 0) { req->cpu_threads = (uint32_t)strtoul(a + 14, NULL, 10); argv[i] = "--"; continue; }
+        if (strcmp(a, "--gpu-ratio") == 0 && i + 1 < argc) {
+            argv[i] = "--";
+            if (strcasecmp(argv[i + 1], "adaptive") == 0) {
+                req->adaptive = 1;
+                set_gpu_ratio_request(req, 0.5);
+            } else {
+                set_gpu_ratio_request(req, strtod(argv[i + 1], NULL));
+            }
+            argv[++i] = "--";
+            continue;
+        }
+        if (strncmp(a, "--gpu-ratio=", 12) == 0) {
+            const char* value = a + 12;
+            if (strcasecmp(value, "adaptive") == 0) {
+                req->adaptive = 1;
+                set_gpu_ratio_request(req, 0.5);
+            } else {
+                set_gpu_ratio_request(req, strtod(value, NULL));
+            }
+            argv[i] = "--";
+            continue;
+        }
+        if (strcmp(a, "--adaptive") == 0) { req->adaptive = 1; set_gpu_ratio_request(req, 0.5); argv[i] = "--"; continue; }
         if (strcmp(a, "-v") == 0 || strcmp(a, "--verbose") == 0) { g_verbose = 1; argv[i] = "--"; continue; }
     }
 }
@@ -79,6 +114,9 @@ static void set_request_defaults(request_t* req) {
     req->standard_copy = 0;
     req->block_size = 0;
     req->local_size = 0;
+    req->cpu_share_pct = 0;
+    req->cpu_threads = 0;
+    req->adaptive = 0;
     /* per-request debug flag removed */
     /* profile_writes removed */
 }

@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <time.h>
+#include <pthread.h>
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #include <io.h>
@@ -559,10 +560,101 @@ typedef struct {
     cl_kernel kernel;
     cl_kernel full_kernel;
     const char* label;
+    void* cache_slot;
     int owns_context;
     int owns_queue;
     int owns_program;
 } hybrid_ocl_t;
+
+typedef struct {
+    int valid;
+    cl_device_type dtype;
+    int bits;
+    char label[16];
+    char alg[16];
+    char suffix[32];
+    hybrid_ocl_t h;
+    cl_mem bufs[4];
+    size_t buf_sizes[4];
+} daemon_hybrid_cache_t;
+
+static int g_daemon_hybrid_cache_enabled = 0;
+static pthread_mutex_t g_daemon_hybrid_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static daemon_hybrid_cache_t g_daemon_hybrid_cache[8];
+
+static void
+#if defined(__GNUC__)
+__attribute__((unused))
+#endif
+lzo_hybrid_set_daemon_cache_enabled(int enabled)
+{
+    g_daemon_hybrid_cache_enabled = enabled ? 1 : 0;
+}
+
+static cl_device_type lzo_hybrid_label_dtype(const char* label)
+{
+    return (label && strcmp(label, "CPU") == 0) ? CL_DEVICE_TYPE_CPU : CL_DEVICE_TYPE_GPU;
+}
+
+static daemon_hybrid_cache_t* lzo_hybrid_find_cache(cl_device_type dtype, const char* label, const char* alg_name, int bits, const char* suffix)
+{
+    size_t i;
+    for (i = 0; i < sizeof(g_daemon_hybrid_cache) / sizeof(g_daemon_hybrid_cache[0]); ++i) {
+        daemon_hybrid_cache_t* c = &g_daemon_hybrid_cache[i];
+        if (!c->valid) continue;
+        if (c->dtype == dtype && c->bits == bits &&
+            strcmp(c->label, label ? label : "") == 0 &&
+            strcmp(c->alg, alg_name ? alg_name : "") == 0 &&
+            strcmp(c->suffix, suffix ? suffix : "") == 0) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+static daemon_hybrid_cache_t* lzo_hybrid_alloc_cache_slot(void)
+{
+    size_t i;
+    for (i = 0; i < sizeof(g_daemon_hybrid_cache) / sizeof(g_daemon_hybrid_cache[0]); ++i) {
+        if (!g_daemon_hybrid_cache[i].valid) return &g_daemon_hybrid_cache[i];
+    }
+    return &g_daemon_hybrid_cache[0];
+}
+
+static cl_mem lzo_hybrid_cached_buffer(hybrid_ocl_t* h,
+                                       int index,
+                                       size_t size,
+                                       cl_mem_flags flags,
+                                       cl_int* err_out)
+{
+    daemon_hybrid_cache_t* cache = NULL;
+    cl_int err = CL_SUCCESS;
+
+    if (err_out) *err_out = CL_SUCCESS;
+    if (size == 0) size = 1;
+    if (!g_daemon_hybrid_cache_enabled || !h || !h->cache_slot || index < 0 || index >= 4) {
+        cl_mem buf = clCreateBuffer(h ? h->ctx : NULL, flags, size, NULL, &err);
+        if (err_out) *err_out = err;
+        return buf;
+    }
+
+    cache = (daemon_hybrid_cache_t*)h->cache_slot;
+    if (cache->bufs[index] && cache->buf_sizes[index] < size) {
+        clReleaseMemObject(cache->bufs[index]);
+        cache->bufs[index] = NULL;
+        cache->buf_sizes[index] = 0;
+    }
+    if (!cache->bufs[index]) {
+        cache->bufs[index] = clCreateBuffer(h->ctx, flags, size, NULL, &err);
+        if (err != CL_SUCCESS) {
+            if (err_out) *err_out = err;
+            return NULL;
+        }
+        cache->buf_sizes[index] = size;
+    }
+    if (err_out) *err_out = CL_SUCCESS;
+    return cache->bufs[index];
+}
 
 static size_t g_accel_cpu_slots_override = 0;
 static size_t g_cli_cpu_threads = 0;
@@ -697,6 +789,20 @@ static size_t lzo_hybrid_gpu_items_for_device(cl_device_id gpu_dev, size_t block
 }
 
 static int lzo_hybrid_init_device(hybrid_ocl_t* h, cl_device_type dtype, const char* label) {
+    if (g_daemon_hybrid_cache_enabled) {
+        daemon_hybrid_cache_t* cache;
+        pthread_mutex_lock(&g_daemon_hybrid_cache_lock);
+        for (cache = lzo_hybrid_find_cache(dtype, label, NULL, 0, NULL); cache; cache = NULL) {
+            *h = cache->h;
+            h->cache_slot = cache;
+            h->owns_context = 0;
+            h->owns_queue = 0;
+            h->owns_program = 0;
+            pthread_mutex_unlock(&g_daemon_hybrid_cache_lock);
+            return 0;
+        }
+        pthread_mutex_unlock(&g_daemon_hybrid_cache_lock);
+    }
     cl_int err;
     cl_uint num_platforms = 0;
     cl_platform_id* platforms = NULL;
@@ -725,11 +831,32 @@ static int lzo_hybrid_init_device(hybrid_ocl_t* h, cl_device_type dtype, const c
     if (err != CL_SUCCESS || !h->q) return -1;
     h->owns_context = 1;
     h->owns_queue = 1;
+    if (g_daemon_hybrid_cache_enabled) {
+        daemon_hybrid_cache_t* cache = lzo_hybrid_alloc_cache_slot();
+        if (cache) {
+            memset(cache, 0, sizeof(*cache));
+            cache->valid = 1;
+            cache->dtype = dtype;
+            cache->bits = 0;
+            strncpy(cache->label, label ? label : "", sizeof(cache->label) - 1);
+            cache->h = *h;
+            cache->h.cache_slot = cache;
+            cache->h.owns_context = 1;
+            cache->h.owns_queue = 1;
+            cache->h.owns_program = 0;
+            h->cache_slot = cache;
+        }
+    }
     return 0;
 }
 
 static void lzo_hybrid_release(hybrid_ocl_t* h) {
     if (!h) return;
+    if (g_daemon_hybrid_cache_enabled &&
+        !h->owns_context && !h->owns_queue && !h->owns_program) {
+        memset(h, 0, sizeof(*h));
+        return;
+    }
     if (h->full_kernel) clReleaseKernel(h->full_kernel);
     if (h->kernel) clReleaseKernel(h->kernel);
     if (h->prog && h->owns_program) clReleaseProgram(h->prog);
@@ -739,6 +866,21 @@ static void lzo_hybrid_release(hybrid_ocl_t* h) {
 }
 
 static int lzo_hybrid_load_kernel(hybrid_ocl_t* h, const char* alg_name, int bits, const char* suffix) {
+    if (g_daemon_hybrid_cache_enabled) {
+        daemon_hybrid_cache_t* cache;
+        pthread_mutex_lock(&g_daemon_hybrid_cache_lock);
+        cache = lzo_hybrid_find_cache(lzo_hybrid_label_dtype(h->label), h->label, alg_name, bits, suffix);
+        if (cache && cache->h.prog && cache->h.kernel) {
+            *h = cache->h;
+            h->cache_slot = cache;
+            h->owns_context = 0;
+            h->owns_queue = 0;
+            h->owns_program = 0;
+            pthread_mutex_unlock(&g_daemon_hybrid_cache_lock);
+            return 0;
+        }
+        pthread_mutex_unlock(&g_daemon_hybrid_cache_lock);
+    }
     char build_log[8192] = {0};
     char krn_name[128];
     char full_krn_name[128];
@@ -776,6 +918,27 @@ static int lzo_hybrid_load_kernel(hybrid_ocl_t* h, const char* alg_name, int bit
                         h->label, full_krn_name, err);
                 return -1;
             }
+        }
+    }
+    if (g_daemon_hybrid_cache_enabled) {
+        daemon_hybrid_cache_t* cache = lzo_hybrid_alloc_cache_slot();
+        if (cache) {
+            memset(cache, 0, sizeof(*cache));
+            cache->valid = 1;
+            cache->dtype = lzo_hybrid_label_dtype(h->label);
+            cache->bits = bits;
+            strncpy(cache->label, h->label ? h->label : "", sizeof(cache->label) - 1);
+            strncpy(cache->alg, alg_name ? alg_name : "", sizeof(cache->alg) - 1);
+            strncpy(cache->suffix, suffix ? suffix : "", sizeof(cache->suffix) - 1);
+            cache->h = *h;
+            cache->h.cache_slot = cache;
+            cache->h.owns_context = 1;
+            cache->h.owns_queue = 1;
+            cache->h.owns_program = 1;
+            h->cache_slot = cache;
+            h->owns_context = 0;
+            h->owns_queue = 0;
+            h->owns_program = 0;
         }
     }
     return 0;
@@ -1124,20 +1287,20 @@ static int do_hybrid_compress_mode(const char* in_path,
     size_t gpu_dict_bytes = gpu_dict_slots * (1ULL << gpu_level) * sizeof(uint32_t);
     size_t cpu_dict_bytes = cpu_global * (1ULL << cpu_level) * sizeof(uint32_t);
     if (gpu_blocks > 0) {
-        gpu_in = clCreateBuffer(gpu.ctx, CL_MEM_READ_ONLY, gpu_in_sz ? gpu_in_sz : 1, NULL, &err); if (err != CL_SUCCESS) goto cleanup;
-        gpu_out = clCreateBuffer(gpu.ctx, CL_MEM_WRITE_ONLY, gpu_blocks * worst_blk, NULL, &err); if (err != CL_SUCCESS) goto cleanup;
-        gpu_len = clCreateBuffer(gpu.ctx, CL_MEM_READ_WRITE, gpu_blocks * sizeof(cl_uint), NULL, &err); if (err != CL_SUCCESS) goto cleanup;
-        gpu_dict = clCreateBuffer(gpu.ctx, CL_MEM_READ_WRITE, gpu_dict_bytes + sizeof(cl_uint), NULL, &err); if (err != CL_SUCCESS) goto cleanup;
+        gpu_in = lzo_hybrid_cached_buffer(&gpu, 0, gpu_in_sz ? gpu_in_sz : 1, CL_MEM_READ_ONLY, &err); if (err != CL_SUCCESS) goto cleanup;
+        gpu_out = lzo_hybrid_cached_buffer(&gpu, 1, gpu_blocks * worst_blk, CL_MEM_WRITE_ONLY, &err); if (err != CL_SUCCESS) goto cleanup;
+        gpu_len = lzo_hybrid_cached_buffer(&gpu, 2, gpu_blocks * sizeof(cl_uint), CL_MEM_READ_WRITE, &err); if (err != CL_SUCCESS) goto cleanup;
+        gpu_dict = lzo_hybrid_cached_buffer(&gpu, 3, gpu_dict_bytes + sizeof(cl_uint), CL_MEM_READ_WRITE, &err); if (err != CL_SUCCESS) goto cleanup;
         CHECK(clEnqueueWriteBuffer(gpu.q, gpu_in, CL_FALSE, 0, gpu_in_sz, input + gpu_in_off, 0, NULL, NULL));
         CHECK(clEnqueueFillBuffer(gpu.q, gpu_dict, &(cl_uint){0}, sizeof(cl_uint), 0, gpu_dict_bytes + sizeof(cl_uint), 0, NULL, NULL));
         lzo_hybrid_set_comp_args(gpu.kernel, gpu_in, gpu_out, gpu_len, (cl_uint)in_sz, (cl_uint)blk, (cl_uint)worst_blk,
                                  gpu_dict, (cl_uint)gpu_dict_slots, 1U, 0U, (cl_uint)gpu_blocks);
     }
     if (cpu_blocks > 0) {
-        cpu_in = clCreateBuffer(cpu.ctx, CL_MEM_READ_ONLY, cpu_in_sz ? cpu_in_sz : 1, NULL, &err); if (err != CL_SUCCESS) goto cleanup;
-        cpu_out = clCreateBuffer(cpu.ctx, CL_MEM_WRITE_ONLY, cpu_blocks * worst_blk, NULL, &err); if (err != CL_SUCCESS) goto cleanup;
-        cpu_len = clCreateBuffer(cpu.ctx, CL_MEM_READ_WRITE, cpu_blocks * sizeof(cl_uint), NULL, &err); if (err != CL_SUCCESS) goto cleanup;
-        cpu_dict = clCreateBuffer(cpu.ctx, CL_MEM_READ_WRITE, cpu_dict_bytes + sizeof(cl_uint), NULL, &err); if (err != CL_SUCCESS) goto cleanup;
+        cpu_in = lzo_hybrid_cached_buffer(&cpu, 0, cpu_in_sz ? cpu_in_sz : 1, CL_MEM_READ_ONLY, &err); if (err != CL_SUCCESS) goto cleanup;
+        cpu_out = lzo_hybrid_cached_buffer(&cpu, 1, cpu_blocks * worst_blk, CL_MEM_WRITE_ONLY, &err); if (err != CL_SUCCESS) goto cleanup;
+        cpu_len = lzo_hybrid_cached_buffer(&cpu, 2, cpu_blocks * sizeof(cl_uint), CL_MEM_READ_WRITE, &err); if (err != CL_SUCCESS) goto cleanup;
+        cpu_dict = lzo_hybrid_cached_buffer(&cpu, 3, cpu_dict_bytes + sizeof(cl_uint), CL_MEM_READ_WRITE, &err); if (err != CL_SUCCESS) goto cleanup;
         CHECK(clEnqueueWriteBuffer(cpu.q, cpu_in, CL_FALSE, 0, cpu_in_sz, input + cpu_in_off, 0, NULL, NULL));
         CHECK(clEnqueueFillBuffer(cpu.q, cpu_dict, &(cl_uint){0}, sizeof(cl_uint), 0, cpu_dict_bytes + sizeof(cl_uint), 0, NULL, NULL));
         lzo_hybrid_set_comp_args(cpu.kernel, cpu_in, cpu_out, cpu_len, (cl_uint)in_sz, (cl_uint)blk, (cl_uint)worst_blk,
@@ -1199,14 +1362,16 @@ static int do_hybrid_compress_mode(const char* in_path,
 cleanup:
     if (ev_gpu) clReleaseEvent(ev_gpu);
     if (ev_cpu) clReleaseEvent(ev_cpu);
-    if (gpu_in) clReleaseMemObject(gpu_in);
-    if (gpu_out) clReleaseMemObject(gpu_out);
-    if (gpu_len) clReleaseMemObject(gpu_len);
-    if (gpu_dict) clReleaseMemObject(gpu_dict);
-    if (cpu_in) clReleaseMemObject(cpu_in);
-    if (cpu_out) clReleaseMemObject(cpu_out);
-    if (cpu_len) clReleaseMemObject(cpu_len);
-    if (cpu_dict) clReleaseMemObject(cpu_dict);
+    if (!g_daemon_hybrid_cache_enabled) {
+        if (gpu_in) clReleaseMemObject(gpu_in);
+        if (gpu_out) clReleaseMemObject(gpu_out);
+        if (gpu_len) clReleaseMemObject(gpu_len);
+        if (gpu_dict) clReleaseMemObject(gpu_dict);
+        if (cpu_in) clReleaseMemObject(cpu_in);
+        if (cpu_out) clReleaseMemObject(cpu_out);
+        if (cpu_len) clReleaseMemObject(cpu_len);
+        if (cpu_dict) clReleaseMemObject(cpu_dict);
+    }
     lzo_hybrid_release(&gpu);
     lzo_hybrid_release(&cpu);
     free(input);
@@ -1314,10 +1479,10 @@ static int do_hybrid_decompress_mode(const char* lz_path,
     t_init_end = now_ns();
 
     if (gpu_blocks > 0) {
-        gpu_comp = clCreateBuffer(gpu.ctx, CL_MEM_READ_ONLY, gpu_comp_sz ? gpu_comp_sz : 1, NULL, &err); if (err != CL_SUCCESS) goto cleanup;
-        gpu_off_d = clCreateBuffer(gpu.ctx, CL_MEM_READ_ONLY, gpu_blocks * sizeof(cl_uint), NULL, &err); if (err != CL_SUCCESS) goto cleanup;
-        gpu_len_d = clCreateBuffer(gpu.ctx, CL_MEM_READ_ONLY, gpu_blocks * sizeof(cl_uint), NULL, &err); if (err != CL_SUCCESS) goto cleanup;
-        gpu_out = clCreateBuffer(gpu.ctx, CL_MEM_WRITE_ONLY, gpu_out_sz ? gpu_out_sz : 1, NULL, &err); if (err != CL_SUCCESS) goto cleanup;
+        gpu_comp = lzo_hybrid_cached_buffer(&gpu, 0, gpu_comp_sz ? gpu_comp_sz : 1, CL_MEM_READ_ONLY, &err); if (err != CL_SUCCESS) goto cleanup;
+        gpu_off_d = lzo_hybrid_cached_buffer(&gpu, 1, gpu_blocks * sizeof(cl_uint), CL_MEM_READ_ONLY, &err); if (err != CL_SUCCESS) goto cleanup;
+        gpu_len_d = lzo_hybrid_cached_buffer(&gpu, 2, gpu_blocks * sizeof(cl_uint), CL_MEM_READ_ONLY, &err); if (err != CL_SUCCESS) goto cleanup;
+        gpu_out = lzo_hybrid_cached_buffer(&gpu, 3, gpu_out_sz ? gpu_out_sz : 1, CL_MEM_WRITE_ONLY, &err); if (err != CL_SUCCESS) goto cleanup;
         CHECK(clEnqueueWriteBuffer(gpu.q, gpu_comp, CL_FALSE, 0, gpu_comp_sz, comp, 0, NULL, NULL));
         CHECK(clEnqueueWriteBuffer(gpu.q, gpu_off_d, CL_FALSE, 0, gpu_blocks * sizeof(cl_uint), gpu_off, 0, NULL, NULL));
         CHECK(clEnqueueWriteBuffer(gpu.q, gpu_len_d, CL_FALSE, 0, gpu_blocks * sizeof(cl_uint), lens, 0, NULL, NULL));
@@ -1325,10 +1490,10 @@ static int do_hybrid_decompress_mode(const char* lz_path,
                                 blk_sz, orig_sz, 0U, (cl_uint)gpu_blocks);
     }
     if (cpu_blocks > 0) {
-        cpu_comp = clCreateBuffer(cpu.ctx, CL_MEM_READ_ONLY, cpu_comp_sz ? cpu_comp_sz : 1, NULL, &err); if (err != CL_SUCCESS) goto cleanup;
-        cpu_off_d = clCreateBuffer(cpu.ctx, CL_MEM_READ_ONLY, cpu_blocks * sizeof(cl_uint), NULL, &err); if (err != CL_SUCCESS) goto cleanup;
-        cpu_len_d = clCreateBuffer(cpu.ctx, CL_MEM_READ_ONLY, cpu_blocks * sizeof(cl_uint), NULL, &err); if (err != CL_SUCCESS) goto cleanup;
-        cpu_out = clCreateBuffer(cpu.ctx, CL_MEM_WRITE_ONLY, cpu_out_sz ? cpu_out_sz : 1, NULL, &err); if (err != CL_SUCCESS) goto cleanup;
+        cpu_comp = lzo_hybrid_cached_buffer(&cpu, 0, cpu_comp_sz ? cpu_comp_sz : 1, CL_MEM_READ_ONLY, &err); if (err != CL_SUCCESS) goto cleanup;
+        cpu_off_d = lzo_hybrid_cached_buffer(&cpu, 1, cpu_blocks * sizeof(cl_uint), CL_MEM_READ_ONLY, &err); if (err != CL_SUCCESS) goto cleanup;
+        cpu_len_d = lzo_hybrid_cached_buffer(&cpu, 2, cpu_blocks * sizeof(cl_uint), CL_MEM_READ_ONLY, &err); if (err != CL_SUCCESS) goto cleanup;
+        cpu_out = lzo_hybrid_cached_buffer(&cpu, 3, cpu_out_sz ? cpu_out_sz : 1, CL_MEM_WRITE_ONLY, &err); if (err != CL_SUCCESS) goto cleanup;
         CHECK(clEnqueueWriteBuffer(cpu.q, cpu_comp, CL_FALSE, 0, cpu_comp_sz, comp + gpu_comp_sz, 0, NULL, NULL));
         CHECK(clEnqueueWriteBuffer(cpu.q, cpu_off_d, CL_FALSE, 0, cpu_blocks * sizeof(cl_uint), cpu_off, 0, NULL, NULL));
         CHECK(clEnqueueWriteBuffer(cpu.q, cpu_len_d, CL_FALSE, 0, cpu_blocks * sizeof(cl_uint), lens + gpu_blocks, 0, NULL, NULL));
@@ -1386,14 +1551,16 @@ cleanup:
     if (f) fclose(f);
     if (ev_gpu) clReleaseEvent(ev_gpu);
     if (ev_cpu) clReleaseEvent(ev_cpu);
-    if (gpu_comp) clReleaseMemObject(gpu_comp);
-    if (gpu_off_d) clReleaseMemObject(gpu_off_d);
-    if (gpu_len_d) clReleaseMemObject(gpu_len_d);
-    if (gpu_out) clReleaseMemObject(gpu_out);
-    if (cpu_comp) clReleaseMemObject(cpu_comp);
-    if (cpu_off_d) clReleaseMemObject(cpu_off_d);
-    if (cpu_len_d) clReleaseMemObject(cpu_len_d);
-    if (cpu_out) clReleaseMemObject(cpu_out);
+    if (!g_daemon_hybrid_cache_enabled) {
+        if (gpu_comp) clReleaseMemObject(gpu_comp);
+        if (gpu_off_d) clReleaseMemObject(gpu_off_d);
+        if (gpu_len_d) clReleaseMemObject(gpu_len_d);
+        if (gpu_out) clReleaseMemObject(gpu_out);
+        if (cpu_comp) clReleaseMemObject(cpu_comp);
+        if (cpu_off_d) clReleaseMemObject(cpu_off_d);
+        if (cpu_len_d) clReleaseMemObject(cpu_len_d);
+        if (cpu_out) clReleaseMemObject(cpu_out);
+    }
     lzo_hybrid_release(&gpu);
     lzo_hybrid_release(&cpu);
     free(lens);
@@ -1404,6 +1571,68 @@ cleanup:
     free(cpu_out_h);
     return rc;
 }
+
+#if !defined(_WIN32)
+static pthread_mutex_t g_daemon_hybrid_call_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int lzo_hybrid_daemon_hybrid_file_request(char operation,
+                                          const char* input_path,
+                                          const char* output_path,
+                                          int alg,
+                                          int level,
+                                          int block_size,
+                                          uint32_t local_size,
+                                          uint32_t cpu_share_pct,
+                                          uint32_t cpu_threads,
+                                          unsigned long* elapsed_us)
+{
+    int rc;
+    uint64_t t0;
+    size_t old_cpu_threads = g_cli_cpu_threads;
+    int old_cpu_threads_set = g_cli_cpu_threads_set;
+    size_t old_cpu_share_pct = g_cli_cpu_share_pct;
+    int old_gpu_ratio_set = g_cli_gpu_ratio_set;
+    int old_adaptive_enabled = g_cli_adaptive_enabled;
+    size_t old_fixed_block_bytes = g_cli_fixed_block_bytes;
+    int old_fixed_block_exact = g_cli_fixed_block_exact;
+    size_t old_local_size = g_cli_local_size;
+    const char* alg_name = (alg == 1) ? "lzo1y" : "lzo1x";
+
+    if (cpu_share_pct > 100U) cpu_share_pct = 100U;
+    if (level < 0) level = LZO_DEFAULT_COMP_LEVEL;
+
+    pthread_mutex_lock(&g_daemon_hybrid_call_lock);
+    lzo_hybrid_set_daemon_cache_enabled(1);
+    g_cli_cpu_share_pct = cpu_share_pct;
+    g_cli_gpu_ratio_set = 1;
+    g_cli_adaptive_enabled = 0;
+    g_cli_cpu_threads = cpu_threads;
+    g_cli_cpu_threads_set = cpu_threads > 0 ? 1 : 0;
+    g_cli_fixed_block_bytes = block_size > 0 ? (size_t)block_size : 0;
+    g_cli_fixed_block_exact = block_size > 0 ? 1 : 0;
+    g_cli_local_size = local_size;
+
+    t0 = now_ns();
+    if (operation == 'C') {
+        rc = do_hybrid_compress_mode(input_path, output_path, 1, alg_name, level);
+    } else {
+        rc = do_hybrid_decompress_mode(input_path, output_path, 1);
+    }
+    if (elapsed_us) *elapsed_us = (unsigned long)((now_ns() - t0) / 1000ULL);
+
+    g_cli_cpu_threads = old_cpu_threads;
+    g_cli_cpu_threads_set = old_cpu_threads_set;
+    g_cli_cpu_share_pct = old_cpu_share_pct;
+    g_cli_gpu_ratio_set = old_gpu_ratio_set;
+    g_cli_adaptive_enabled = old_adaptive_enabled;
+    g_cli_fixed_block_bytes = old_fixed_block_bytes;
+    g_cli_fixed_block_exact = old_fixed_block_exact;
+    g_cli_local_size = old_local_size;
+    lzo_hybrid_set_daemon_cache_enabled(0);
+    pthread_mutex_unlock(&g_daemon_hybrid_call_lock);
+    return rc;
+}
+#endif
 
 
 /* Prototypes for extracted helpers to keep main concise */

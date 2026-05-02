@@ -8,6 +8,7 @@
 - benchmark（压缩 + 解压 + roundtrip 校验）
 - Linux 下的 daemon/client 模式
 - OpenCL GPU-only / CPU-only / CPU+GPU mixed
+- daemon mixed 请求：`--use-daemon --gpu-ratio/--cpu-threads/--adaptive`
 - `lzo1x` / `lzo1y`
 - `D_BITS=11..15`
 
@@ -75,6 +76,7 @@ OPENCL_LIB_NAME=OpenCL
 - `lzo_hybrid` 使用 `lzo_hybrid*` 主机源码和 `lzo_hybrid`/`lzo_hybrid.exe` 二进制名；
 - OpenCL kernel 仍为 `lzo1x.cl` / `lzo1y.cl`，压缩/解压格式与 `lzo_gpu` 兼容；
 - mixed 路径通过 `--gpu-ratio` 与 `--cpu-threads` 在同一进程内划分 OpenCL CPU/GPU block；
+- daemon mixed 路径复用 OpenCL context、queue、program、kernel 和主要 device buffer；首次同配置请求可能仍有 build/load，后续请求应接近 `init_load=0ms`；
 - CPU-only 与 GPU-only 是 mixed 调度的两个边界配置；
 - range kernel 用于让 work-item/slots 与 block 数解耦；
 - 运行时会复用 OpenCL context、kernel 与 workspace buffer；
