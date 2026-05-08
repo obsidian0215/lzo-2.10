@@ -114,6 +114,7 @@ int lzo_write_compressed_file(const char* path,
                               int alg_id, int debug);
 
 void lzo_print_response_stats(const response_t* resp, const char* input_path, int operation, int alg);
+cl_int lzo_select_opencl_platform_device(cl_platform_id* out_pf, cl_device_id* out_dev);
 
 #ifdef __cplusplus
 }

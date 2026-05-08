@@ -22,6 +22,9 @@ CPU_CONTROL = SCRIPT_DIR / "cpu_control.sh"
 GPU_CONTROL = SCRIPT_DIR / "gpu_control.sh"
 BENCH_LZO = SCRIPT_DIR / "bench_lzo.py"
 
+DEFAULT_CPU_FREQ_MHZ = "1900,3500,NA"
+DEFAULT_GPU_FREQ_MHZ = "1000,NA"
+
 
 def parse_frequency_points(text):
     if text is None or str(text).strip() == "":
@@ -83,6 +86,41 @@ def split_csv_text(value):
     return [item.strip() for item in str(value).split(",") if item.strip()]
 
 
+def discover_samples(samples_dir, limit, single_file):
+    root = Path(samples_dir)
+    if not root.exists():
+        raise SystemExit(f"samples dir not found: {root}")
+    files = sorted([p for p in root.iterdir() if p.is_file()])
+    if not files:
+        child_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
+        if len(child_dirs) == 1:
+            files = sorted([p for p in child_dirs[0].iterdir() if p.is_file()])
+
+    if single_file:
+        direct = Path(single_file)
+        if direct.is_file():
+            return [direct]
+        matches = [p for p in files if p.name == str(single_file)]
+        if len(matches) != 1:
+            raise SystemExit(f"single file not found or ambiguous: {single_file}")
+        return matches
+
+    if int(limit or 0) > 0:
+        return files[: int(limit)]
+    return files
+
+
+def bench_samples_from_args(args_list):
+    samples_dir = bench_arg_value(args_list, "--samples") or str(REPO_ROOT.parent / "samples")
+    single_file = bench_arg_value(args_list, "--single-file") or ""
+    limit_text = bench_arg_value(args_list, "--limit")
+    try:
+        limit = int(limit_text) if limit_text is not None and str(limit_text).strip() else 0
+    except Exception:
+        limit = 0
+    return discover_samples(samples_dir, limit, single_file)
+
+
 def default_bench_value(name):
     code = (
         "import importlib.util; "
@@ -100,8 +138,10 @@ def default_bench_value(name):
 
 
 def effective_engines(args_list):
-    text = bench_arg_value(args_list, "--engines") or default_bench_value("DEFAULT_ENGINES")
-    return set(split_csv_text(text))
+    text = bench_arg_value(args_list, "--engines")
+    if text:
+        return set(split_csv_text(text))
+    return {"native_cpu", "gpu"}
 
 
 def effective_gpu_ratios(args_list):
@@ -141,7 +181,7 @@ def build_work_items(args, cpu_points, gpu_points):
     none_gpu = {"kind": "none", "value": None, "label": "NA"}
 
     gpu_engines = [engine for engine in ("gpu",) if engine in engines]
-    cpu_engines = [engine for engine in ("native_cpu", "opencl_cpu", "lzop") if engine in engines]
+    cpu_engines = [engine for engine in ("native_cpu", "lzop") if engine in engines]
     if gpu_engines:
         bench_args = with_bench_option(common, "--engines", ",".join(gpu_engines))
         for gpu_point in gpu_points:
@@ -208,7 +248,7 @@ def run_bench(args, point_idx, item):
     cpu_point = item["cpu"]
     gpu_point = item["gpu"]
     safe_label = "".join(ch if ch.isalnum() or ch in ("_", "-", ".") else "_" for ch in item["label"])
-    run_dir = Path(args.output_dir) / f"point_{point_idx:03d}_{safe_label}_cpu_{cpu_point['label']}_gpu_{gpu_point['label']}"
+    run_dir = Path(args.output_dir) / f"{safe_label}_cpu_{cpu_point['label']}_gpu_{gpu_point['label']}"
     run_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         sys.executable,
@@ -271,14 +311,27 @@ def write_csv(path, rows, fieldnames):
         writer.writerows(rows)
 
 
+def find_per_file_summary(run_dir):
+    run_path = Path(run_dir)
+    candidates = sorted(run_path.rglob("per_file_summary.csv"))
+    return candidates[-1] if candidates else None
+
+
+def read_csv_rows(path):
+    if not path or not Path(path).exists():
+        return []
+    with open(path, "r", newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
 def main(argv):
     parser = argparse.ArgumentParser(
         description="External power/frequency wrapper for bench_lzo.py. Arguments after -- are passed to bench_lzo.py."
     )
     parser.add_argument("--platform-id", default=os.environ.get("LZO_PLATFORM_ID", "local"))
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "exp_results" / "power_freq_runs" / time.strftime("%Y%m%d_%H%M%S")))
-    parser.add_argument("--cpu-frequencies", "--cpu-points", default="NA", help='Comma list: "2100,3400,NA" or "50%,100%,NA"')
-    parser.add_argument("--gpu-frequencies", "--gpu-points", default="NA", help='Comma list: "1000,NA" or "70%,NA"')
+    parser.add_argument("--cpu-frequencies", "--cpu-points", default=DEFAULT_CPU_FREQ_MHZ, help='Comma list: "2100,3400,NA" or "50%,100%,NA"')
+    parser.add_argument("--gpu-frequencies", "--gpu-points", default=DEFAULT_GPU_FREQ_MHZ, help='Comma list: "1000,NA" or "70%,NA"')
     parser.add_argument("--sample-interval", type=float, default=0.2)
     parser.add_argument("--no-reset-before", action="store_true")
     parser.add_argument("bench_args", nargs=argparse.REMAINDER)
@@ -294,30 +347,27 @@ def main(argv):
     gpu_points = parse_frequency_points(args.gpu_frequencies)
     points = build_work_items(args, cpu_points, gpu_points)
     records = []
+    per_file_records = []
+    any_fail = False
 
     print(f"[wrapper] output_dir={output_dir}")
     print(f"[wrapper] telemetry={telemetry.describe_sources()}")
     print(f"[wrapper] points={[(p['label'], p['cpu']['label'], p['gpu']['label'], shlex.join(p['bench_args'])) for p in points]}")
+    print("[wrapper] start")
 
     for idx, item in enumerate(points, start=1):
         cpu_point = item["cpu"]
         gpu_point = item["gpu"]
-        cpu_apply = "not_requested"
-        gpu_apply = "not_requested"
-        cpu_reset_before = "skipped"
-        gpu_reset_before = "skipped"
-        cpu_reset_after = "not_run"
-        gpu_reset_after = "not_run"
         rc = -1
         run_dir = ""
         elapsed = 0.0
         summary = {}
         try:
             if not args.no_reset_before:
-                cpu_reset_before = run_control_reset(CPU_CONTROL)
-                gpu_reset_before = run_control_reset(GPU_CONTROL)
-            cpu_apply = apply_frequency(CPU_CONTROL, cpu_point)
-            gpu_apply = apply_frequency(GPU_CONTROL, gpu_point)
+                run_control_reset(CPU_CONTROL)
+                run_control_reset(GPU_CONTROL)
+            apply_frequency(CPU_CONTROL, cpu_point)
+            apply_frequency(GPU_CONTROL, gpu_point)
 
             proc, cmd, run_dir_path, start = run_bench(args, idx, item)
             rc, output, samples = collect_until_done(proc, telemetry, max(0.05, args.sample_interval))
@@ -329,23 +379,11 @@ def main(argv):
             with open(run_dir_path / "wrapper_output.log", "w", encoding="utf-8") as handle:
                 handle.write(output)
         finally:
-            cpu_reset_after = run_control_reset(CPU_CONTROL)
-            gpu_reset_after = run_control_reset(GPU_CONTROL)
+            run_control_reset(CPU_CONTROL)
+            run_control_reset(GPU_CONTROL)
 
         record = {
-            "point_idx": idx,
             "workload": item["label"],
-            "cpu_target_kind": cpu_point["kind"],
-            "gpu_target_kind": gpu_point["kind"],
-            "cpu_target": "" if cpu_point["value"] is None else cpu_point["value"],
-            "gpu_target": "" if gpu_point["value"] is None else gpu_point["value"],
-            "cpu_apply": cpu_apply,
-            "gpu_apply": gpu_apply,
-            "cpu_reset_before": cpu_reset_before,
-            "gpu_reset_before": gpu_reset_before,
-            "cpu_reset_after": cpu_reset_after,
-            "gpu_reset_after": gpu_reset_after,
-            "returncode": rc,
             "elapsed_s": elapsed,
             "run_dir": run_dir,
             "bench_args": shlex.join(item["bench_args"]),
@@ -366,11 +404,44 @@ def main(argv):
             "gpu_peak_power_w": summary.get("gpu_peak_power_w", 0.0),
         }
         records.append(record)
+        if rc != 0:
+            any_fail = True
         write_csv(output_dir / "power_frequency_summary.csv", records, list(record.keys()))
-        print(f"[wrapper] point={idx} rc={rc} cpu_reset_after={cpu_reset_after} gpu_reset_after={gpu_reset_after}")
+
+        per_file_path = find_per_file_summary(run_dir)
+        for pf in read_csv_rows(per_file_path):
+            pf_record = {
+                "workload": item["label"],
+                "sample": pf.get("sample", ""),
+                "engine": pf.get("engine", ""),
+                "ratio_pct_median": pf.get("ratio_pct_median", ""),
+                "manual_comp_no_ocl_mbs_mean": pf.get("manual_comp_no_ocl_mbs_mean", ""),
+                "manual_dec_no_ocl_mbs_mean": pf.get("manual_dec_no_ocl_mbs_mean", ""),
+                "elapsed_s": elapsed,
+                "run_dir": run_dir,
+                "cpu_freq_avg_mhz": summary.get("cpu_freq_avg_mhz", 0.0),
+                "gpu_freq_avg_mhz": summary.get("gpu_freq_avg_mhz", 0.0),
+                "cpu_energy_j": summary.get("cpu_energy_j", 0.0),
+                "core_energy_j": summary.get("core_energy_j", 0.0),
+                "dram_energy_j": summary.get("dram_energy_j", 0.0),
+                "gpu_energy_j": summary.get("gpu_energy_j", 0.0),
+                "cpu_pkg_avg_power_w": summary.get("cpu_pkg_avg_power_w", 0.0),
+                "cpu_core_avg_power_w": summary.get("cpu_core_avg_power_w", 0.0),
+                "dram_avg_power_w": summary.get("dram_avg_power_w", 0.0),
+                "gpu_avg_power_w": summary.get("gpu_avg_power_w", 0.0),
+                "cpu_pkg_peak_power_w": summary.get("cpu_pkg_peak_power_w", 0.0),
+                "cpu_core_peak_power_w": summary.get("cpu_core_peak_power_w", 0.0),
+                "dram_peak_power_w": summary.get("dram_peak_power_w", 0.0),
+                "gpu_peak_power_w": summary.get("gpu_peak_power_w", 0.0),
+            }
+            per_file_records.append(pf_record)
+        if per_file_records:
+            write_csv(output_dir / "per_file_power_summary.csv", per_file_records, list(per_file_records[0].keys()))
+
+        print(f"[wrapper] point={idx} rc={rc}")
 
     print(f"[wrapper] summary={output_dir / 'power_frequency_summary.csv'}")
-    return 0 if all(int(r["returncode"]) == 0 for r in records) else 1
+    return 0 if not any_fail else 1
 
 
 if __name__ == "__main__":

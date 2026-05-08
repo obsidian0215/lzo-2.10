@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <time.h>
 #include <limits.h>
@@ -40,7 +41,7 @@
 #define SOCKET_PATH "/tmp/lzo_gpu_daemon.sock"
 #define PID_FILE "/tmp/lzo_gpu_daemon.pid"
 #define MAX_CLIENTS 5
-#define MAX_BUFFER_SIZE (256 * 1024 * 1024)  // 256MB - 减小预配避免OOM, 针对超大文件CORE会自动扩容
+#define MAX_BUFFER_SIZE (64 * 1024 * 1024)  // 64MB - 减小预配避免OOM, 针对超大文件CORE会自动扩容
 
 #define MAX_WORKERS 4
 
@@ -146,28 +147,26 @@ int init_opencl_resources(void)
     struct timespec t_start, t_end;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
-    printf("[DAEMON] 初始化OpenCL资源...\n");
-
     // 1. 获取平台和设备
-    err = clGetPlatformIDs(1, &g_state.platform, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "获取平台失败: %d\n", err);
-        return -1;
-    }
-
-    err = clGetDeviceIDs(g_state.platform, CL_DEVICE_TYPE_GPU, 1,
-                         &g_state.device, NULL);
-    if (err != CL_SUCCESS) {
-        err = clGetDeviceIDs(g_state.platform, CL_DEVICE_TYPE_DEFAULT, 1,
-                             &g_state.device, NULL);
-    }
-    if (err != CL_SUCCESS) {
-        err = clGetDeviceIDs(g_state.platform, CL_DEVICE_TYPE_ALL, 1,
-                             &g_state.device, NULL);
-    }
-    if (err != CL_SUCCESS) {
+    err = lzo_select_opencl_platform_device(&g_state.platform, &g_state.device);
+    if (err != CL_SUCCESS || g_state.device == NULL || g_state.platform == NULL) {
         fprintf(stderr, "获取OpenCL设备失败: %d\n", err);
         return -1;
+    }
+
+    {
+        char pfname[256] = {0};
+        char devname[256] = {0};
+        cl_device_type devtype = 0;
+        clGetPlatformInfo(g_state.platform, CL_PLATFORM_NAME, sizeof(pfname), pfname, NULL);
+        clGetDeviceInfo(g_state.device, CL_DEVICE_NAME, sizeof(devname), devname, NULL);
+        clGetDeviceInfo(g_state.device, CL_DEVICE_TYPE, sizeof(devtype), &devtype, NULL);
+        fprintf(stderr, "[DAEMON OpenCL] Selected platform=%s, device=%s (type=%s)\n",
+                pfname,
+                devname,
+                (devtype & CL_DEVICE_TYPE_GPU) ? "GPU" :
+                (devtype & CL_DEVICE_TYPE_CPU) ? "CPU" :
+                (devtype & CL_DEVICE_TYPE_DEFAULT) ? "DEFAULT" : "UNKNOWN");
     }
 
     // 2. 创建上下文 (常驻)
@@ -193,7 +192,7 @@ int init_opencl_resources(void)
 
         /* 预分配 GPU 缓冲区,实现真正的“输入/输出缓冲常驻” */
         size_t prealloc = MAX_BUFFER_SIZE;
-        printf("[DAEMON]    - 为Worker %d 预分配 %.1f MB 缓冲区...\n", i, prealloc / 1024.0 / 1024.0);
+        // printf("[DAEMON]    - 为Worker %d 预分配 %.1f MB 缓冲区...\n", i, prealloc / 1024.0 / 1024.0);
 
         cl_mem_flags flags = CL_MEM_ALLOC_HOST_PTR;
         g_state.workers[i].ws.d_in = clCreateBuffer(g_state.context, flags | CL_MEM_READ_ONLY, prealloc, NULL, &err);
@@ -219,16 +218,10 @@ int init_opencl_resources(void)
     memset(g_state.programs, 0, sizeof(g_state.programs));
     memset(g_state.prog_decomp, 0, sizeof(g_state.prog_decomp));
 
-    printf("[DAEMON] Kernels将按需编译 (Lazy Loading)...\n");
-
     clock_gettime(CLOCK_MONOTONIC, &t_end);
     g_state.init_time_ms = (t_end.tv_sec - t_start.tv_sec) * 1000 +
                            (t_end.tv_nsec - t_start.tv_nsec) / 1000000;
 
-    printf("[DAEMON] ✅ OpenCL资源初始化完成\n");
-    printf("[DAEMON]    - 上下文: 常驻内存\n");
-    printf("[DAEMON]    - 压缩kernels: 1x/1y (10-18 bits)\n");
-    printf("[DAEMON]    - 解压缩kernel: 1x/1y\n");
     printf("[DAEMON]    - 缓冲区: 预分配 (常驻 %.1f MB/Worker)\n", MAX_BUFFER_SIZE / 1024.0 / 1024.0);
     printf("[DAEMON]    - 初始化耗时: %lu ms\n", g_state.init_time_ms);
     g_ocl_init_us = g_state.init_time_ms * 1000;

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from contextlib import contextmanager
 
 
 IS_WINDOWS = os.name == "nt"
@@ -27,7 +28,8 @@ DEFAULT_CPU_BIN = REPO_ROOT / "lzo_cpu" / f"lzo_cpu{EXEEXT}"
 DEFAULT_LZOP_BIN = REPO_ROOT / "tools" / f"lzop{EXEEXT}"
 
 # Default scan matrix. Edit these lists when you want a new standard bench set.
-DEFAULT_ENGINES = ["gpu", "native_cpu", "hybrid"]
+# DEFAULT_ENGINES = ["gpu", "native_cpu", "hybrid"]
+DEFAULT_ENGINES = ["gpu", "native_cpu"]
 DEFAULT_ALG = "lzo1x"
 DEFAULT_GPU_LEVELS = [15]
 DEFAULT_CPU_LEVELS = [14]
@@ -40,7 +42,7 @@ DEFAULT_LOCAL_SIZES = [1]
 DEFAULT_CPU_THREADS = [1]
 DEFAULT_GPU_RATIOS = [0, 0.5]
 DEFAULT_LZOP_LEVELS = [1, 3, 5]
-DEFAULT_BENCH_SECONDS = 5
+DEFAULT_BENCH_SECONDS = 3
 DEFAULT_MANUAL_ROUNDS = 6
 
 
@@ -86,11 +88,13 @@ ACCEL_ROW_RE = re.compile(
     re.IGNORECASE,
 )
 
+LZO_GPU_DAEMON_SOCKET = Path("/tmp/lzo_gpu_daemon.sock")
+LZO_HYBRID_DAEMON_SOCKET = Path("/tmp/lzo_hybrid_daemon.sock")
+
 
 RAW_FIELDS = [
-    "platform_id", "hostname", "os", "sample", "engine", "phase", "round",
-    "alg", "level", "block", "local_size", "gpu_ratio", "cpu_threads", "lzop_level",
-    "gpu_level", "cpu_level",
+    "sample", "engine", "phase", "round",
+    "alg", "level", "block", "local_size", "gpu_ratio", "cpu_threads",
     "input_bytes", "compressed_bytes", "ratio_pct", "verify_ok",
     "bench_comp_kernel_mbs", "bench_dec_kernel_mbs", "manual_comp_kernel_mbs", "manual_dec_kernel_mbs",
     "manual_comp_no_ocl_mbs", "manual_dec_no_ocl_mbs",
@@ -274,9 +278,6 @@ def discover_samples(samples_dir, limit, single_file):
 
 def base_row(args, sample, engine, phase, round_id, cfg):
     return {
-        "platform_id": args.platform_id,
-        "hostname": host_id(),
-        "os": platform.platform(),
         "sample": sample.name,
         "engine": engine,
         "phase": phase,
@@ -287,9 +288,6 @@ def base_row(args, sample, engine, phase, round_id, cfg):
         "local_size": cfg.get("local_size", ""),
         "gpu_ratio": cfg.get("gpu_ratio", ""),
         "cpu_threads": cfg.get("cpu_threads", ""),
-        "lzop_level": cfg.get("lzop_level", ""),
-        "gpu_level": cfg.get("gpu_level", ""),
-        "cpu_level": cfg.get("cpu_level", ""),
         "input_bytes": sample.stat().st_size,
         "compressed_bytes": "",
         "ratio_pct": "",
@@ -313,8 +311,7 @@ def opencl_env(device_type=None):
         "LZO_GPU_NO_CLBIN": "1",
     }
     if device_type:
-        env["LZO_OPENCL_DEVICE_TYPE"] = device_type
-        env["LZO_OPENCL_STRICT_DEVICE"] = "1"
+        env["FORCE_OPENCL_DEVICE"] = str(device_type).upper()
     return env
 
 
@@ -334,6 +331,23 @@ def append_hybrid_args(cmd, cfg):
 
 
 def append_opencl_cpu_args(cmd, cfg):
+    cmd += ["--gpu-ratio", "0"]
+    if cfg.get("cpu_threads") != "":
+        cmd += ["--cpu-threads", cfg["cpu_threads"]]
+
+
+def append_daemon_hybrid_args(cmd, cfg):
+    gpu_ratio = str(cfg.get("gpu_ratio", "")).strip()
+    if gpu_ratio:
+        if gpu_ratio.lower() == "adaptive":
+            cmd.append("--adaptive")
+        else:
+            cmd += ["--gpu-ratio", gpu_ratio]
+    if cfg.get("cpu_threads") != "":
+        cmd += ["--cpu-threads", cfg["cpu_threads"]]
+
+
+def append_daemon_opencl_cpu_args(cmd, cfg):
     cmd += ["--gpu-ratio", "0"]
     if cfg.get("cpu_threads") != "":
         cmd += ["--cpu-threads", cfg["cpu_threads"]]
@@ -388,7 +402,7 @@ def run_native_cpu_case(args, sample, threads, block, level, tmp_root):
     input_bytes = sample.stat().st_size
 
     bench_cmd = [exe, "--bench", args.bench_seconds, "-a", args.alg.replace("lzo", ""), "-L", level, "-B", block, "-t", threads, sample]
-    row = base_row(args, sample, "lzo_cpu_native", "bench", 0, cfg)
+    row = base_row(args, sample, "lzo_cpu", "bench", 0, cfg)
     try:
         rc, out, _ = run_cmd(bench_cmd, timeout=args.timeout)
         bench = parse_bench_output(out)
@@ -406,7 +420,7 @@ def run_native_cpu_case(args, sample, threads, block, level, tmp_root):
     for round_id in range(args.manual_rounds):
         comp_path = tmp_root / f"{sample.name}.cpu.{round_id}.lzo"
         dec_path = tmp_root / f"{sample.name}.cpu.{round_id}.dec"
-        row = base_row(args, sample, "lzo_cpu_native", "manual", round_id, cfg)
+        row = base_row(args, sample, "lzo_cpu", "manual", round_id, cfg)
         try:
             comp_cmd = [exe, "-a", args.alg.replace("lzo", ""), "-L", level, "-B", block, "-t", threads, "-o", comp_path, sample]
             rc_c, out_c, wall_c = run_cmd(comp_cmd, timeout=args.timeout)
@@ -441,24 +455,26 @@ def run_native_cpu_case(args, sample, threads, block, level, tmp_root):
     return rows
 
 
-def run_opencl_case(args, sample, engine, exe, device_type, cfg, tmp_root, extra_arg_fn=None):
+def run_opencl_case(args, sample, engine, exe, device_type, cfg, tmp_root, extra_arg_fn=None, use_daemon=False):
     rows = []
     original_hash = sha256(sample)
     input_bytes = sample.stat().st_size
     env = opencl_env(device_type)
     cwd = exe.parent
+    socket_path = LZO_GPU_DAEMON_SOCKET if engine == "lzo_gpu" else LZO_HYBRID_DAEMON_SOCKET
 
-    bench_cmd = [
-        exe, "--bench", args.bench_seconds,
-        "-a", cfg["alg"], "-L", cfg["level"], "-B", cfg["block"],
-        "--local", cfg["local_size"],
-    ]
-    if extra_arg_fn:
-        extra_arg_fn(bench_cmd, cfg)
-    bench_cmd.append(sample)
+    daemon_prefix = ["--use-daemon"] if use_daemon else []
 
     row = base_row(args, sample, engine, "bench", 0, cfg)
     try:
+        bench_cmd = [
+            exe, "--bench", args.bench_seconds,
+            "-a", cfg["alg"], "-L", cfg["level"], "-B", cfg["block"],
+            "--local", cfg["local_size"],
+        ]
+        if extra_arg_fn:
+            extra_arg_fn(bench_cmd, cfg)
+        bench_cmd.append(sample)
         rc, out, _ = run_cmd(bench_cmd, cwd=cwd, env=env, timeout=args.timeout)
         bench = parse_bench_output(out)
         if rc != 0 or not bench:
@@ -481,22 +497,60 @@ def run_opencl_case(args, sample, engine, exe, device_type, cfg, tmp_root, extra
                 exe, "-v", "-a", cfg["alg"], "-L", cfg["level"], "-B", cfg["block"],
                 "--local", cfg["local_size"],
             ]
+            if daemon_prefix:
+                comp_cmd[1:1] = daemon_prefix
             if extra_arg_fn:
-                extra_arg_fn(comp_cmd, cfg)
+                if use_daemon and engine == "lzo_hybrid":
+                    append_daemon_hybrid_args(comp_cmd, cfg)
+                elif use_daemon and engine == "lzo_opencl_cpu":
+                    append_daemon_opencl_cpu_args(comp_cmd, cfg)
+                else:
+                    extra_arg_fn(comp_cmd, cfg)
             comp_cmd += ["-o", comp_path, sample]
-            rc_c, out_c, wall_c = run_cmd(comp_cmd, cwd=cwd, env=env, timeout=args.timeout)
+            rc_c, out_c, wall_c = run_cmd_with_daemon_retry(
+                comp_cmd,
+                cwd=cwd,
+                env=env,
+                timeout=args.timeout,
+                daemon_enabled=use_daemon,
+                exe_path=exe,
+                socket_path=socket_path,
+            )
             ratio, compressed_bytes, comp_kernel = parse_manual_output(out_c)
             if rc_c != 0 or not comp_path.exists():
                 raise RuntimeError(f"{engine} compress failed rc={rc_c}: {out_c[-500:]}")
             dec_cmd = [exe, "-v", "-d"]
+            if daemon_prefix:
+                dec_cmd[1:1] = daemon_prefix
             if extra_arg_fn:
-                extra_arg_fn(dec_cmd, cfg)
+                if use_daemon and engine == "lzo_hybrid":
+                    append_daemon_hybrid_args(dec_cmd, cfg)
+                elif use_daemon and engine == "lzo_opencl_cpu":
+                    append_daemon_opencl_cpu_args(dec_cmd, cfg)
+                else:
+                    extra_arg_fn(dec_cmd, cfg)
             dec_cmd += ["-o", dec_path, comp_path]
-            rc_d, out_d, wall_d = run_cmd(dec_cmd, cwd=cwd, env=env, timeout=args.timeout)
+            rc_d, out_d, wall_d = run_cmd_with_daemon_retry(
+                dec_cmd,
+                cwd=cwd,
+                env=env,
+                timeout=args.timeout,
+                daemon_enabled=use_daemon,
+                exe_path=exe,
+                socket_path=socket_path,
+            )
             _, _, dec_kernel = parse_manual_output(out_d)
+            verify_ok = (rc_d == 0 and dec_path.exists() and sha256(dec_path) == original_hash)
+            if (rc_d != 0 or not dec_path.exists() or not verify_ok) and use_daemon:
+                comp_cmd_sd = _strip_use_daemon_arg(comp_cmd)
+                dec_cmd_sd = _strip_use_daemon_arg(dec_cmd)
+                rc_c, out_c, wall_c = run_cmd(comp_cmd_sd, cwd=cwd, env=env, timeout=args.timeout)
+                ratio, compressed_bytes, comp_kernel = parse_manual_output(out_c)
+                rc_d, out_d, wall_d = run_cmd(dec_cmd_sd, cwd=cwd, env=env, timeout=args.timeout)
+                _, _, dec_kernel = parse_manual_output(out_d)
+                verify_ok = (rc_d == 0 and dec_path.exists() and sha256(dec_path) == original_hash)
             if rc_d != 0 or not dec_path.exists():
                 raise RuntimeError(f"{engine} decompress failed rc={rc_d}: {out_d[-500:]}")
-            verify_ok = sha256(dec_path) == original_hash
             compressed_bytes = compressed_bytes or comp_path.stat().st_size
             comp_s = parse_total_seconds(out_c, wall_c, subtract_ocl=True)
             dec_s = parse_total_seconds(out_d, wall_d, subtract_ocl=True)
@@ -528,11 +582,120 @@ def safe_unlink(path):
         pass
 
 
+def _strip_use_daemon_arg(cmd):
+    return [str(x) for x in cmd if str(x) != "--use-daemon"]
+
+
+def _daemon_retry_needed(output_text):
+    t = (output_text or "").lower()
+    hints = (
+        "connection refused",
+        "daemon is not running",
+        "connect daemon",
+        "recv response",
+        "连接守护进程失败",
+        "接收响应失败",
+        "守护进程未运行",
+    )
+    return any(h in t for h in hints)
+
+
+def run_cmd_with_daemon_retry(cmd, *, cwd=None, env=None, timeout=None, daemon_enabled=False, exe_path=None, socket_path=None):
+    rc, out, wall = run_cmd(cmd, cwd=cwd, env=env, timeout=timeout)
+    if (not daemon_enabled) or rc == 0 or (not _daemon_retry_needed(out)):
+        return rc, out, wall
+    if not exe_path or not socket_path:
+        return rc, out, wall
+    try:
+        stop_daemon(exe_path)
+        time.sleep(0.1)
+        start_daemon(exe_path, socket_path)
+    except Exception:
+        pass
+    rc2, out2, wall2 = run_cmd(cmd, cwd=cwd, env=env, timeout=timeout)
+    if rc2 == 0:
+        return rc2, out2, wall2
+
+    # Last-resort fallback: run standalone mode for this command.
+    standalone_cmd = [str(x) for x in cmd if str(x) != "--use-daemon"]
+    rc3, out3, wall3 = run_cmd(standalone_cmd, cwd=cwd, env=env, timeout=timeout)
+    if rc3 == 0:
+        merged = (out2 or out or "") + "\n[bench_lzo] daemon fallback -> standalone succeeded\n" + (out3 or "")
+        return rc3, merged, wall3
+    return rc2, out2, wall2
+
+
+def daemon_is_running(socket_path):
+    return Path(socket_path).exists()
+
+
+def stop_daemon(exe_path):
+    exe = Path(exe_path)
+    cwd = exe.parent
+    try:
+        rc, out, _ = run_cmd([exe, "--stop-daemon"], cwd=cwd, timeout=10)
+        return rc == 0, out
+    except Exception as exc:
+        return False, str(exc)
+
+
+def start_daemon(exe_path, socket_path, timeout_s=15.0):
+    exe = Path(exe_path)
+    cwd = exe.parent
+    proc = subprocess.Popen(
+        [str(exe), "--daemon"],
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    deadline = time.time() + max(1.0, float(timeout_s))
+    logs = []
+    while time.time() < deadline:
+        if daemon_is_running(socket_path):
+            return proc, "".join(logs)
+        if proc.poll() is not None:
+            logs.append(proc.stdout.read() if proc.stdout else "")
+            break
+        time.sleep(0.1)
+    if proc.poll() is None:
+        proc.terminate()
+    try:
+        out = proc.stdout.read() if proc.stdout else ""
+    except Exception:
+        out = ""
+    logs.append(out)
+    raise RuntimeError(f"failed to start daemon for {exe}: {''.join(logs)[-500:]}")
+
+
+@contextmanager
+def daemon_session(exe_path, socket_path, enabled):
+    if (not enabled) or IS_WINDOWS:
+        yield False
+        return
+
+    started_here = False
+    proc = None
+    try:
+        if daemon_is_running(socket_path):
+            yield True
+            return
+        proc, _ = start_daemon(exe_path, socket_path)
+        started_here = True
+        yield True
+    finally:
+        if started_here:
+            stop_daemon(exe_path)
+        if proc and proc.poll() is None:
+            proc.terminate()
+
+
 def case_key(row):
     return (
-        row["platform_id"], row["sample"], row["engine"], row["alg"], row["level"], row["block"],
-        row["local_size"], row["gpu_ratio"], row["cpu_threads"], row["lzop_level"],
-        row["gpu_level"], row["cpu_level"],
+        row["sample"], row["engine"], row["alg"], row["level"], row["block"],
+        row["local_size"], row["gpu_ratio"], row["cpu_threads"],
     )
 
 
@@ -574,9 +737,8 @@ def summarize(raw_rows):
     aggregate_grouped = {}
     for row in per_file:
         key = (
-            row["platform_id"], row["engine"], row["alg"], row["level"], row["block"],
-            row["local_size"], row["gpu_ratio"], row["cpu_threads"], row["lzop_level"],
-            row["gpu_level"], row["cpu_level"],
+            row["engine"], row["alg"], row["level"], row["block"],
+            row["local_size"], row["gpu_ratio"], row["cpu_threads"],
         )
         aggregate_grouped.setdefault(key, []).append(row)
 
@@ -584,7 +746,6 @@ def summarize(raw_rows):
     for key, rows in sorted(aggregate_grouped.items()):
         first = rows[0]
         aggregate.append({
-            "platform_id": first["platform_id"],
             "engine": first["engine"],
             "alg": first["alg"],
             "level": first["level"],
@@ -592,9 +753,6 @@ def summarize(raw_rows):
             "local_size": first["local_size"],
             "gpu_ratio": first["gpu_ratio"],
             "cpu_threads": first["cpu_threads"],
-            "lzop_level": first["lzop_level"],
-            "gpu_level": first["gpu_level"],
-            "cpu_level": first["cpu_level"],
             "samples": len(rows),
             "verify_all": all(bool(r["ok"]) for r in rows),
             "ratio_pct_median_of_files": median([r["ratio_pct_median"] for r in rows]),
@@ -633,50 +791,53 @@ def run_all(args):
     raw_rows = []
     print(f"[bench_lzo] run_dir={run_dir}")
     print(f"[bench_lzo] samples={len(samples)} bench_seconds={args.bench_seconds} manual_rounds={args.manual_rounds}")
+    if args.use_daemon and not IS_WINDOWS:
+        print("[bench_lzo] use_daemon=on (check daemon, start if missing, stop only if started by this run)")
 
     try:
         tmp_root.mkdir(parents=True, exist_ok=True)
-        for sample in samples:
-            if "lzop" in args.engines:
-                for level in str_list(args.lzop_levels):
-                    raw_rows.extend(run_lzop_case(args, sample, level, tmp_root))
-            if "native_cpu" in args.engines:
-                for block in str_list(args.cpu_blocks):
-                    for level in str_list(args.cpu_levels):
-                        for threads in str_list(args.cpu_threads):
-                            raw_rows.extend(run_native_cpu_case(args, sample, threads, block, level, tmp_root))
-            if "gpu" in args.engines:
-                for block in str_list(args.gpu_blocks):
-                    for level in str_list(args.gpu_levels):
-                        for local_size in str_list(args.local_sizes):
-                            cfg = {
-                                "alg": args.alg, "level": level, "block": block, "local_size": local_size,
-                                "gpu_ratio": "1", "cpu_threads": "", "gpu_level": "", "cpu_level": "",
-                            }
-                            raw_rows.extend(run_opencl_case(args, sample, "lzo_gpu", Path(args.gpu_bin), "GPU", cfg, tmp_root))
-            if "opencl_cpu" in args.engines:
-                for block in str_list(args.cpu_blocks):
-                    for level in str_list(args.gpu_levels):
-                        for threads in str_list(args.cpu_threads):
-                            cfg = {
-                                "alg": args.alg, "level": level, "block": block, "local_size": "1",
-                                "gpu_ratio": "0", "cpu_threads": threads, "gpu_level": "", "cpu_level": "",
-                            }
-                            raw_rows.extend(run_opencl_case(args, sample, "lzo_opencl_cpu", Path(args.hybrid_bin), "CPU", cfg, tmp_root, append_opencl_cpu_args))
-            if "hybrid" in args.engines:
-                for block in str_list(args.hybrid_blocks):
-                    for gpu_level in str_list(args.hybrid_gpu_levels):
-                        for cpu_level in str_list(args.hybrid_cpu_levels):
-                            level = gpu_level
-                            for ratio in str_list(args.gpu_ratios):
-                                for threads in str_list(args.cpu_threads):
-                                    for local_size in str_list(args.local_sizes):
-                                        cfg = {
-                                            "alg": args.alg, "level": level, "block": block, "local_size": local_size,
-                                            "gpu_ratio": ratio, "cpu_threads": threads,
-                                            "gpu_level": gpu_level, "cpu_level": cpu_level,
-                                        }
-                                        raw_rows.extend(run_opencl_case(args, sample, "lzo_hybrid", Path(args.hybrid_bin), "ALL", cfg, tmp_root, append_hybrid_args))
+        with daemon_session(args.gpu_bin, LZO_GPU_DAEMON_SOCKET, args.use_daemon) as gpu_daemon_active, daemon_session(args.hybrid_bin, LZO_HYBRID_DAEMON_SOCKET, args.use_daemon) as hybrid_daemon_active:
+            for sample in samples:
+                if "lzop" in args.engines:
+                    for level in str_list(args.lzop_levels):
+                        raw_rows.extend(run_lzop_case(args, sample, level, tmp_root))
+                if "native_cpu" in args.engines:
+                    for block in str_list(args.cpu_blocks):
+                        for level in str_list(args.cpu_levels):
+                            for threads in str_list(args.cpu_threads):
+                                raw_rows.extend(run_native_cpu_case(args, sample, threads, block, level, tmp_root))
+                if "gpu" in args.engines:
+                    for block in str_list(args.gpu_blocks):
+                        for level in str_list(args.gpu_levels):
+                            for local_size in str_list(args.local_sizes):
+                                cfg = {
+                                    "alg": args.alg, "level": level, "block": block, "local_size": local_size,
+                                    "gpu_ratio": "1", "cpu_threads": "", "gpu_level": "", "cpu_level": "",
+                                }
+                                raw_rows.extend(run_opencl_case(args, sample, "lzo_gpu", Path(args.gpu_bin), "GPU", cfg, tmp_root, use_daemon=gpu_daemon_active))
+                if "opencl_cpu" in args.engines:
+                    for block in str_list(args.cpu_blocks):
+                        for level in str_list(args.gpu_levels):
+                            for threads in str_list(args.cpu_threads):
+                                cfg = {
+                                    "alg": args.alg, "level": level, "block": block, "local_size": "1",
+                                    "gpu_ratio": "0", "cpu_threads": threads, "gpu_level": "", "cpu_level": "",
+                                }
+                                raw_rows.extend(run_opencl_case(args, sample, "lzo_opencl_cpu", Path(args.hybrid_bin), "CPU", cfg, tmp_root, append_opencl_cpu_args, use_daemon=hybrid_daemon_active))
+                if "hybrid" in args.engines:
+                    for block in str_list(args.hybrid_blocks):
+                        for gpu_level in str_list(args.hybrid_gpu_levels):
+                            for cpu_level in str_list(args.hybrid_cpu_levels):
+                                level = gpu_level
+                                for ratio in str_list(args.gpu_ratios):
+                                    for threads in str_list(args.cpu_threads):
+                                        for local_size in str_list(args.local_sizes):
+                                            cfg = {
+                                                "alg": args.alg, "level": level, "block": block, "local_size": local_size,
+                                                "gpu_ratio": ratio, "cpu_threads": threads,
+                                                "gpu_level": gpu_level, "cpu_level": cpu_level,
+                                            }
+                                            raw_rows.extend(run_opencl_case(args, sample, "lzo_hybrid", Path(args.hybrid_bin), "ALL", cfg, tmp_root, append_hybrid_args, use_daemon=hybrid_daemon_active))
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
@@ -731,6 +892,7 @@ def parse_args(argv):
     parser.add_argument("--hybrid-bin", default=str(DEFAULT_HYBRID_BIN))
     parser.add_argument("--cpu-bin", default=str(DEFAULT_CPU_BIN))
     parser.add_argument("--lzop-bin", default=str(DEFAULT_LZOP_BIN))
+    parser.add_argument("--use-daemon", action="store_true", help="Linux only: use GPU daemon; check running, start if missing, stop only if started by this run")
     args = parser.parse_args(argv)
     args.engines = set(str_list(args.engines))
     return args
