@@ -7,9 +7,14 @@
 
 #define LZO_MODE_COMPRESS 0
 #define LZO_MODE_DECOMPRESS 1
+#define LZO_DAEMON_REQUEST_MAGIC 0x4c5a4f47u
+#define LZO_DAEMON_REQUEST_VERSION 2u
+#define LZO_DAEMON_FLAG_RAW_BUFFER 0x1u
 
 /* 客户端请求结构 */
 typedef struct {
+    uint32_t magic;
+    uint32_t version;
     char operation;          /* 'C'=COMPR, 'D'=DECOMPR */
     int alg;                 /* 0=1x, 1=1y */
     int level;               /* 10-18 */
@@ -19,6 +24,7 @@ typedef struct {
     int standard_copy;
     size_t input_size;
     uint32_t local_size;
+    uint32_t flags;
 } request_t;
 
 /* 服务端响应结构 */

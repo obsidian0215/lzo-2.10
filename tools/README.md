@@ -65,8 +65,8 @@ DEFAULT_MANUAL_ROUNDS = 6
 - `--bench-seconds 5`
 - `--manual-rounds 6`
 - 默认引擎：`gpu,native_cpu,hybrid`
-- bench 阶段：调用程序自己的 `--bench`，收集 kernel 吞吐和压缩率。
-- manual 阶段：真实压缩到临时文件、真实解压、校验 hash，收集 no-ocl/total 类吞吐。
+- bench 阶段：调用程序自己的 `--bench`，作为缺少 manual kernel 字段时的补充来源。
+- manual 阶段：真实压缩到临时文件、真实解压、校验 hash，收集主吞吐与端到端吞吐。
 - 临时产物：写入本次 run 的 `tmp/`，结束时 `rmtree`，不污染样本目录。
 - `hybrid` 默认测试 `gpu_ratio=0,0.5`；`0` 是 OpenCL CPU-only，`0.5` 是 GPU/CPU 固定比例混合。
 - `--gpu-ratios adaptive` 会传给 `lzo_hybrid --adaptive`；当前实现用 50/50 作为自适应入口的初始策略，后续自适应模型在此入口上扩展。
@@ -168,8 +168,8 @@ exp_results/runs/<timestamp>/
 
 字段含义：
 
-- `bench_comp_kernel_mbs` / `bench_dec_kernel_mbs`：bench 阶段 kernel 吞吐。
-- `manual_comp_no_ocl_mbs` / `manual_dec_no_ocl_mbs`：真实压缩/解压吞吐，OpenCL 路径排除 OpenCL init/build。
+- `comp_mbs_*` / `dec_mbs_*`：压缩/解压主吞吐；优先来自真实 manual 阶段的 kernel/span 字段，缺失时回退到 bench 阶段。
+- `e2e_comp_mbs_*` / `e2e_dec_mbs_*`：端到端吞吐；真实压缩/解压路径，OpenCL 路径排除 OpenCL init/build。
 - `ratio_pct`：压缩率。
 - `verify_ok` / `verify_all`：解压 hash 校验结果。
 - `gpu_level` / `cpu_level`：hybrid 压缩侧分别使用的 `D_BITS`；普通 GPU/CPU 引擎为空。

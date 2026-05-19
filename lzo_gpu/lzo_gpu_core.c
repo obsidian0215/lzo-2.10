@@ -677,7 +677,7 @@ int lzo_compress_core(
         cl_uint cus = 0;
         cl_ulong global_mem = 0;
         cl_ulong max_alloc = 0;
-        size_t dict_per_block = (1ULL << params->level) * sizeof(uint32_t);
+        size_t dict_per_block = (1ULL << params->level) * lzo_dict_entry_bytes_for_block(params->block_size, params->level);
         size_t occ_cap = 0;
         size_t mem_cap = 0;
         size_t safe_mem = 0;
@@ -741,9 +741,8 @@ int lzo_compress_core(
     ws->comp_epoch_base += (uint32_t)nblk + 1U;
 
     {
-        /* 32-bit packed dictionary: epoch_12|offset_20 in one uint32 per hash entry. */
-        size_t dict_per_block = (1ULL << params->level) * sizeof(uint32_t);
-        size_t total_dict_size = (size_t)pool_size * dict_per_block;
+        size_t dict_per_block = (1ULL << params->level) * lzo_dict_entry_bytes_for_block(params->block_size, params->level);
+        size_t total_dict_size = (size_t)pool_size * dict_per_block + sizeof(cl_uint);
         size_t prev_dict_size = ws->dict_size;
 
         cl_mem d_dict = core_get_or_create_buffer(ctx, &ws->d_dict, &ws->dict_size, total_dict_size, CL_MEM_READ_WRITE, &err);
@@ -753,6 +752,10 @@ int lzo_compress_core(
         }
         if (ws->dict_size > prev_dict_size) {
             (void)lzo_zero_buffer_range(queue, d_dict, prev_dict_size, ws->dict_size - prev_dict_size);
+        }
+        {
+            size_t counter_offset = (size_t)pool_size * dict_per_block;
+            (void)lzo_zero_buffer_range(queue, d_dict, counter_offset, sizeof(cl_uint));
         }
 
         int need_set_stable_args = 1;

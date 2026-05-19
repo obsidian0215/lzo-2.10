@@ -42,7 +42,7 @@ DEFAULT_LOCAL_SIZES = [1]
 DEFAULT_CPU_THREADS = [1]
 DEFAULT_GPU_RATIOS = [0, 0.5]
 DEFAULT_LZOP_LEVELS = [1, 3, 5]
-DEFAULT_BENCH_SECONDS = 3
+DEFAULT_BENCH_SECONDS = 5
 DEFAULT_MANUAL_ROUNDS = 6
 
 
@@ -132,6 +132,49 @@ def mean(values):
 def stdev(values):
     vals = [float(v) for v in values if v not in (None, "")]
     return statistics.pstdev(vals) if len(vals) > 1 else 0.0 if vals else None
+
+
+def numeric_values(values):
+    return [float(v) for v in values if v not in (None, "")]
+
+
+def sample_stdev(values):
+    vals = numeric_values(values)
+    return statistics.stdev(vals) if len(vals) > 1 else 0.0 if vals else None
+
+
+def ci95_half_width(values):
+    vals = numeric_values(values)
+    if len(vals) <= 1:
+        return 0.0 if vals else None
+    return 1.96 * statistics.stdev(vals) / (len(vals) ** 0.5)
+
+
+def cv_pct(values):
+    vals = numeric_values(values)
+    if not vals:
+        return None
+    avg = sum(vals) / len(vals)
+    if avg == 0.0:
+        return 0.0
+    return 100.0 * statistics.stdev(vals) / avg if len(vals) > 1 else 0.0
+
+
+def add_metric_stats(out, prefix, values):
+    vals = numeric_values(values)
+    out[f"{prefix}_n"] = len(vals)
+    out[f"{prefix}_mean"] = mean(vals)
+    out[f"{prefix}_median"] = median(vals)
+    out[f"{prefix}_stdev"] = sample_stdev(vals)
+    out[f"{prefix}_cv_pct"] = cv_pct(vals)
+    out[f"{prefix}_ci95_half"] = ci95_half_width(vals)
+
+
+def choose_metric_values(primary_rows, primary_field, fallback_rows, fallback_field):
+    vals = numeric_values([r.get(primary_field, "") for r in primary_rows])
+    if vals:
+        return vals
+    return numeric_values([r.get(fallback_field, "") for r in fallback_rows])
 
 
 def fmt(value, digits=6):
@@ -354,7 +397,7 @@ def append_daemon_opencl_cpu_args(cmd, cfg):
 
 
 def run_lzop_case(args, sample, level, tmp_root):
-    exe = Path(args.lzop_bin)
+    exe = Path(args.lzop_bin).resolve()
     cfg = {"lzop_level": level}
     rows = []
     comp_path = tmp_root / f"{sample.name}.lzop.lzo"
@@ -395,7 +438,7 @@ def run_lzop_case(args, sample, level, tmp_root):
 
 
 def run_native_cpu_case(args, sample, threads, block, level, tmp_root):
-    exe = Path(args.cpu_bin)
+    exe = Path(args.cpu_bin).resolve()
     cfg = {"alg": args.alg, "level": level, "block": block, "cpu_threads": threads}
     rows = []
     original_hash = sha256(sample)
@@ -456,6 +499,7 @@ def run_native_cpu_case(args, sample, threads, block, level, tmp_root):
 
 
 def run_opencl_case(args, sample, engine, exe, device_type, cfg, tmp_root, extra_arg_fn=None, use_daemon=False):
+    exe = Path(exe).resolve()
     rows = []
     original_hash = sha256(sample)
     input_bytes = sample.stat().st_size
@@ -709,29 +753,27 @@ def summarize(raw_rows):
         bench_rows = [r for r in rows if r["phase"] == "bench" and r["status"] == "ok"]
         manual_rows = [r for r in rows if r["phase"] == "manual" and r["status"] == "ok"]
         first = rows[0]
-        out = {field: first.get(field, "") for field in RAW_FIELDS if field not in {
-            "phase", "round", "status", "error",
-            "bench_comp_kernel_mbs", "bench_dec_kernel_mbs",
-            "manual_comp_kernel_mbs", "manual_dec_kernel_mbs",
-            "manual_comp_no_ocl_mbs", "manual_dec_no_ocl_mbs",
-            "manual_comp_seconds", "manual_dec_seconds",
-        }}
-        out.update({
+        ratio_rows = manual_rows if manual_rows else bench_rows
+        out = {
+            "sample": first.get("sample", ""),
+            "engine": first.get("engine", ""),
+            "alg": first.get("alg", ""),
+            "level": first.get("level", ""),
+            "block": first.get("block", ""),
+            "local_size": first.get("local_size", ""),
+            "gpu_ratio": first.get("gpu_ratio", ""),
+            "cpu_threads": first.get("cpu_threads", ""),
+            "input_bytes": first.get("input_bytes", ""),
+            "compressed_bytes": first.get("compressed_bytes", ""),
             "bench_rounds": len(bench_rows),
             "manual_rounds": len(manual_rows),
             "ok": all(str(r.get("verify_ok", "")).lower() in ("true", "yes", "1") for r in manual_rows) if manual_rows else False,
-            "bench_comp_kernel_mbs_median": median([r["bench_comp_kernel_mbs"] for r in bench_rows]),
-            "bench_dec_kernel_mbs_median": median([r["bench_dec_kernel_mbs"] for r in bench_rows]),
-            "manual_comp_kernel_mbs_median": median([r["manual_comp_kernel_mbs"] for r in manual_rows]),
-            "manual_dec_kernel_mbs_median": median([r["manual_dec_kernel_mbs"] for r in manual_rows]),
-            "manual_comp_no_ocl_mbs_median": median([r["manual_comp_no_ocl_mbs"] for r in manual_rows]),
-            "manual_dec_no_ocl_mbs_median": median([r["manual_dec_no_ocl_mbs"] for r in manual_rows]),
-            "manual_comp_no_ocl_mbs_mean": mean([r["manual_comp_no_ocl_mbs"] for r in manual_rows]),
-            "manual_dec_no_ocl_mbs_mean": mean([r["manual_dec_no_ocl_mbs"] for r in manual_rows]),
-            "manual_comp_no_ocl_mbs_stdev": stdev([r["manual_comp_no_ocl_mbs"] for r in manual_rows]),
-            "manual_dec_no_ocl_mbs_stdev": stdev([r["manual_dec_no_ocl_mbs"] for r in manual_rows]),
-            "ratio_pct_median": median([r["ratio_pct"] for r in manual_rows] or [r["ratio_pct"] for r in bench_rows]),
-        })
+        }
+        add_metric_stats(out, "ratio_pct", [r["ratio_pct"] for r in ratio_rows])
+        add_metric_stats(out, "comp_mbs", choose_metric_values(manual_rows, "manual_comp_kernel_mbs", bench_rows, "bench_comp_kernel_mbs"))
+        add_metric_stats(out, "dec_mbs", choose_metric_values(manual_rows, "manual_dec_kernel_mbs", bench_rows, "bench_dec_kernel_mbs"))
+        add_metric_stats(out, "e2e_comp_mbs", [r["manual_comp_no_ocl_mbs"] for r in manual_rows])
+        add_metric_stats(out, "e2e_dec_mbs", [r["manual_dec_no_ocl_mbs"] for r in manual_rows])
         per_file.append(out)
 
     aggregate_grouped = {}
@@ -756,12 +798,15 @@ def summarize(raw_rows):
             "samples": len(rows),
             "verify_all": all(bool(r["ok"]) for r in rows),
             "ratio_pct_median_of_files": median([r["ratio_pct_median"] for r in rows]),
-            "bench_comp_kernel_mbs_median_of_files": median([r["bench_comp_kernel_mbs_median"] for r in rows]),
-            "bench_dec_kernel_mbs_median_of_files": median([r["bench_dec_kernel_mbs_median"] for r in rows]),
-            "manual_comp_kernel_mbs_median_of_files": median([r["manual_comp_kernel_mbs_median"] for r in rows]),
-            "manual_dec_kernel_mbs_median_of_files": median([r["manual_dec_kernel_mbs_median"] for r in rows]),
-            "manual_comp_no_ocl_mbs_median_of_files": median([r["manual_comp_no_ocl_mbs_median"] for r in rows]),
-            "manual_dec_no_ocl_mbs_median_of_files": median([r["manual_dec_no_ocl_mbs_median"] for r in rows]),
+            "ratio_pct_mean_of_files": mean([r["ratio_pct_median"] for r in rows]),
+            "comp_mbs_median_of_files": median([r["comp_mbs_median"] for r in rows]),
+            "comp_mbs_mean_of_files": mean([r["comp_mbs_median"] for r in rows]),
+            "dec_mbs_median_of_files": median([r["dec_mbs_median"] for r in rows]),
+            "dec_mbs_mean_of_files": mean([r["dec_mbs_median"] for r in rows]),
+            "e2e_comp_mbs_median_of_files": median([r["e2e_comp_mbs_median"] for r in rows]),
+            "e2e_comp_mbs_mean_of_files": mean([r["e2e_comp_mbs_median"] for r in rows]),
+            "e2e_dec_mbs_median_of_files": median([r["e2e_dec_mbs_median"] for r in rows]),
+            "e2e_dec_mbs_mean_of_files": mean([r["e2e_dec_mbs_median"] for r in rows]),
         })
     return per_file, aggregate
 

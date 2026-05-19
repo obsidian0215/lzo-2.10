@@ -18,6 +18,7 @@
 #include <getopt.h>
 #include <limits.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "lzo_gpu_protocol.h"
 
@@ -76,6 +77,8 @@ static void parse_client_cli_opts(int argc, char** argv, request_t* req) {
 
 /* set default request options */
 static void set_request_defaults(request_t* req) {
+    req->magic = LZO_DAEMON_REQUEST_MAGIC;
+    req->version = LZO_DAEMON_REQUEST_VERSION;
     req->standard_copy = 0;
     req->block_size = 0;
     req->local_size = 0;
@@ -89,6 +92,253 @@ static void set_request_defaults(request_t* req) {
 int is_daemon_running(void)
 {
     return access(lzo_daemon_socket_path(), F_OK) == 0;
+}
+
+static int client_read_full(int fd, void* buf, size_t len)
+{
+    unsigned char* p = (unsigned char*)buf;
+    while (len > 0) {
+        ssize_t n = recv(fd, p, len, 0);
+        if (n <= 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int client_write_full(int fd, const void* buf, size_t len)
+{
+    const unsigned char* p = (const unsigned char*)buf;
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, 0);
+        if (n <= 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int stdin_read_u64(uint64_t* out)
+{
+    size_t n = fread(out, 1, sizeof(*out), stdin);
+    if (n == 0 && feof(stdin)) return 1;
+    if (n != sizeof(*out)) return -1;
+    return 0;
+}
+
+static int stdin_read_exact(void* buf, size_t len)
+{
+    return fread(buf, 1, len, stdin) == len ? 0 : -1;
+}
+
+static int stdout_write_u64(uint64_t value)
+{
+    return fwrite(&value, 1, sizeof(value), stdout) == sizeof(value) ? 0 : -1;
+}
+
+static int read_stdin_all(unsigned char** out, size_t* out_len)
+{
+    size_t cap = 1 << 20;
+    size_t len = 0;
+    unsigned char* buf = (unsigned char*)malloc(cap);
+    if (!buf) return -1;
+    for (;;) {
+        size_t got;
+        if (len == cap) {
+            size_t next = cap * 2;
+            unsigned char* nb = (unsigned char*)realloc(buf, next);
+            if (!nb) { free(buf); return -1; }
+            buf = nb;
+            cap = next;
+        }
+        got = fread(buf + len, 1, cap - len, stdin);
+        len += got;
+        if (got == 0) {
+            if (ferror(stdin)) { free(buf); return -1; }
+            break;
+        }
+    }
+    *out = buf;
+    *out_len = len;
+    return 0;
+}
+
+static int write_stdout_all(const void* data, size_t len)
+{
+    return fwrite(data, 1, len, stdout) == len ? 0 : -1;
+}
+
+static int raw_with_daemon(char operation, int alg, int level)
+{
+    int sock;
+    struct sockaddr_un addr;
+    request_t req;
+    response_t resp;
+    unsigned char* input = NULL;
+    size_t input_len = 0;
+    uint64_t out_len = 0;
+    unsigned char* out = NULL;
+    int rc = -1;
+
+    if (!is_daemon_running()) {
+        fprintf(stderr, "错误: 守护进程未运行\n");
+        return -1;
+    }
+    if (read_stdin_all(&input, &input_len) != 0 || input_len == 0) {
+        fprintf(stderr, "错误: failed to read stdin raw payload\n");
+        free(input);
+        return -1;
+    }
+
+    sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) { free(input); return -1; }
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, lzo_daemon_socket_path(), sizeof(addr.sun_path) - 1);
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("连接守护进程失败");
+        close(sock);
+        free(input);
+        return -1;
+    }
+
+    memset(&req, 0, sizeof(req));
+    set_request_defaults(&req);
+    memcpy(&req, &g_cli_req_flags, sizeof(req));
+    req.operation = operation;
+    req.alg = alg;
+    req.level = level;
+    req.input_size = input_len;
+    req.flags = LZO_DAEMON_FLAG_RAW_BUFFER;
+    fill_request_env_flags(&req);
+
+    if (client_write_full(sock, &req, sizeof(req)) != 0 ||
+        client_write_full(sock, input, input_len) != 0 ||
+        client_read_full(sock, &resp, sizeof(resp)) != 0) {
+        perror("daemon raw exchange failed");
+        goto out;
+    }
+    if (resp.status != 0) {
+        fprintf(stderr, "daemon raw failed: %s\n", resp.message);
+        goto out;
+    }
+    if (client_read_full(sock, &out_len, sizeof(out_len)) != 0) goto out;
+    if (out_len > 0) {
+        if (out_len > (uint64_t)SIZE_MAX) goto out;
+        out = (unsigned char*)malloc((size_t)out_len);
+        if (!out) goto out;
+        if (client_read_full(sock, out, (size_t)out_len) != 0) goto out;
+        if (write_stdout_all(out, (size_t)out_len) != 0) goto out;
+    }
+    rc = 0;
+out:
+    free(out);
+    free(input);
+    close(sock);
+    return rc;
+}
+
+static int raw_session_with_daemon(char operation, int alg, int level)
+{
+    int sock;
+    struct sockaddr_un addr;
+    int rc = -1;
+
+    if (!is_daemon_running()) {
+        fprintf(stderr, "错误: 守护进程未运行\n");
+        return -1;
+    }
+
+    sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, lzo_daemon_socket_path(), sizeof(addr.sun_path) - 1);
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("连接守护进程失败");
+        close(sock);
+        return -1;
+    }
+
+    for (;;) {
+        uint64_t input_len = 0;
+        unsigned char* input = NULL;
+        unsigned char* out = NULL;
+        uint64_t out_len = 0;
+        request_t req;
+        response_t resp;
+
+        rc = stdin_read_u64(&input_len);
+        if (rc == 1) { rc = 0; break; }
+        if (rc != 0 || input_len == 0 || input_len > (uint64_t)SIZE_MAX) {
+            fprintf(stderr, "错误: failed to read raw session frame length\n");
+            rc = -1;
+            break;
+        }
+
+        input = (unsigned char*)malloc((size_t)input_len);
+        if (!input) { rc = -1; break; }
+        if (stdin_read_exact(input, (size_t)input_len) != 0) {
+            fprintf(stderr, "错误: failed to read raw session payload\n");
+            free(input);
+            rc = -1;
+            break;
+        }
+
+        memset(&req, 0, sizeof(req));
+        set_request_defaults(&req);
+        memcpy(&req, &g_cli_req_flags, sizeof(req));
+        req.operation = operation;
+        req.alg = alg;
+        req.level = level;
+        req.input_size = (size_t)input_len;
+        req.flags = LZO_DAEMON_FLAG_RAW_BUFFER;
+        fill_request_env_flags(&req);
+
+        if (client_write_full(sock, &req, sizeof(req)) != 0 ||
+            client_write_full(sock, input, (size_t)input_len) != 0 ||
+            client_read_full(sock, &resp, sizeof(resp)) != 0) {
+            perror("daemon raw session exchange failed");
+            free(input);
+            rc = -1;
+            break;
+        }
+        free(input);
+        if (resp.status != 0) {
+            fprintf(stderr, "daemon raw failed: %s\n", resp.message);
+            rc = -1;
+            break;
+        }
+        if (client_read_full(sock, &out_len, sizeof(out_len)) != 0) {
+            rc = -1;
+            break;
+        }
+        if (out_len > (uint64_t)SIZE_MAX) {
+            rc = -1;
+            break;
+        }
+        if (out_len > 0) {
+            out = (unsigned char*)malloc((size_t)out_len);
+            if (!out) { rc = -1; break; }
+            if (client_read_full(sock, out, (size_t)out_len) != 0) {
+                free(out);
+                rc = -1;
+                break;
+            }
+        }
+        if (stdout_write_u64(out_len) != 0 ||
+            (out_len > 0 && fwrite(out, 1, (size_t)out_len, stdout) != (size_t)out_len)) {
+            free(out);
+            rc = -1;
+            break;
+        }
+        fflush(stdout);
+        free(out);
+    }
+
+    close(sock);
+    return rc;
 }
 
 /*
@@ -286,6 +536,8 @@ static void show_help(const char* prog) {
     fprintf(stderr, "  --mt-io / --no-mt-io          Enable/disable multi-threaded I/O.\n");
     fprintf(stderr, "  --zero-copy / --standard-copy Enable/disable zero-copy (pinned memory).\n");
     fprintf(stderr, "  --local N                     Local work-group size.\n");
+    fprintf(stderr, "  --raw-buffer                  Read request payload from stdin and write output to stdout via daemon raw-buffer protocol.\n");
+    fprintf(stderr, "  --raw-buffer-session          Keep one daemon socket open and process multiple length-prefixed payload frames from stdin.\n");
     fprintf(stderr, "示例:\n");
     fprintf(stderr, "  %s input.txt                  # 压缩为 input.txt.lzo\n", prog);
     fprintf(stderr, "  %s -d file1.lzo file2.lzo     # 批量解压\n", prog);
@@ -307,6 +559,8 @@ int run_lzo_client(int argc, char** argv)
     int alg = -1;    /* 未指定: 让服务端决定 */
     char operation = 'C';  /* 默认压缩 */
     int show_help_flag = 0;
+    int raw_buffer_mode = 0;
+    int raw_buffer_session_mode = 0;
 
 
 
@@ -324,7 +578,11 @@ int run_lzo_client(int argc, char** argv)
             break;
         }
 
-        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) {
+        if (strcmp(argv[i], "--raw-buffer") == 0) {
+            raw_buffer_mode = 1;
+        } else if (strcmp(argv[i], "--raw-buffer-session") == 0) {
+            raw_buffer_session_mode = 1;
+        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--decompress") == 0) {
             operation = 'D';
         } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--alg") == 0) {
             if (i + 1 < argc) {
@@ -371,10 +629,26 @@ int run_lzo_client(int argc, char** argv)
     }
 
     // 显示帮助
-    if (show_help_flag || input_count == 0) {
+    if (show_help_flag || ((!raw_buffer_mode && !raw_buffer_session_mode) && input_count == 0)) {
         show_help(argv[0]);
         free(inputs);
         return show_help_flag ? 0 : 1;
+    }
+
+    if (raw_buffer_session_mode) {
+        int final_alg = (alg < 0) ? 0 : alg;
+        int final_level = (level < 0) ? LZO_DEFAULT_COMP_LEVEL : level;
+        int ret = raw_session_with_daemon(operation, final_alg, final_level);
+        free(inputs);
+        return ret == 0 ? 0 : 1;
+    }
+
+    if (raw_buffer_mode) {
+        int final_alg = (alg < 0) ? 0 : alg;
+        int final_level = (level < 0) ? LZO_DEFAULT_COMP_LEVEL : level;
+        int ret = raw_with_daemon(operation, final_alg, final_level);
+        free(inputs);
+        return ret == 0 ? 0 : 1;
     }
 
 

@@ -489,7 +489,8 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
     int kernel_has_dbg = 0;
     int debug_counters = lzo_debug_counters_enabled_cli();
     uint64_t tk1 = now_ns();
-    if (lzo_load_comp_kernel(ctx, dev, alg_name, comp_level, debug_counters, &prog_c, &krn_c, &kernel_has_dbg, build_log, sizeof(build_log)) != 0) {
+    size_t block_size = g_cli_fixed_block_bytes;
+    if (lzo_load_comp_kernel_for_block(ctx, dev, alg_name, comp_level, block_size, debug_counters, &prog_c, &krn_c, &kernel_has_dbg, build_log, sizeof(build_log)) != 0) {
         if (build_log[0]) fprintf(stderr, "error: failed to load kernel for %s bits=%d: %s\n", alg_name, comp_level, build_log);
         else fprintf(stderr, "error: failed to load kernel for %s bits=%d\n", alg_name, comp_level);
         return 1;
@@ -498,7 +499,6 @@ static int do_compress_mode(const char* in_path, const char* output_path, int ou
     g_kernel_load_us = (unsigned long)((tk2 - tk1) / 1000);
 
     int standard_copy = lzo_resolve_standard_copy(dev);
-    size_t block_size = g_cli_fixed_block_bytes;
     int alg_id = (strcmp(alg_name, "lzo1y") == 0) ? 1 : 0;
 
     lzo_gpu_workspace_t ws;
@@ -685,7 +685,7 @@ static int run_lzo_bench(const char *in_path,
     cl_int err = CL_SUCCESS;
     int kernel_has_dbg = 0;
     char build_log[8192] = {0};
-    if (lzo_load_comp_kernel(ctx, dev, alg_name, comp_level, debug_counters,
+    if (lzo_load_comp_kernel_for_block(ctx, dev, alg_name, comp_level, g_cli_fixed_block_bytes, debug_counters,
                              &prog_c, &krn_c, &kernel_has_dbg,
                              build_log, sizeof(build_log)) != 0 || !prog_c || !krn_c) {
         fprintf(stderr, "bench error: failed to load compression kernel\n");

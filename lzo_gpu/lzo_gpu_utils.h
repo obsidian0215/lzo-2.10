@@ -83,11 +83,14 @@ int lzo_specified_unit_is_bytes(const char* s);
  * fixed_exact==1 then the requested value is used as-is (no alignment/minimum).
  */
 void lzo_choose_blocking_adaptive(const unsigned char* data, size_t in_sz, cl_device_id dev, size_t blk_bytes, int fixed_exact, size_t* blk_sz_out, size_t* nblk_out, int debug);
+int lzo_dict_u16_clear_for_block(size_t block_size, int bits);
+size_t lzo_dict_entry_bytes_for_block(size_t block_size, int bits);
 
 /* Load an OpenCL program from a precompiled binary (<prog>_<bits>.clbin) or compile from source (<prog>.cl) with -D D_BITS=<bits>.
  * On success returns a built cl_program; on failure returns NULL and, if build_log is provided, writes build output into it.
  */
 cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const char *alg_name, int bits, char *build_log, size_t build_log_len);
+cl_program lzo_load_program_with_dbits_and_block(cl_context ctx, cl_device_id dev, const char *alg_name, int bits, size_t block_size, char *build_log, size_t build_log_len);
 
 /* Load and create a compression kernel for the given algorithm and D_BITS.
  * Compiles/loads the base kernel (<alg>.cl / <alg>_<bits>.clbin). LZO_USE_UNROLL2 is applied by default.
@@ -95,6 +98,7 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
  * On failure returns non-zero and, if provided, writes a short message into build_log.
  */
 int lzo_load_comp_kernel(cl_context ctx, cl_device_id dev, const char *alg_name, int comp_level, int debug, cl_program *out_prog, cl_kernel *out_krn, int *kernel_has_dbg, char *build_log, size_t build_log_len);
+int lzo_load_comp_kernel_for_block(cl_context ctx, cl_device_id dev, const char *alg_name, int comp_level, size_t block_size, int debug, cl_program *out_prog, cl_kernel *out_krn, int *kernel_has_dbg, char *build_log, size_t build_log_len);
 
 /* Debug parsing and instrumentation helpers removed from production build. */
 

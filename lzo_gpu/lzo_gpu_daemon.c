@@ -19,6 +19,8 @@
 #include <unistd.h>
 #include <time.h>
 #include <limits.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <signal.h>
@@ -33,6 +35,9 @@
 #include "lzo_gpu_core.h"
 #include <stddef.h>
 #include <libgen.h>
+
+extern long syscall(long number, ...);
+#include <sys/syscall.h>
 
 #define core_now_ns lzo_now_ns
 
@@ -56,14 +61,115 @@ typedef struct {
     pthread_mutex_t lock;
 
     /* Private kernels for this worker to avoid race conditions on clSetKernelArg */
-    /* Alg: 0=1x, 1=1y | Bits: 0-8 (10-18) */
-    cl_kernel kernels_comp[2][9];
+    /* Alg: 0=1x, 1=1y | Bits: 0-8 (10-18) | Dict mode: 0=epoch32, 1=clear16 */
+    cl_kernel kernels_comp[2][9][2];
     cl_kernel kernels_decomp[2];
 } worker_res_t;
 
 typedef struct {
     int client_sock;
 } worker_thread_args_t;
+
+static int daemon_read_full(int fd, void* buf, size_t len)
+{
+    unsigned char* p = (unsigned char*)buf;
+    while (len > 0) {
+        ssize_t n = recv(fd, p, len, 0);
+        if (n <= 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int daemon_write_full(int fd, const void* buf, size_t len)
+{
+    const unsigned char* p = (const unsigned char*)buf;
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, 0);
+        if (n <= 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int daemon_memfd_create(const char* name)
+{
+#ifdef SYS_memfd_create
+    return (int)syscall(SYS_memfd_create, name ? name : "lzo_gpu_daemon", 0);
+#else
+    (void)name;
+    return -1;
+#endif
+}
+
+static int daemon_fd_path(int fd, char* out, size_t out_len)
+{
+    if (!out || out_len == 0 || fd < 0) return -1;
+    if (snprintf(out, out_len, "/proc/self/fd/%d", fd) >= (int)out_len) return -1;
+    return 0;
+}
+
+static int daemon_write_fd_full(int fd, const void* buf, size_t len)
+{
+    const unsigned char* p = (const unsigned char*)buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n <= 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int daemon_send_fd_payload(int sock, int fd)
+{
+    char* buf = NULL;
+    uint64_t len = 0;
+    int rc = -1;
+
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size < 0) {
+        len = 0;
+        (void)daemon_write_full(sock, &len, sizeof(len));
+        return -1;
+    }
+    len = (uint64_t)st.st_size;
+    if (daemon_write_full(sock, &len, sizeof(len)) != 0) return -1;
+    if (len == 0) return 0;
+
+    buf = (char*)malloc(1 << 20);
+    if (!buf) return -1;
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        free(buf);
+        return -1;
+    }
+    while (len > 0) {
+        size_t want = (len > (uint64_t)(1 << 20)) ? (size_t)(1 << 20) : (size_t)len;
+        size_t got = read(fd, buf, want);
+        if (got == 0) goto out;
+        if (daemon_write_full(sock, buf, got) != 0) goto out;
+        len -= got;
+    }
+    rc = 0;
+out:
+    free(buf);
+    return rc;
+}
+
+static int daemon_request_valid(const request_t* req, response_t* resp)
+{
+    if (!req || !resp) return 0;
+    if (req->magic != LZO_DAEMON_REQUEST_MAGIC ||
+        req->version != LZO_DAEMON_REQUEST_VERSION) {
+        resp->status = -1;
+        snprintf(resp->message, sizeof(resp->message),
+                 "daemon protocol mismatch: restart daemon/client");
+        return 0;
+    }
+    return 1;
+}
 
 /* 守护进程全局状态 */
 typedef struct {
@@ -78,7 +184,7 @@ typedef struct {
     /* 多kernel支持 - 算法(2) x 字典大小(9) */
     /* Alg: 0=1x, 1=1y */
     /* Bits: 0=10, 1=11, 2=12, 3=13, 4=14, 5=15, 6=16, 7=17, 8=18 */
-    cl_program programs[2][9];
+    cl_program programs[2][9][2];
 
     /* 解压缩kernels (每个算法一个) */
     cl_program prog_decomp[2];
@@ -181,7 +287,7 @@ int init_opencl_resources(void)
     pthread_mutex_init(&g_state.stats_lock, NULL);
 
     // 3. 为每个Worker初始化资源
-    cl_queue_properties props[] = { CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0 };
+    cl_queue_properties props[] = { CL_QUEUE_PROPERTIES, 0, 0 };
     for (int i = 0; i < MAX_WORKERS; i++) {
         g_state.workers[i].queue = clCreateCommandQueueWithProperties(g_state.context, g_state.device, props, &err);
         if (err != CL_SUCCESS) {
@@ -230,11 +336,12 @@ int init_opencl_resources(void)
 }
 
 /* 获取或编译压缩Program (线程安全,全局缓存) */
-static cl_program get_compress_program(int alg, int bits)
+static cl_program get_compress_program(int alg, int bits, size_t block_size)
 {
     if (alg < 0 || alg > 1 || bits < 10 || bits > 18) return NULL;
     int bit_idx = bits - 10;
-    cl_program *p_prog = &g_state.programs[alg][bit_idx];
+    int dict_mode = lzo_dict_u16_clear_for_block(block_size, bits) ? 1 : 0;
+    cl_program *p_prog = &g_state.programs[alg][bit_idx][dict_mode];
 
     pthread_mutex_lock(&g_state.compile_lock);
     if (*p_prog) {
@@ -288,7 +395,7 @@ static cl_program get_compress_program(int alg, int bits)
         free(src);
         if (err == CL_SUCCESS) {
             char build_opts_with_inc[512];
-            snprintf(build_opts_with_inc, sizeof(build_opts_with_inc), "-cl-std=CL2.0 -I.%s -D D_BITS=%d", include_opt, bits);
+            snprintf(build_opts_with_inc, sizeof(build_opts_with_inc), "-cl-std=CL2.0 -I.%s -D D_BITS=%d -D LZO_DICT_U16_CLEAR=%d", include_opt, bits, dict_mode);
             err = clBuildProgram(*p_prog, 1, &g_state.device, build_opts_with_inc, NULL, NULL);
             uint64_t tk2_src = core_now_ns();
             g_kernel_load_us += (unsigned long)((tk2_src - tk1) / 1000);
@@ -307,15 +414,16 @@ static cl_program get_compress_program(int alg, int bits)
     return NULL;
 }
 
-static cl_kernel get_compress_kernel_for_worker(worker_res_t* worker, int alg, int bits)
+static cl_kernel get_compress_kernel_for_worker(worker_res_t* worker, int alg, int bits, size_t block_size)
 {
     if (alg < 0 || alg > 1 || bits < 10 || bits > 18) return NULL;
     int bit_idx = bits - 10;
-    cl_kernel *p_krn = &worker->kernels_comp[alg][bit_idx];
+    int dict_mode = lzo_dict_u16_clear_for_block(block_size, bits) ? 1 : 0;
+    cl_kernel *p_krn = &worker->kernels_comp[alg][bit_idx][dict_mode];
 
     if (*p_krn) return *p_krn;
 
-    cl_program prog = get_compress_program(alg, bits);
+    cl_program prog = get_compress_program(alg, bits, block_size);
     if (!prog) return NULL;
 
     const char* alg_names[] = {"lzo1x", "lzo1y"};
@@ -382,6 +490,16 @@ static cl_kernel get_decompress_kernel_for_worker(worker_res_t* worker, int alg)
     return worker->kernels_decomp[alg];
 }
 
+static void warmup_default_daemon_kernels(void)
+{
+    const int alg = 0;
+    const int bits = LZO_DEFAULT_COMP_LEVEL;
+    for (int i = 0; i < MAX_WORKERS; i++) {
+        (void)get_compress_kernel_for_worker(&g_state.workers[i], alg, bits, 64U * 1024U);
+        (void)get_decompress_kernel_for_worker(&g_state.workers[i], alg);
+    }
+}
+
 /*
  * 处理压缩请求 (复用已初始化的资源)
  */
@@ -400,7 +518,7 @@ int handle_compress_request(request_t* req, response_t* resp, worker_res_t* work
            req->input_path, req->output_path, req->level);
 
     // 根据alg和level选择合适的worker私有kernel
-    cl_kernel kernel = get_compress_kernel_for_worker(worker, req->alg, req->level);
+    cl_kernel kernel = get_compress_kernel_for_worker(worker, req->alg, req->level, req->block_size);
     const char* alg_names[] = {"lzo1x", "lzo1y"};
 
     if (!kernel) {
@@ -606,7 +724,11 @@ void cleanup_opencl_resources(void)
 
         for (int a = 0; a < 2; a++) {
             for (int b = 0; b < 9; b++) {
-                if (g_state.workers[i].kernels_comp[a][b]) clReleaseKernel(g_state.workers[i].kernels_comp[a][b]);
+                for (int m = 0; m < 2; m++) {
+                    if (g_state.workers[i].kernels_comp[a][b][m]) {
+                        clReleaseKernel(g_state.workers[i].kernels_comp[a][b][m]);
+                    }
+                }
             }
             if (g_state.workers[i].kernels_decomp[a]) clReleaseKernel(g_state.workers[i].kernels_decomp[a]);
         }
@@ -618,7 +740,11 @@ void cleanup_opencl_resources(void)
     // 清理所有全局programs
     for (int i = 0; i < 2; i++) {
         for (int j = 0; j < 9; j++) {
-            if (g_state.programs[i][j]) clReleaseProgram(g_state.programs[i][j]);
+            for (int m = 0; m < 2; m++) {
+                if (g_state.programs[i][j][m]) {
+                    clReleaseProgram(g_state.programs[i][j][m]);
+                }
+            }
         }
         if (g_state.prog_decomp[i]) clReleaseProgram(g_state.prog_decomp[i]);
     }
@@ -858,68 +984,127 @@ static void* worker_thread(void* arg) {
 
     request_t req;
     response_t resp;
-    memset(&resp, 0, sizeof(resp));
-
-    // 1. Receive request
-    ssize_t n = recv(client_sock, &req, sizeof(req), 0);
-    if (n != sizeof(req)) {
-        fprintf(stderr, "[DAEMON] Failed to receive request\n");
-        close(client_sock);
-        return NULL;
-    }
-
-    // 2. Find an available worker resource
     worker_res_t* worker = NULL;
-    int prefer_backend = (req.standard_copy == 0 || req.standard_copy == 1) ? req.standard_copy : -1;
-    int spin_round = 0;
-    while (g_state.running) {
-        int strict_pref = (prefer_backend >= 0 && spin_round < 4);
-        for (int i = 0; i < MAX_WORKERS; i++) {
-            if (strict_pref && !worker_matches_backend_pref(i, prefer_backend)) {
-                continue;
-            }
-            if (pthread_mutex_trylock(&g_state.workers[i].lock) == 0) {
-                if (!g_state.workers[i].in_use) {
-                    g_state.workers[i].in_use = 1;
-                    worker = &g_state.workers[i];
-                    pthread_mutex_unlock(&g_state.workers[i].lock);
-                    break;
+    int worker_acquired = 0;
+    int prefer_backend = -1;
+
+    for (;;) {
+        int raw_in_fd = -1;
+        int raw_out_fd = -1;
+        char raw_in_path[64] = {0};
+        char raw_out_path[64] = {0};
+        memset(&resp, 0, sizeof(resp));
+
+        // 1. Receive request
+        if (daemon_read_full(client_sock, &req, sizeof(req)) != 0) {
+            break;
+        }
+        if (!daemon_request_valid(&req, &resp)) {
+            (void)daemon_write_full(client_sock, &resp, sizeof(resp));
+            break;
+        }
+
+        if (!worker_acquired) {
+            prefer_backend = (req.standard_copy == 0 || req.standard_copy == 1) ? req.standard_copy : -1;
+            int spin_round = 0;
+            while (g_state.running) {
+                int strict_pref = (prefer_backend >= 0 && spin_round < 4);
+                for (int i = 0; i < MAX_WORKERS; i++) {
+                    if (strict_pref && !worker_matches_backend_pref(i, prefer_backend)) {
+                        continue;
+                    }
+                    if (pthread_mutex_trylock(&g_state.workers[i].lock) == 0) {
+                        if (!g_state.workers[i].in_use) {
+                            g_state.workers[i].in_use = 1;
+                            worker = &g_state.workers[i];
+                            worker_acquired = 1;
+                            pthread_mutex_unlock(&g_state.workers[i].lock);
+                            break;
+                        }
+                        pthread_mutex_unlock(&g_state.workers[i].lock);
+                    }
                 }
-                pthread_mutex_unlock(&g_state.workers[i].lock);
+                if (worker_acquired) break;
+                spin_round++;
+                struct timespec ts = {0, 1000000}; // 1ms
+                nanosleep(&ts, NULL);
+            }
+            if (!worker) {
+                resp.status = -1;
+                snprintf(resp.message, sizeof(resp.message), "Daemon shutting down or no workers available");
+                (void)daemon_write_full(client_sock, &resp, sizeof(resp));
+                break;
             }
         }
-        if (worker) break;
-        spin_round++;
-        struct timespec ts = {0, 1000000}; // 1ms
-        nanosleep(&ts, NULL);
+
+        if (req.flags & LZO_DAEMON_FLAG_RAW_BUFFER) {
+            uint64_t raw_len = (uint64_t)req.input_size;
+            char* raw_buf = NULL;
+            if (raw_len == 0 || raw_len > (uint64_t)SIZE_MAX) {
+                resp.status = -1;
+                snprintf(resp.message, sizeof(resp.message), "invalid raw input size");
+                (void)daemon_write_full(client_sock, &resp, sizeof(resp));
+                break;
+            }
+            raw_buf = (char*)malloc((size_t)raw_len);
+            if (!raw_buf || daemon_read_full(client_sock, raw_buf, (size_t)raw_len) != 0) {
+                free(raw_buf);
+                resp.status = -1;
+                snprintf(resp.message, sizeof(resp.message), "failed to receive raw payload");
+                (void)daemon_write_full(client_sock, &resp, sizeof(resp));
+                break;
+            }
+            raw_in_fd = daemon_memfd_create("lzo_gpu_raw_in");
+            raw_out_fd = daemon_memfd_create("lzo_gpu_raw_out");
+            if (raw_in_fd < 0 || raw_out_fd < 0 ||
+                daemon_write_fd_full(raw_in_fd, raw_buf, (size_t)raw_len) != 0 ||
+                lseek(raw_in_fd, 0, SEEK_SET) < 0 ||
+                daemon_fd_path(raw_in_fd, raw_in_path, sizeof(raw_in_path)) != 0 ||
+                daemon_fd_path(raw_out_fd, raw_out_path, sizeof(raw_out_path)) != 0) {
+                free(raw_buf);
+                if (raw_in_fd >= 0) close(raw_in_fd);
+                if (raw_out_fd >= 0) close(raw_out_fd);
+                resp.status = -1;
+                snprintf(resp.message, sizeof(resp.message), "failed to materialize raw payload");
+                (void)daemon_write_full(client_sock, &resp, sizeof(resp));
+                break;
+            }
+            free(raw_buf);
+            memset(req.input_path, 0, sizeof(req.input_path));
+            memset(req.output_path, 0, sizeof(req.output_path));
+            strncpy(req.input_path, raw_in_path, sizeof(req.input_path) - 1);
+            strncpy(req.output_path, raw_out_path, sizeof(req.output_path) - 1);
+        }
+
+        // 2. Process request
+        if (req.operation == 'C') {
+            handle_compress_request(&req, &resp, worker);
+        } else if (req.operation == 'D') {
+            handle_decompress_request(&req, &resp, worker);
+        } else {
+            resp.status = -1;
+            snprintf(resp.message, sizeof(resp.message), "Unknown operation");
+        }
+
+        // 3. Send response and payload
+        (void)daemon_write_full(client_sock, &resp, sizeof(resp));
+        if ((req.flags & LZO_DAEMON_FLAG_RAW_BUFFER) && resp.status == 0) {
+            (void)daemon_send_fd_payload(client_sock, raw_out_fd);
+        }
+        if (raw_in_fd >= 0) close(raw_in_fd);
+        if (raw_out_fd >= 0) close(raw_out_fd);
+
+        if (!(req.flags & LZO_DAEMON_FLAG_RAW_BUFFER)) {
+            break;
+        }
     }
 
-    if (!worker) {
-        resp.status = -1;
-        snprintf(resp.message, sizeof(resp.message), "Daemon shutting down or no workers available");
-        send(client_sock, &resp, sizeof(resp), 0);
-        close(client_sock);
-        return NULL;
-    }
-
-    // 3. Process request
-    if (req.operation == 'C') {
-        handle_compress_request(&req, &resp, worker);
-    } else if (req.operation == 'D') {
-        handle_decompress_request(&req, &resp, worker);
-    } else {
-        resp.status = -1;
-        snprintf(resp.message, sizeof(resp.message), "Unknown operation");
-    }
-
-    // 4. Send response and release worker
-    send(client_sock, &resp, sizeof(resp), 0);
     close(client_sock);
-
-    pthread_mutex_lock(&worker->lock);
-    worker->in_use = 0;
-    pthread_mutex_unlock(&worker->lock);
-
+    if (worker_acquired && worker) {
+        pthread_mutex_lock(&worker->lock);
+        worker->in_use = 0;
+        pthread_mutex_unlock(&worker->lock);
+    }
     return NULL;
 }
 
@@ -1042,6 +1227,7 @@ int run_lzo_daemon(int argc, char** argv)
         remove_pidfile();
         return 1;
     }
+    warmup_default_daemon_kernels();
 
     // 启动服务器
     if (start_server() != 0) {

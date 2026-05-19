@@ -682,10 +682,20 @@ void lzo_choose_blocking_adaptive(const unsigned char* data, size_t in_sz, cl_de
     *nblk_out = nblk;
 }
 
+int lzo_dict_u16_clear_for_block(size_t block_size, int bits)
+{
+    return (bits <= 16 && block_size > 0 && block_size <= 64U * 1024U) ? 1 : 0;
+}
+
+size_t lzo_dict_entry_bytes_for_block(size_t block_size, int bits)
+{
+    return lzo_dict_u16_clear_for_block(block_size, bits) ? sizeof(uint16_t) : sizeof(uint32_t);
+}
+
 /* Load an OpenCL program from an available precompiled binary or compile from source.
  * Does NOT exit on failure; returns NULL on error and fills build_log (if provided).
  */
-cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const char* alg_name, int bits, char *build_log, size_t build_log_len)
+cl_program lzo_load_program_with_dbits_and_block(cl_context ctx, cl_device_id dev, const char* alg_name, int bits, size_t block_size, char *build_log, size_t build_log_len)
 {
     cl_int err;
     cl_program prog = NULL;
@@ -845,14 +855,15 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
             if (sl) *sl = '\0'; else src_dir[0] = '.', src_dir[1] = '\0';
         }
         char build_opts[512];
+        int dict_u16_clear = lzo_dict_u16_clear_for_block(block_size, bits);
         if (dbg_flag) {
            snprintf(build_opts, sizeof(build_opts),
-               "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I\"%s\" -I. -I./lzo_gpu -I../lzo_gpu -I.. -D D_BITS=%d -D LZO_GPU_DEBUG_COUNTERS_RUNTIME=1",
-               src_dir, bits);
+               "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I\"%s\" -I. -I./lzo_gpu -I../lzo_gpu -I.. -D D_BITS=%d -D LZO_DICT_U16_CLEAR=%d -D LZO_GPU_DEBUG_COUNTERS_RUNTIME=1",
+               src_dir, bits, dict_u16_clear);
         } else {
            snprintf(build_opts, sizeof(build_opts),
-               "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I\"%s\" -I. -I./lzo_gpu -I../lzo_gpu -I.. -D D_BITS=%d",
-               src_dir, bits);
+               "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -I\"%s\" -I. -I./lzo_gpu -I../lzo_gpu -I.. -D D_BITS=%d -D LZO_DICT_U16_CLEAR=%d",
+               src_dir, bits, dict_u16_clear);
         }
         err = clBuildProgram(prog, 1, &dev, build_opts, NULL, NULL);
         if (err != CL_SUCCESS) {
@@ -884,8 +895,18 @@ cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const c
     }
 }
 
+cl_program lzo_load_program_with_dbits(cl_context ctx, cl_device_id dev, const char* alg_name, int bits, char *build_log, size_t build_log_len)
+{
+    return lzo_load_program_with_dbits_and_block(ctx, dev, alg_name, bits, 0, build_log, build_log_len);
+}
+
 /* Load and create a compression kernel (see header for behavior). */
 int lzo_load_comp_kernel(cl_context ctx, cl_device_id dev, const char *alg_name, int comp_level, int debug, cl_program *out_prog, cl_kernel *out_krn, int *kernel_has_dbg, char *build_log, size_t build_log_len)
+{
+    return lzo_load_comp_kernel_for_block(ctx, dev, alg_name, comp_level, 0, debug, out_prog, out_krn, kernel_has_dbg, build_log, build_log_len);
+}
+
+int lzo_load_comp_kernel_for_block(cl_context ctx, cl_device_id dev, const char *alg_name, int comp_level, size_t block_size, int debug, cl_program *out_prog, cl_kernel *out_krn, int *kernel_has_dbg, char *build_log, size_t build_log_len)
 {
     cl_int err;
     cl_program prog = NULL;
@@ -916,7 +937,7 @@ int lzo_load_comp_kernel(cl_context ctx, cl_device_id dev, const char *alg_name,
     }
 
     /* Load base algorithm program */
-    prog = lzo_load_program_with_dbits(ctx, dev, effective_alg, comp_level, build_log, build_log_len);
+    prog = lzo_load_program_with_dbits_and_block(ctx, dev, effective_alg, comp_level, block_size, build_log, build_log_len);
     if (!prog) {
         if (build_log && build_log[0] == '\0') snprintf(build_log, build_log_len, "failed to build kernel for %s", effective_alg);
         return -1;

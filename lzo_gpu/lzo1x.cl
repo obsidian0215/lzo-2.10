@@ -185,7 +185,7 @@ static inline void dict_store32(__global uint* dict, uint idx, uint offset, uint
 {
 #if LZO_DICT_U16_CLEAR
     __global ushort* dict16 = (__global ushort*)dict;
-    dict16[idx] = (ushort)(offset & 0xffffu);
+    dict16[idx] = (ushort)((offset & 0xffffu) + 1u);
     (void)epoch;
 #else
     dict[idx] = ((epoch & 0xFFFu) << DICT_EPOCH_SHIFT) | (offset & DICT_OFF_MASK);
@@ -199,7 +199,7 @@ static inline uint dict_load32(__global const uint* dict, uint idx, uint epoch, 
     uint entry = (uint)dict16[idx];
     *valid = (entry != 0u);
     (void)epoch;
-    return entry;
+    return entry - 1u;
 #else
     uint entry = dict[idx];
     *valid = (((entry >> DICT_EPOCH_SHIFT) & 0xFFFu) == (epoch & 0xFFFu));
@@ -210,10 +210,8 @@ static inline uint dict_load32(__global const uint* dict, uint idx, uint epoch, 
 static inline void dict_clear_for_block(__global uint* dict)
 {
 #if LZO_DICT_U16_CLEAR
-    __global ushort* dict16 = (__global ushort*)dict;
-    for (uint i = 0; i < D_SIZE; ++i) {
-        dict16[i] = (ushort)0;
-    }
+    __global uint4* dict4 = (__global uint4*)dict;
+    for (uint i = 0; i < (D_SIZE >> 3); ++i) dict4[i] = (uint4)(0u, 0u, 0u, 0u);
 #else
     (void)dict;
 #endif
@@ -726,11 +724,12 @@ __kernel void lzo1x_block_compress(__global const uchar *in ,
     const uint total_wi = get_global_size(0);
     const uint total_blocks = (in_sz + blk_size - 1) / blk_size;
     const uint dict_elems = (1u << D_BITS);
+    const size_t dict_stride = ((size_t)dict_elems * (size_t)(LZO_DICT_U16_CLEAR ? sizeof(ushort) : sizeof(uint)) + sizeof(uint) - 1u) / sizeof(uint);
 
     if (dict_pool_size == 0u) return;
 
     const uint dict_slot = wi % dict_pool_size;
-    __global uint *dict = dict_pool + ((size_t)dict_slot * dict_elems);
+    __global uint *dict = dict_pool + ((size_t)dict_slot * dict_stride);
 #if LZO_GPU_DEBUG_COUNTERS_RUNTIME
     __global uint *dbg_stats = dbg_enabled ? dbg_comp : (__global uint *)0;
 #endif
@@ -755,7 +754,7 @@ __kernel void lzo1x_block_compress(__global const uchar *in ,
         return;
     }
 
-    __global volatile uint *next_block = (__global volatile uint *)(dict_pool + ((size_t)dict_pool_size * dict_elems));
+    __global volatile uint *next_block = (__global volatile uint *)(dict_pool + ((size_t)dict_pool_size * dict_stride));
     for (;;) {
         uint b = atomic_inc(next_block);
         if (b >= total_blocks) break;
@@ -797,11 +796,12 @@ __kernel void lzo1x_block_compress_range(__global const uchar *in,
     const uint total_wi = get_global_size(0);
     const uint total_blocks = (in_sz + blk_size - 1) / blk_size;
     const uint dict_elems = (1u << D_BITS);
+    const size_t dict_stride = ((size_t)dict_elems * (size_t)(LZO_DICT_U16_CLEAR ? sizeof(ushort) : sizeof(uint)) + sizeof(uint) - 1u) / sizeof(uint);
 
     if (dict_pool_size == 0u) return;
 
     const uint dict_slot = wi % dict_pool_size;
-    __global uint *dict = dict_pool + ((size_t)dict_slot * dict_elems);
+    __global uint *dict = dict_pool + ((size_t)dict_slot * dict_stride);
 #if LZO_GPU_DEBUG_COUNTERS_RUNTIME
     __global uint *dbg_stats = dbg_enabled ? dbg_comp : (__global uint *)0;
 #endif
@@ -827,7 +827,7 @@ __kernel void lzo1x_block_compress_range(__global const uchar *in,
             return;
         }
 
-        __global volatile uint *next_block = (__global volatile uint *)(dict_pool + ((size_t)dict_pool_size * dict_elems));
+        __global volatile uint *next_block = (__global volatile uint *)(dict_pool + ((size_t)dict_pool_size * dict_stride));
         for (;;) {
             uint b = atomic_inc(next_block);
             if (b >= total_blocks) break;
@@ -872,7 +872,7 @@ __kernel void lzo1x_block_compress_range(__global const uchar *in,
         return;
     }
 
-    __global volatile uint *next_local_block = (__global volatile uint *)(dict_pool + ((size_t)dict_pool_size * dict_elems));
+    __global volatile uint *next_local_block = (__global volatile uint *)(dict_pool + ((size_t)dict_pool_size * dict_stride));
     for (;;) {
         uint local_b = atomic_inc(next_local_block);
         if (local_b >= block_count) break;
